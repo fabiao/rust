@@ -1,0 +1,17 @@
+# Vendored copy for std of the ask syscall ABI crate. Canonical source:
+# the ask superproject's `ask-abi/` crate — keep this copy in sync with it
+# (small, changes rarely: ids/Error/one named function per syscall).
+[package]
+name = "ask-abi"
+version = "0.1.0"
+edition = "2024"
+description = "Syscall ABI surface of the ask microkernel, for std's sys/ask PAL."
+license = "MIT OR Apache-2.0"
+
+[lib]
+test = false
+bench = false
+doc = false
+
+[dependencies]
+core = { version = "1.0.0", package = "rustc-std-workspace-core" }

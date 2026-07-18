@@ -39,6 +39,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ask-abi"
+version = "0.1.0"
+dependencies = [
+ "rustc-std-workspace-core",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -324,6 +331,7 @@ version = "0.0.0"
 dependencies = [
  "addr2line",
  "alloc",
+ "ask-abi",
  "cfg-if",
  "core",
  "dlmalloc",

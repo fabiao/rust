@@ -24,6 +24,10 @@ cfg_select! {
         mod motor;
         pub use self::motor::*;
     }
+    target_os = "ask" => {
+        mod ask;
+        pub use self::ask::*;
+    }
     target_os = "trusty" => {
         mod trusty;
         pub use self::trusty::*;

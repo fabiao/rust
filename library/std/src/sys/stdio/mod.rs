@@ -9,6 +9,10 @@ cfg_select! {
         mod windows;
         pub use windows::*;
     }
+    target_os = "ask" => {
+        mod ask;
+        pub use ask::*;
+    }
     all(target_vendor = "fortanix", target_env = "sgx") => {
         mod sgx;
         pub use sgx::*;

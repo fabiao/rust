@@ -85,6 +85,9 @@ cfg_select! {
         mod motor;
         use motor as imp;
     }
+    target_os = "ask" => {
+        mod ask;
+    }
     all(target_vendor = "fortanix", target_env = "sgx") => {
         mod sgx;
         use sgx as imp;
