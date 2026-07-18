@@ -2,6 +2,7 @@ pub(crate) mod aix;
 pub(crate) mod android;
 pub mod apple;
 pub(crate) mod arm_none;
+pub(crate) mod ask;
 pub(crate) mod avr;
 pub(crate) mod bpf;
 pub(crate) mod cygwin;

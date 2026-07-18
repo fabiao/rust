@@ -1676,6 +1676,8 @@ supported_targets! {
     ("x86_64-unknown-hermit", x86_64_unknown_hermit),
     ("x86_64-unknown-motor", x86_64_unknown_motor),
 
+    ("x86_64-unknown-ask", x86_64_unknown_ask),
+
     ("x86_64-unikraft-linux-musl", x86_64_unikraft_linux_musl),
 
     ("armv7-unknown-trusty", armv7_unknown_trusty),
@@ -1975,6 +1977,7 @@ crate::target_spec_enum! {
         Aix = "aix",
         AmdHsa = "amdhsa",
         Android = "android",
+        Ask = "ask",
         Cuda = "cuda",
         Cygwin = "cygwin",
         Dragonfly = "dragonfly",
