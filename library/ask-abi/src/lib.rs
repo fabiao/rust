@@ -31,6 +31,7 @@ pub const SYS_GET_PARENT_PID: u64 = 17;
 pub const SYS_PARK_TIMEOUT: u64 = 18;
 pub const SYS_GET_PID: u64 = 19;
 pub const SYS_GET_COREFS_MANIFEST: u64 = 20;
+pub const SYS_GET_MONOTONIC_MS: u64 = 21;
 
 /// Cap on a single `Log` payload — matches the kernel's own `LOG_MAX`
 /// (`kernel/src/syscall/mod.rs`).
@@ -303,4 +304,12 @@ pub fn get_corefs_manifest(output: &mut [u8]) -> Result<(), Error> {
         )
     })
     .map(|_| ())
+}
+
+/// `GetMonotonicMs()`: milliseconds elapsed on the kernel's PIT-calibrated
+/// monotonic TSC clock. This is suitable for measuring elapsed
+/// time and deadlines, but is not wall-clock time.
+pub fn get_monotonic_ms() -> u64 {
+    // Safety: `GetMonotonicMs` takes no pointer arguments and cannot fail.
+    unsafe { syscall2(SYS_GET_MONOTONIC_MS, 0, 0) }
 }

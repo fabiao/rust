@@ -6,6 +6,16 @@ cfg_select! {
     target_os = "motor" => {
         use moto_rt::time as imp;
     }
+    target_os = "ask" => {
+        mod ask;
+        #[expect(unused)]
+        mod unsupported;
+
+        mod imp {
+            pub use super::ask::Instant;
+            pub use super::unsupported::{SystemTime, UNIX_EPOCH};
+        }
+    }
     all(target_vendor = "fortanix", target_env = "sgx") => {
         mod sgx;
         use sgx as imp;
