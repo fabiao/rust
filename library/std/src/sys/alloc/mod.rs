@@ -87,6 +87,7 @@ cfg_select! {
     }
     target_os = "ask" => {
         mod ask;
+        use ask as imp;
     }
     all(target_vendor = "fortanix", target_env = "sgx") => {
         mod sgx;

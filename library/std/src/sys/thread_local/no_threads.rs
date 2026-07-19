@@ -5,7 +5,10 @@ use crate::cell::{Cell, UnsafeCell};
 use crate::mem::MaybeUninit;
 use crate::ptr;
 
-#[cfg(target_has_threads)]
+// ask: single-threaded processes (no thread-spawn syscall) but not a
+// `singlethread` target - core-level atomics must stay real for its
+// cross-process shared-memory rings (ask docs/10-rust-toolchain.md).
+#[cfg(all(target_has_threads, not(target_os = "ask")))]
 compile_error!("Using no_threads implementation on a target with threads");
 
 #[doc(hidden)]

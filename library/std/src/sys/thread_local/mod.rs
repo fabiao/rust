@@ -30,6 +30,7 @@ cfg_select! {
         target_os = "zkvm",
         target_os = "trusty",
         target_os = "vexos",
+        target_os = "ask",
     ) => {
         mod no_threads;
         pub use no_threads::{EagerStorage, LazyStorage, thread_local_inner};
@@ -118,6 +119,9 @@ pub(crate) mod guard {
         any(
             target_os = "hermit",
             target_os = "xous",
+            // ask: single-threaded processes, `no_threads` storage above —
+            // process exit is the only "thread exit", nothing to register.
+            target_os = "ask",
         ) => {
             // `std` is the only runtime, so it just calls the destructor functions
             // itself when the time comes.
