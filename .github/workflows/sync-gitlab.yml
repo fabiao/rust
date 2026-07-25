@@ -25,8 +25,8 @@ jobs:
           # -------------------------------------------------------------
         run: |
           # 1. Configura l'utente Git per il commit di merge
-          git config user.name "fabiao"
-          git config user.email "fabio.difrancesco@gmail.com"
+          git config user.name "GitHub AutoSync Bot"
+          git config user.email "actions@github.com"
 
           # 2. Configura il remote GitLab usando l'autenticazione tramite Token
           GITLAB_URL="https://oauth2:${GITLAB_TOKEN}@gitlab.com/${GITLAB_REPO}.git"
