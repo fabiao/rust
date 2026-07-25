@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main # O "master", in base a come si chiama il tuo branch principale
+  workflow_dispatch: # <-- Aggiungi questa riga per abilitare il pulsante manuale!
 
 jobs:
   sync-and-merge:
