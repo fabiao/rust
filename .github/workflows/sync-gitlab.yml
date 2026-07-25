@@ -1,0 +1,52 @@
+name: Sync to GitLab and Merge Branch
+
+on:
+  push:
+    branches:
+      - main # O "master", in base a come si chiama il tuo branch principale
+
+jobs:
+  sync-and-merge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Recupera la cronologia completa, necessaria per i merge
+
+      - name: Sync Main and Merge Custom Branch on GitLab
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+          # -------------------------------------------------------------
+          # Personalizza queste 3 variabili con i tuoi dati:
+          GITLAB_USER: "fabiao"
+          GITLAB_REPO: "fabiao/rust"
+          CUSTOM_BRANCH: "ask"
+          # -------------------------------------------------------------
+        run: |
+          # 1. Configura l'utente Git per il commit di merge
+          git config user.name "fabiao"
+          git config user.email "fabio.difrancesco@gmail.com"
+
+          # 2. Configura il remote GitLab usando l'autenticazione tramite Token
+          GITLAB_URL="https://oauth2:${GITLAB_TOKEN}@gitlab.com/${GITLAB_REPO}.git"
+          git remote add gitlab $GITLAB_URL
+
+          # 3. Propaga il branch main aggiornato su GitLab
+          echo "==> Pushing main su GitLab..."
+          git push gitlab main
+
+          # 4. Scarica il branch custom da GitLab
+          echo "==> Fetching del branch custom '$CUSTOM_BRANCH' da GitLab..."
+          git fetch gitlab $CUSTOM_BRANCH
+
+          # 5. Crea/spostati sul branch custom locale tracciando quello di GitLab
+          git checkout -b $CUSTOM_BRANCH gitlab/$CUSTOM_BRANCH
+
+          # 6. Esegui il merge di main all'interno del branch custom
+          echo "==> Merge di main in $CUSTOM_BRANCH..."
+          git merge main -m "ci: auto-merge main into $CUSTOM_BRANCH after upstream update"
+
+          # 7. Push del branch custom aggiornato su GitLab
+          echo "==> Pushing del branch custom aggiornato su GitLab..."
+          git push gitlab $CUSTOM_BRANCH
