@@ -73,11 +73,12 @@ fortanix-sgx-abi = { version = "0.6.1", features = [
 [target.'cfg(target_os = "motor")'.dependencies]
 moto-rt = { version = "0.16", features = ['rustc-dep-of-std'], public = true }
 
-# In-tree only (ask-abi/, the vendored copy of the ask superproject's own
-# crate) — not published to crates.io, so a path dependency like
-# windows_link's rather than a version.
+# In-tree only (askabi/, the canonical ask superproject crate — no separate
+# vendored copy, which used to exist and drifted silently more than once,
+# docs/rust-toolchain_history.md) — not published to crates.io, so a path
+# dependency like windows_link's rather than a version.
 [target.'cfg(target_os = "ask")'.dependencies]
-ask-abi = { path = "../ask-abi", public = true }
+askabi = { path = "../../../../../core/services/askabi/source", public = true }
 
 [target.'cfg(target_os = "hermit")'.dependencies]
 hermit-abi = { version = "0.5.0", features = [
