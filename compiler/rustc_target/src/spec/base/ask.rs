@@ -1,4 +1,4 @@
-use crate::spec::{Cc, LinkerFlavor, Lld, Os, PanicStrategy, RustcAbi, StackProbeType, TargetOptions};
+use crate::spec::{Cc, LinkerFlavor, Lld, Os, PanicStrategy, StackProbeType, TargetOptions};
 
 pub(crate) fn opts() -> TargetOptions {
     TargetOptions {
@@ -11,11 +11,9 @@ pub(crate) fn opts() -> TargetOptions {
         static_position_independent_executables: false,
         linker_flavor: LinkerFlavor::Gnu(Cc::No, Lld::Yes),
         linker: Some("rust-lld".into()),
-        // Soft-float, no SSE: the kernel does not save FPU/SSE state on
-        // context switch, so userspace must not produce such instructions
-        // (same feature set as every ask service's target specification).
-        features: "-mmx,-sse,-sse2,-sse3,-ssse3,-sse4.1,-sse4.2,-avx,-avx2,+soft-float".into(),
-        rustc_abi: Some(RustcAbi::Softfloat),
+        // Userspace uses the ordinary x86_64 hard-float/SSE2 ABI. The
+        // kernel remains soft-float, but saves and restores each process's
+        // FXSAVE area at every context switch.
         // No ELF TLS: the kernel sets no thread pointer yet (docs/02's open
         // question); thread-locals go through std's OS-level fallback.
         has_thread_local: false,
