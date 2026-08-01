@@ -21,6 +21,10 @@ cfg_select! {
         mod motor;
         pub use motor::*;
     }
+    target_os = "ask" => {
+        mod ask;
+        pub use ask::*;
+    }
     target_os = "xous" => {
         mod xous;
         pub use xous::*;

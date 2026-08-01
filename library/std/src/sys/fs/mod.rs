@@ -29,6 +29,10 @@ cfg_select! {
         mod hermit;
         use hermit as imp;
     }
+    target_os = "ask" => {
+        mod ask;
+        use ask as imp;
+    }
     target_os = "motor" => {
         mod motor;
         use motor as imp;

@@ -7,6 +7,8 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![allow(missing_docs, nonstandard_style)]
 
+pub mod channel;
+
 use crate::io;
 
 /// `ask_abi::Error` carries no errno-shaped detail yet (docs/02's open

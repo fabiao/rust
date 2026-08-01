@@ -7154,7 +7154,15 @@ name = "askabi"
 version = "0.1.0"
 
 [[patch.unused]]
+name = "askclient"
+version = "0.1.0"
+
+[[patch.unused]]
 name = "askgraphics"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "askhid"
 version = "0.1.0"
 
 [[patch.unused]]
