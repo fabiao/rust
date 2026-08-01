@@ -8,9 +8,9 @@
 //!
 //! The process's `/exe`/`/in`/`/out` bindings arrive once at spawn time in
 //! the 64-byte startup view (`GetSpawnBlob(SPAWN_BLOB_VIEW,..)`,
-//! `ask_abi::view`); this module decodes only what a `Path` like
-//! `/out/nested/file.txt` needs — the bound provider pid for the `out` slot
-//! — rather than depending on `libask::view`, which std cannot link.
+//! `ask_abi::view`); this module decodes mount provider pids and optional
+//! source roots so paths like `/out/marker.txt` or `/in/asset.txt` map to
+//! provider-relative opens (`profiles/…/out/marker.txt`, `apptest/in/asset.txt`).
 
 use crate::ffi::OsString;
 use crate::hash::Hash;
@@ -23,21 +23,13 @@ use crate::sys::pal::unsupported_err;
 use crate::sys::time::SystemTime;
 use crate::sys::unsupported;
 
-/// Mirrors `ask_abi::view`'s fixed slot order (`Exe`, `In`, `Out`) — the
-/// `out` mount is slot 2, the only one `std::fs` currently resolves paths
-/// against (`fstest`/`apptest` bind only `/out`; `/exe`/`/in` have no
-/// current `std::fs` caller).
-const OUT_SLOT: usize = 2;
-
-/// Decode just the `out` binding's provider pid out of the raw startup-view
-/// blob — a trimmed, `libask`-free equivalent of
-/// `libask::view::View::decode_startup`, following the same "private
-/// trimmed copy" precedent `askposix-dl` already uses for the same
-/// std-cannot-depend-on-`libask` reason.
-fn out_provider_pid() -> io::Result<u32> {
+/// Decode a path mount's provider pid and optional source root from the
+/// startup-view blob — a trimmed, `libask`-free equivalent of
+/// `libask::view::View::decode_startup`.
+fn mount_binding(slot: usize) -> io::Result<(u32, [u8; ask_abi::view::ROOT_TABLE_LEN], u8, u8)> {
     let mut bytes = [0u8; ask_abi::view::LEN];
     ask_abi::get_startup_view(&mut bytes).map_err(crate::sys::map_ask_error)?;
-    let offset = OUT_SLOT * ask_abi::view::BINDING_LEN;
+    let offset = slot * ask_abi::view::BINDING_LEN;
     let bound = *bytes.get(offset + 5).ok_or_else(unsupported_err)?;
     if bound == 0 {
         return Err(unsupported_err());
@@ -47,20 +39,87 @@ fn out_provider_pid() -> io::Result<u32> {
         .and_then(|b| b.try_into().ok())
         .map(u32::from_le_bytes)
         .ok_or_else(unsupported_err)?;
-    Ok(pid)
+    let root_off = *bytes.get(offset + 6).ok_or_else(unsupported_err)?;
+    let root_len = *bytes.get(offset + 7).ok_or_else(unsupported_err)?;
+    let mut root_table = [0u8; ask_abi::view::ROOT_TABLE_LEN];
+    let table = bytes
+        .get(
+            ask_abi::view::ROOT_TABLE_OFFSET
+                ..ask_abi::view::ROOT_TABLE_OFFSET + ask_abi::view::ROOT_TABLE_LEN,
+        )
+        .ok_or_else(unsupported_err)?;
+    root_table.copy_from_slice(table);
+    Ok((pid, root_table, root_off, root_len))
 }
 
-/// Splits a `/out/...` path into its provider-relative tail. Every other
-/// mount (`/exe`, `/in`) and every non-absolute path report `Unsupported` —
-/// std's ask PAL only resolves the one mount any current caller binds.
-fn provider_relative_path(path: &Path) -> io::Result<&str> {
+/// Map `/exe|in|out/...` to `(provider_pid, provider-relative path bytes)`.
+fn resolve_fs_path(path: &Path) -> io::Result<(u32, heapless_path::PathBuf)> {
     let path = path.to_str().ok_or_else(unsupported_err)?;
-    let relative = path.strip_prefix("/out/").or_else(|| {
-        // `/out` itself (no trailing component) resolves to an empty
-        // provider-relative path.
-        (path == "/out").then_some("")
-    });
-    relative.ok_or_else(unsupported_err)
+    let relative = path.strip_prefix('/').ok_or_else(unsupported_err)?;
+    let (mount, rest) = relative.split_once('/').ok_or_else(unsupported_err)?;
+    if rest.is_empty()
+        || rest
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(unsupported_err());
+    }
+    let slot = match mount {
+        "exe" => 0usize,
+        "in" => 1,
+        "out" => 2,
+        _ => return Err(unsupported_err()),
+    };
+    let (pid, root_table, root_off, root_len) = mount_binding(slot)?;
+    let mut out = heapless_path::PathBuf::new();
+    if root_len != 0 {
+        let start = root_off as usize;
+        let end = start
+            .checked_add(root_len as usize)
+            .ok_or_else(unsupported_err)?;
+        let root = root_table.get(start..end).ok_or_else(unsupported_err)?;
+        out.push(root)?;
+        out.push(b"/")?;
+    }
+    out.push(rest.as_bytes())?;
+    Ok((pid, out))
+}
+
+/// Tiny fixed path builder — avoids `alloc` in the hot open path while still
+/// fitting `ask_abi::fs::OPEN_PATH_MAX`.
+mod heapless_path {
+    use super::*;
+
+    pub struct PathBuf {
+        buf: [u8; ask_abi::fs::OPEN_PATH_MAX],
+        len: usize,
+    }
+
+    impl PathBuf {
+        pub fn new() -> Self {
+            Self {
+                buf: [0; ask_abi::fs::OPEN_PATH_MAX],
+                len: 0,
+            }
+        }
+
+        pub fn push(&mut self, bytes: &[u8]) -> io::Result<()> {
+            let end = self
+                .len
+                .checked_add(bytes.len())
+                .ok_or_else(unsupported_err)?;
+            if end > ask_abi::fs::OPEN_PATH_MAX {
+                return Err(unsupported_err());
+            }
+            self.buf[self.len..end].copy_from_slice(bytes);
+            self.len = end;
+            Ok(())
+        }
+
+        pub fn as_bytes(&self) -> &[u8] {
+            &self.buf[..self.len]
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -233,10 +292,9 @@ fn map_fs_result(result: i32) -> io::Result<()> {
 
 impl File {
     pub fn open(path: &Path, opts: &OpenOptions) -> io::Result<File> {
-        let relative = provider_relative_path(path)?;
-        let provider_pid = out_provider_pid()?;
+        let (provider_pid, relative) = resolve_fs_path(path)?;
         let mut channel = SyncChannel::create(provider_pid as u64, 1)
-            .map_err(|_| io::const_error!(io::ErrorKind::NotFound, "askfs unreachable"))?;
+            .map_err(|_| io::const_error!(io::ErrorKind::NotFound, "fs provider unreachable"))?;
 
         let mut request = [0u8; 4 + ask_abi::fs::OPEN_PATH_MAX];
         let payload =
@@ -244,12 +302,12 @@ impl File {
                 .ok_or_else(unsupported_err)?;
         let completion = channel.call(ask_abi::fs::OP_OPEN, payload)?;
         if completion.result < 0 {
-            return Err(io::const_error!(io::ErrorKind::NotFound, "askfs: open failed"));
+            return Err(io::const_error!(io::ErrorKind::NotFound, "fs: open failed"));
         }
         let (handle, size) =
             ask_abi::fs::decode_fs_open_reply(completion.payload()).ok_or_else(unsupported_err)?;
         if handle == ask_abi::fs::HANDLE_INVALID {
-            return Err(io::const_error!(io::ErrorKind::NotFound, "askfs: open failed"));
+            return Err(io::const_error!(io::ErrorKind::NotFound, "fs: open failed"));
         }
 
         Ok(File {
