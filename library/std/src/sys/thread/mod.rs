@@ -12,10 +12,10 @@ cfg_select! {
     }
     target_os = "ask" => {
         mod ask;
-        pub use ask::{sleep, yield_now};
+        pub use ask::{DEFAULT_MIN_STACK_SIZE, Thread, sleep, yield_now};
         #[expect(dead_code)]
         mod unsupported;
-        pub use unsupported::{Thread, available_parallelism, current_os_id, set_name, DEFAULT_MIN_STACK_SIZE};
+        pub use unsupported::{available_parallelism, current_os_id, set_name};
     }
     all(target_vendor = "fortanix", target_env = "sgx") => {
         mod sgx;

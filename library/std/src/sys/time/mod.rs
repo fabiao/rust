@@ -8,13 +8,7 @@ cfg_select! {
     }
     target_os = "ask" => {
         mod ask;
-        #[expect(unused)]
-        mod unsupported;
-
-        mod imp {
-            pub use super::ask::Instant;
-            pub use super::unsupported::{SystemTime, UNIX_EPOCH};
-        }
+        use ask as imp;
     }
     all(target_vendor = "fortanix", target_env = "sgx") => {
         mod sgx;

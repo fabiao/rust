@@ -30,7 +30,6 @@ cfg_select! {
         target_os = "zkvm",
         target_os = "trusty",
         target_os = "vexos",
-        target_os = "ask",
     ) => {
         mod no_threads;
         pub use no_threads::{EagerStorage, LazyStorage, thread_local_inner};
@@ -119,8 +118,12 @@ pub(crate) mod guard {
         any(
             target_os = "hermit",
             target_os = "xous",
-            // ask: single-threaded processes, `no_threads` storage above —
-            // process exit is the only "thread exit", nothing to register.
+            // ask has no OS-provided pthread-key-style automatic destructor
+            // callback for its own `key` backend (`sys/thread_local/key/ask.rs`)
+            // to piggyback on the way `guard/key.rs`'s `_ =>` arm below does —
+            // same reasoning as `xous`. `sys/thread/ask.rs`'s own trampoline
+            // calls `key::destroy_tls()` directly after the user closure
+            // returns, mirroring `sys/thread/xous.rs`'s identical call.
             target_os = "ask",
         ) => {
             // `std` is the only runtime, so it just calls the destructor functions
@@ -198,6 +201,16 @@ pub(crate) mod key {
             pub(super) use racy::LazyKey;
             pub(super) use moto_rt::tls::{Key, get, set};
             use moto_rt::tls::{create, destroy};
+        }
+        target_os = "ask" => {
+            mod ask;
+            mod racy;
+            #[cfg(test)]
+            mod tests;
+            pub(super) use racy::LazyKey;
+            pub(crate) use ask::{destroy_tls, init_this_thread};
+            pub(super) use ask::{Key, get, set};
+            use ask::{create, destroy};
         }
         _ => {}
     }

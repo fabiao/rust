@@ -43,6 +43,18 @@ extern "sysv64" fn _start() -> ! {
     unsafe extern "C" {
         fn main(argc: isize, argv: *const *const u8, sigpipe: u8) -> i32;
     }
+    // `sys::thread_local::key::ask`'s TLS-key table lives behind a
+    // self-pointer at `%fs:0`; every execution context needs a real, mapped
+    // `%fs` base before that read happens, since dereferencing an unset
+    // segment (base `0`, the kernel's default for a fresh process)
+    // page-faults immediately rather than reading as a soft null. This must
+    // run before the compiler-generated `main` below, which internally
+    // calls `rt::init` — that already touches `thread_local!` state
+    // (`thread::current_id()`) before `sys::init` (this crate's own hook)
+    // would otherwise get a chance to install it. A `SpawnThread` child
+    // gets the same call from `sys::thread::ask::Thread::new`'s own
+    // trampoline, its equivalent earliest point.
+    crate::sys::thread_local::key::init_this_thread();
     // `SpawnRaw`'s binary capability block carries no argument list
     // (docs/02-kernel-abi.md) — every ask process starts with an empty
     // argv, the same posture Motor OS's `motor_start` takes.
