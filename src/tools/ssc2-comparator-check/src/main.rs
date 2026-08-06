@@ -10,10 +10,12 @@
 //! crate's own fully-resolved static callgraph (`callgraph`/`budget`
 //! modules) — every piece of docs/scheduling.md's "Safe-Rust-subset
 //! restriction rules" and "Stack budget, execution-bound metric, and
-//! load-path enforcement" is implemented. NOT yet done: wiring this binary
-//! into an actual SSC2 package-loading step (none exists yet) and placing
-//! the budget constants in `askabi` — see docs/scheduling.md's Open
-//! Decisions.
+//! load-path enforcement" is implemented. Wired into `ask_cookbook sign`
+//! as an enforced gate for any `ssc2_comparator = true` recipe
+//! (`recipes/tools/ask_cookbook/source/src/actions/sign.rs`), which also
+//! passes `--stack-budget-pages`/`--block-budget` sourced from
+//! `askabi::sched` — see `budget::Budget`'s own doc comment for why that
+//! (not a Cargo dependency) is this crate's real single source of truth.
 
 #![feature(rustc_private)]
 
@@ -49,7 +51,9 @@ use rustc_middle::ty::{self, TyCtxt};
 /// lint — that lint's own doc comment there explains why: it can't
 /// distinguish real unsafe code from the `#[unsafe(no_mangle)]` attribute
 /// every comparator's exported entry point structurally requires.
-struct Ssc2ComparatorCalls;
+struct Ssc2ComparatorCalls {
+    budget: budget::Budget,
+}
 
 impl rustc_driver::Callbacks for Ssc2ComparatorCalls {
     fn after_crate_root_parsing(
@@ -75,7 +79,7 @@ impl rustc_driver::Callbacks for Ssc2ComparatorCalls {
             Ok(reachable) => reachable,
             Err(violation) => fatal_error(&violation.to_string()),
         };
-        if let Err(violation) = budget::check(tcx, &reachable) {
+        if let Err(violation) = budget::check(tcx, &reachable, self.budget) {
             fatal_error(&violation.to_string());
         }
 
@@ -119,11 +123,24 @@ fn reject_unstable_flags(args: &[String]) {
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().collect();
+    let mut args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: ssc2-comparator-check <path-to-comparator-crate-main.rs> [rustc args...]");
+        eprintln!(
+            "usage: ssc2-comparator-check <path-to-comparator-crate-main.rs> \
+             [--stack-budget-pages=N] [--block-budget=N] [rustc args...]"
+        );
         return ExitCode::FAILURE;
     }
+
+    // Stripped before `reject_*`/`rustc_driver` ever see `args` — neither
+    // is a real rustc flag, and rustc rejects unrecognized `--` flags.
+    let budget = match budget::Budget::parse_and_strip(&mut args) {
+        Ok(budget) => budget,
+        Err(msg) => {
+            eprintln!("ssc2-comparator-check: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     reject_forbidden_target_features(&args);
     reject_unstable_flags(&args);
@@ -131,7 +148,7 @@ fn main() -> ExitCode {
     // `rustc_driver::run_compiler` itself drops `args[0]` (the program
     // name) internally, so the compiler's own args start at `args[1]` —
     // pass the full `args`, not `&args[1..]`.
-    let mut callbacks = Ssc2ComparatorCalls;
+    let mut callbacks = Ssc2ComparatorCalls { budget };
     match rustc_driver::catch_fatal_errors(|| rustc_driver::run_compiler(&args, &mut callbacks)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(_) => ExitCode::FAILURE,

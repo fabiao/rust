@@ -29,19 +29,78 @@ use rustc_middle::ty::{self, Instance, TyCtxt};
 /// execution-bound metric, and load-path enforcement"). Canonical home:
 /// `askabi::sched::{COMPARATOR_STACK_BUDGET_PAGES, COMPARATOR_BLOCK_BUDGET}`
 /// (`recipes/core/services/askabi/source/src/sched.rs`) — kept as a local
-/// copy here instead of a real dependency because `recipes/tools/rust` is a
-/// separate submodule/workspace that must never depend on a crate outside
-/// itself (docs/rust-toolchain.md, "ask-specific `src/tools/*` additions").
-/// Unify only once a real SSC2 package-loading step gives both sides of
-/// that submodule boundary a shared wire format to agree through.
-const COMPARATOR_STACK_BUDGET_PAGES: u64 = 4;
-const COMPARATOR_BLOCK_BUDGET: usize = 64;
+/// default here instead of a Cargo dependency because `recipes/tools/rust`
+/// is a separate submodule/workspace that must never depend on a crate
+/// outside itself (docs/rust-toolchain.md, "ask-specific `src/tools/*`
+/// additions"). `ask_cookbook sign` (outside that submodule, so free to
+/// depend on `askabi` directly) is the real single source of truth at
+/// runtime: it passes `--stack-budget-pages=<askabi::sched::
+/// COMPARATOR_STACK_BUDGET_PAGES>`/`--block-budget=<askabi::sched::
+/// COMPARATOR_BLOCK_BUDGET>` on every invocation (`Budget::parse_and_
+/// strip`, `main.rs`), so these consts only serve a standalone/manual
+/// invocation of this checker outside the `sign` gate — the shared wire
+/// format docs/rust-toolchain.md's own comment anticipated, once
+/// `ask_cookbook sign` became that real consumer on both sides of the
+/// boundary.
+const DEFAULT_COMPARATOR_STACK_BUDGET_PAGES: u64 = 4;
+const DEFAULT_COMPARATOR_BLOCK_BUDGET: usize = 64;
 
 /// Bring-up assumption matching `recipes/core/kernel/source`'s own build
 /// target — the comparator's eventual load-path target is `x86_64-unknown-ask`,
 /// whose page size is the ordinary x86_64 4 KiB page. Mirrors
-/// `askabi::sched::PAGE_SIZE_BYTES`, same local-copy reasoning as above.
+/// `askabi::sched::PAGE_SIZE_BYTES`. Not `sign`-overridable like the two
+/// budgets above: an x86_64 page size is a hardware fact, not policy.
 const PAGE_SIZE_BYTES: u64 = 4096;
+
+/// Resolved stack/block budget for one `check()` call — either
+/// `sign`-provided (`--stack-budget-pages=N`/`--block-budget=N`, stripped
+/// from the compiler's own arg list before `rustc_driver` sees them) or
+/// this crate's own bring-up defaults for a standalone invocation.
+#[derive(Clone, Copy)]
+pub struct Budget {
+    pub stack_budget_pages: u64,
+    pub block_budget: usize,
+}
+
+impl Default for Budget {
+    fn default() -> Self {
+        Self {
+            stack_budget_pages: DEFAULT_COMPARATOR_STACK_BUDGET_PAGES,
+            block_budget: DEFAULT_COMPARATOR_BLOCK_BUDGET,
+        }
+    }
+}
+
+impl Budget {
+    /// Scans `args` for `--stack-budget-pages=N`/`--block-budget=N`,
+    /// removing every matched flag in place (rustc would otherwise reject
+    /// them as unknown) and returning the resolved `Budget` — defaults
+    /// fill in whichever flag `sign` didn't pass, so a standalone
+    /// invocation with neither flag reproduces today's fixed-default
+    /// behavior exactly.
+    pub fn parse_and_strip(args: &mut Vec<String>) -> Result<Self, String> {
+        let mut budget = Self::default();
+        let mut i = 0;
+        while i < args.len() {
+            if let Some(value) = args[i].strip_prefix("--stack-budget-pages=") {
+                budget.stack_budget_pages = value
+                    .parse()
+                    .map_err(|_| format!("invalid --stack-budget-pages value: {value:?}"))?;
+                args.remove(i);
+                continue;
+            }
+            if let Some(value) = args[i].strip_prefix("--block-budget=") {
+                budget.block_budget = value
+                    .parse()
+                    .map_err(|_| format!("invalid --block-budget value: {value:?}"))?;
+                args.remove(i);
+                continue;
+            }
+            i += 1;
+        }
+        Ok(budget)
+    }
+}
 
 pub enum Violation {
     StackBudgetExceeded { estimated_bytes: u64, budget_bytes: u64 },
@@ -54,12 +113,12 @@ impl fmt::Display for Violation {
             Violation::StackBudgetExceeded { estimated_bytes, budget_bytes } => write!(
                 f,
                 "comparator callgraph's estimated stack usage ({estimated_bytes} bytes) exceeds \
-                 the {budget_bytes}-byte budget (COMPARATOR_STACK_BUDGET_PAGES)"
+                 the {budget_bytes}-byte budget (--stack-budget-pages)"
             ),
             Violation::BlockBudgetExceeded { blocks, budget } => write!(
                 f,
                 "comparator callgraph has {blocks} basic blocks, exceeding the \
-                 {budget}-block budget (COMPARATOR_BLOCK_BUDGET)"
+                 {budget}-block budget (--block-budget)"
             ),
         }
     }
@@ -70,7 +129,11 @@ impl fmt::Display for Violation {
 /// already validated — a rejected callgraph never reaches this check, so
 /// this takes the already-computed set rather than re-deriving it), and
 /// rejects if either sum exceeds its fixed budget.
-pub fn check<'tcx>(tcx: TyCtxt<'tcx>, reachable: &HashSet<Instance<'tcx>>) -> Result<(), Violation> {
+pub fn check<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    reachable: &HashSet<Instance<'tcx>>,
+    budget: Budget,
+) -> Result<(), Violation> {
     let mut total_stack_bytes: u64 = 0;
     let mut total_blocks: usize = 0;
 
@@ -85,17 +148,17 @@ pub fn check<'tcx>(tcx: TyCtxt<'tcx>, reachable: &HashSet<Instance<'tcx>>) -> Re
         total_blocks = total_blocks.saturating_add(body.basic_blocks.len());
     }
 
-    let budget_bytes = COMPARATOR_STACK_BUDGET_PAGES.saturating_mul(PAGE_SIZE_BYTES);
+    let budget_bytes = budget.stack_budget_pages.saturating_mul(PAGE_SIZE_BYTES);
     if total_stack_bytes > budget_bytes {
         return Err(Violation::StackBudgetExceeded {
             estimated_bytes: total_stack_bytes,
             budget_bytes,
         });
     }
-    if total_blocks > COMPARATOR_BLOCK_BUDGET {
+    if total_blocks > budget.block_budget {
         return Err(Violation::BlockBudgetExceeded {
             blocks: total_blocks,
-            budget: COMPARATOR_BLOCK_BUDGET,
+            budget: budget.block_budget,
         });
     }
 
