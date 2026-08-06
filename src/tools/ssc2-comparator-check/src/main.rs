@@ -1,37 +1,43 @@
-//! Standalone rustc-driver tool enforcing the compiler-flag-level half of
-//! SSC2's comparator safe-Rust-subset restrictions (docs/scheduling.md,
-//! "Safe-Rust-subset restriction rules"). Modeled on miri's own
-//! `rustc_driver::Callbacks` driver shape (`src/tools/miri/src/bin/miri.rs`),
-//! but much thinner: this tool never executes the comparator, it only
-//! rejects a compilation before codegen.
+//! Standalone rustc-driver tool enforcing SSC2's comparator safe-Rust-subset
+//! restrictions (docs/scheduling.md, "Safe-Rust-subset restriction rules").
+//! Modeled on miri's own `rustc_driver::Callbacks` driver shape
+//! (`src/tools/miri/src/bin/miri.rs`), but much thinner: this tool never
+//! executes the comparator, it only rejects a compilation before codegen.
 //!
-//! Scope of this binary: reject `unsafe` code, unstable (`-Z`) features, and
-//! floating-point/SIMD target features. It does NOT yet check recursion,
-//! indirect calls, or the stack/block budgets (`COMPARATOR_STACK_BUDGET_PAGES`,
-//! `COMPARATOR_BLOCK_BUDGET`) — those need the monomorphization callgraph
-//! (`rustc_monomorphize::collector`) and are deferred to a follow-up pass
-//! that will extend `Callbacks::after_analysis` below, marked at its
-//! attachment point.
+//! Checks implemented: `unsafe` code, unstable (`-Z`) features,
+//! floating-point/SIMD target features (all compiler-flag-level), plus
+//! recursion, indirect calls, and stack/block budget accounting over the
+//! crate's own fully-resolved static callgraph (`callgraph`/`budget`
+//! modules) — every piece of docs/scheduling.md's "Safe-Rust-subset
+//! restriction rules" and "Stack budget, execution-bound metric, and
+//! load-path enforcement" is implemented. NOT yet done: wiring this binary
+//! into an actual SSC2 package-loading step (none exists yet) and placing
+//! the budget constants in `askabi` — see docs/scheduling.md's Open
+//! Decisions.
 
 #![feature(rustc_private)]
 
 extern crate rustc_driver;
+extern crate rustc_hir;
 extern crate rustc_interface;
 extern crate rustc_middle;
 extern crate rustc_session;
+
+mod budget;
+mod callgraph;
 
 use std::env;
 use std::process::ExitCode;
 
 use rustc_driver::Compilation;
 use rustc_interface::interface;
-use rustc_middle::ty::TyCtxt;
+use rustc_middle::ty::{self, TyCtxt};
 
 /// `rustc_driver::Callbacks` impl rejecting a comparator crate that uses
-/// `unsafe` or floating-point/SIMD target features — the mechanical part
-/// of the Rex-style blocklist (docs/scheduling.md). Unstable (`-Z`) feature
-/// and forbidden target-feature rejection happen earlier, against the raw
-/// CLI args (`reject_unstable_flags`, `reject_forbidden_target_features`)
+/// `unsafe`, floating-point/SIMD target features, recursion, or indirect
+/// calls — the Rex-style blocklist (docs/scheduling.md). Unstable (`-Z`)
+/// feature and forbidden target-feature rejection happen earlier, against
+/// the raw CLI args (`reject_unstable_flags`, `reject_forbidden_target_features`)
 /// — `Session::opts.unstable_features` cannot be used for this: it reports
 /// `Allow` for any nightly compiler regardless of `-Z` flags actually
 /// passed, including this checker's own nightly stage1 host compiler, so
@@ -47,18 +53,22 @@ impl rustc_driver::Callbacks for Ssc2ComparatorCalls {
         config.opts.lint_opts.push(("unsafe_code".to_owned(), rustc_session::lint::Level::Deny));
     }
 
-    // Attachment point for the next implementation slice: recursion ban,
-    // indirect-call ban, and stack/block budget accounting all need the
-    // fully-resolved monomorphized callgraph, available here via
-    // `rustc_monomorphize::collector::collect_crate_mono_items(tcx, ...)`
-    // (compiler/rustc_monomorphize/src/collector.rs). Intentionally left
-    // unimplemented this slice — see docs/scheduling.md's Open Decisions.
     fn after_analysis<'tcx>(
         &mut self,
         _compiler: &interface::Compiler,
         tcx: TyCtxt<'tcx>,
     ) -> Compilation {
         tcx.dcx().abort_if_errors();
+
+        let typing_env = ty::TypingEnv::fully_monomorphized();
+        let reachable = match callgraph::reachable_instances(tcx, typing_env) {
+            Ok(reachable) => reachable,
+            Err(violation) => fatal_error(&violation.to_string()),
+        };
+        if let Err(violation) = budget::check(tcx, &reachable) {
+            fatal_error(&violation.to_string());
+        }
+
         Compilation::Stop
     }
 }
