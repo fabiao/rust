@@ -17,14 +17,16 @@
 
 #![feature(rustc_private)]
 
+extern crate rustc_ast;
 extern crate rustc_driver;
 extern crate rustc_hir;
 extern crate rustc_interface;
 extern crate rustc_middle;
-extern crate rustc_session;
+extern crate rustc_span;
 
 mod budget;
 mod callgraph;
+mod unsafe_code;
 
 use std::env;
 use std::process::ExitCode;
@@ -34,23 +36,31 @@ use rustc_interface::interface;
 use rustc_middle::ty::{self, TyCtxt};
 
 /// `rustc_driver::Callbacks` impl rejecting a comparator crate that uses
-/// `unsafe`, floating-point/SIMD target features, recursion, or indirect
-/// calls — the Rex-style blocklist (docs/scheduling.md). Unstable (`-Z`)
-/// feature and forbidden target-feature rejection happen earlier, against
-/// the raw CLI args (`reject_unstable_flags`, `reject_forbidden_target_features`)
-/// — `Session::opts.unstable_features` cannot be used for this: it reports
-/// `Allow` for any nightly compiler regardless of `-Z` flags actually
-/// passed, including this checker's own nightly stage1 host compiler, so
-/// it can't distinguish a comparator's `-Z` usage from the toolchain's own
-/// channel.
+/// real unsafe code, floating-point/SIMD target features, recursion, or
+/// indirect calls — the Rex-style blocklist (docs/scheduling.md).
+/// Unstable (`-Z`) feature and forbidden target-feature rejection happen
+/// earlier, against the raw CLI args (`reject_unstable_flags`,
+/// `reject_forbidden_target_features`) — `Session::opts.unstable_features`
+/// cannot be used for this: it reports `Allow` for any nightly compiler
+/// regardless of `-Z` flags actually passed, including this checker's own
+/// nightly stage1 host compiler, so it can't distinguish a comparator's
+/// `-Z` usage from the toolchain's own channel. Unsafe-code rejection is a
+/// custom AST walk (`unsafe_code` module), not the built-in `unsafe_code`
+/// lint — that lint's own doc comment there explains why: it can't
+/// distinguish real unsafe code from the `#[unsafe(no_mangle)]` attribute
+/// every comparator's exported entry point structurally requires.
 struct Ssc2ComparatorCalls;
 
 impl rustc_driver::Callbacks for Ssc2ComparatorCalls {
-    fn config(&mut self, config: &mut interface::Config) {
-        // `-D unsafe_code` is a built-in rustc lint, not a clippy lint —
-        // forbidding it here at the config level makes it non-overridable
-        // by any `#![allow(unsafe_code)]` in the checked crate itself.
-        config.opts.lint_opts.push(("unsafe_code".to_owned(), rustc_session::lint::Level::Deny));
+    fn after_crate_root_parsing(
+        &mut self,
+        _compiler: &interface::Compiler,
+        krate: &mut rustc_ast::Crate,
+    ) -> Compilation {
+        if let Some(violation) = unsafe_code::check(krate) {
+            fatal_error(&violation.to_string());
+        }
+        Compilation::Continue
     }
 
     fn after_analysis<'tcx>(
