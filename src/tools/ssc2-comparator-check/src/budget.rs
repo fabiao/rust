@@ -26,16 +26,21 @@ use rustc_middle::mir::Body;
 use rustc_middle::ty::{self, Instance, TyCtxt};
 
 /// `docs/scheduling.md`'s two fixed bring-up defaults ("Stack budget,
-/// execution-bound metric, and load-path enforcement"). Home: eventually
-/// `askabi`, alongside `SchedContext`'s other shared values (CLAUDE.md's
-/// "constants are configuration boundaries" rule) — not yet placed there,
-/// same deferred status as when this pair was first decided.
+/// execution-bound metric, and load-path enforcement"). Canonical home:
+/// `askabi::sched::{COMPARATOR_STACK_BUDGET_PAGES, COMPARATOR_BLOCK_BUDGET}`
+/// (`recipes/core/services/askabi/source/src/sched.rs`) — kept as a local
+/// copy here instead of a real dependency because `recipes/tools/rust` is a
+/// separate submodule/workspace that must never depend on a crate outside
+/// itself (docs/rust-toolchain.md, "ask-specific `src/tools/*` additions").
+/// Unify only once a real SSC2 package-loading step gives both sides of
+/// that submodule boundary a shared wire format to agree through.
 const COMPARATOR_STACK_BUDGET_PAGES: u64 = 4;
 const COMPARATOR_BLOCK_BUDGET: usize = 64;
 
 /// Bring-up assumption matching `recipes/core/kernel/source`'s own build
 /// target — the comparator's eventual load-path target is `x86_64-unknown-ask`,
-/// whose page size is the ordinary x86_64 4 KiB page.
+/// whose page size is the ordinary x86_64 4 KiB page. Mirrors
+/// `askabi::sched::PAGE_SIZE_BYTES`, same local-copy reasoning as above.
 const PAGE_SIZE_BYTES: u64 = 4096;
 
 pub enum Violation {

@@ -48,7 +48,7 @@ pub unsafe fn alloc(layout: Layout) -> *mut u8 {
 
     if aligned.checked_add(size).is_none_or(|top| top > end) {
         let grow = align_up(size.max(CHUNK_LEN), 4096);
-        if ask_abi::map(end, grow, true, false).is_err() {
+        if ask_abi::map(end, grow, true, false, ask_abi::APP_FRAME_TOKEN).is_err() {
             unlock();
             return core::ptr::null_mut();
         }

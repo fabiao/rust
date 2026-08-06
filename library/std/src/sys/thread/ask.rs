@@ -50,7 +50,8 @@ impl Thread {
     pub unsafe fn new(stack: usize, init: Box<ThreadInit>) -> io::Result<Thread> {
         let stack_len = align_pages(stack as u64);
         let stack_base = NEXT_STACK.fetch_add(stack_len, core::sync::atomic::Ordering::Relaxed);
-        ask_abi::map(stack_base, stack_len, true, false).map_err(map_ask_error)?;
+        ask_abi::map(stack_base, stack_len, true, false, ask_abi::APP_FRAME_TOKEN)
+            .map_err(map_ask_error)?;
         let stack_top = stack_base + stack_len - 8;
 
         // Transfers ownership of `init` into the new thread's own address
