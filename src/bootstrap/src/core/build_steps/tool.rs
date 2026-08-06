@@ -1593,6 +1593,12 @@ tool_rustc_extended!(Clippy {
         }
     }
 });
+tool_rustc_extended!(Ssc2ComparatorCheck {
+    path: "src/tools/ssc2-comparator-check",
+    tool_name: "ssc2-comparator-check",
+    stable: false,
+    add_bins_to_sysroot: ["ssc2-comparator-check"]
+});
 tool_rustc_extended!(Miri {
     path: "src/tools/miri",
     tool_name: "miri",

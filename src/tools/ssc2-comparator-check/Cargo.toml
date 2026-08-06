@@ -1,0 +1,9 @@
+[package]
+name = "ssc2-comparator-check"
+version = "0.0.0"
+edition = "2024"
+
+[[bin]]
+name = "ssc2-comparator-check"
+test = false
+doctest = false

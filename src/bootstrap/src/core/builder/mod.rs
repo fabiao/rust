@@ -827,6 +827,7 @@ impl<'a> Builder<'a> {
                 llvm::Sanitizers,
                 tool::Rustfmt,
                 tool::Cargofmt,
+                tool::Ssc2ComparatorCheck,
                 tool::Miri,
                 tool::CargoMiri,
                 llvm::Lld,
