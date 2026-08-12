@@ -474,6 +474,10 @@ name = "askclient"
 version = "0.1.0"
 
 [[patch.unused]]
+name = "askdrv"
+version = "0.1.0"
+
+[[patch.unused]]
 name = "askgraphics"
 version = "0.1.0"
 
