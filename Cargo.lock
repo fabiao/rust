@@ -7234,6 +7234,18 @@ name = "libcosmic"
 version = "1.0.0"
 
 [[patch.unused]]
+name = "mio"
+version = "1.2.2"
+
+[[patch.unused]]
+name = "polling"
+version = "3.11.0"
+
+[[patch.unused]]
+name = "pty"
+version = "0.1.0"
+
+[[patch.unused]]
 name = "smithay"
 version = "0.7.0"
 
@@ -7244,6 +7256,10 @@ version = "0.20.0"
 [[patch.unused]]
 name = "softbuffer"
 version = "0.4.8"
+
+[[patch.unused]]
+name = "tokio"
+version = "1.53.1"
 
 [[patch.unused]]
 name = "vulkan-loader-ask"
