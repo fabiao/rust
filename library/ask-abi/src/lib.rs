@@ -47,6 +47,7 @@ pub enum Error {
     Denied = u64::MAX,
     InvalidParams = u64::MAX - 1,
     UnknownSyscall = u64::MAX - 2,
+    Exhausted = u64::MAX - 3,
 }
 
 /// Every legitimate return value from these syscalls (a pid, a virtual
@@ -57,6 +58,7 @@ fn decode(v: u64) -> Result<u64, Error> {
         v if v == u64::MAX => Err(Error::Denied),
         v if v == u64::MAX - 1 => Err(Error::InvalidParams),
         v if v == u64::MAX - 2 => Err(Error::UnknownSyscall),
+        v if v == u64::MAX - 3 => Err(Error::Exhausted),
         v => Ok(v),
     }
 }
