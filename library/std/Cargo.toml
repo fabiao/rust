@@ -38,7 +38,7 @@ libc = { version = "0.2.185", default-features = false, features = [
 ], public = true }
 
 [target.'cfg(all(not(target_os = "aix"), not(all(windows, target_env = "msvc", not(target_vendor = "uwp")))))'.dependencies]
-object = { version = "0.39", default-features = false, optional = true, features = [
+object = { version = "0.40", default-features = false, optional = true, features = [
     'read_core',
     'elf',
     'macho',
@@ -60,13 +60,13 @@ path = "../windows_link"
 
 [dev-dependencies]
 rand = { version = "0.9.0", default-features = false, features = ["alloc"] }
-rand_xorshift = "0.4.0"
+rand_xorshift = "0.5.0"
 
 [target.'cfg(any(all(target_family = "wasm", not(any(unix, target_os = "wasi"))), target_os = "xous", target_os = "vexos", all(target_vendor = "fortanix", target_env = "sgx")))'.dependencies]
 dlmalloc = { version = "0.2.10", features = ['rustc-dep-of-std'] }
 
 [target.x86_64-fortanix-unknown-sgx.dependencies]
-fortanix-sgx-abi = { version = "0.6.1", features = [
+fortanix-sgx-abi = { version = "0.7.0", features = [
     'rustc-dep-of-std',
 ], public = true }
 
@@ -98,7 +98,7 @@ wasip2 = { version = '1.0.3', features = [
 ], default-features = false }
 
 [target.'cfg(all(target_os = "wasi", target_env = "p3"))'.dependencies]
-wasip3 = { version = '0.6.0', features = [
+wasip3 = { version = '0.7.0', features = [
     'rustc-dep-of-std',
 ], default-features = false }
 
@@ -107,7 +107,7 @@ r-efi = { version = "5.2.0", features = ['rustc-dep-of-std'] }
 r-efi-alloc = { version = "2.0.0", features = ['rustc-dep-of-std'] }
 
 [target.'cfg(target_os = "vexos")'.dependencies]
-vex-sdk = { version = "0.27.0", features = [
+vex-sdk = { version = "0.28.0", features = [
     'rustc-dep-of-std',
 ], default-features = false }
 
