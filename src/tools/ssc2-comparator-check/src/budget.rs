@@ -28,7 +28,7 @@ use rustc_middle::ty::{self, Instance, TyCtxt};
 /// `docs/scheduling.md`'s two fixed bring-up defaults ("Stack budget,
 /// execution-bound metric, and load-path enforcement"). Canonical home:
 /// `askabi::sched::{COMPARATOR_STACK_BUDGET_PAGES, COMPARATOR_BLOCK_BUDGET}`
-/// (`recipes/core/services/askabi/source/src/sched.rs`) — kept as a local
+/// (`recipes/core/libs/askabi/source/src/sched.rs`) — kept as a local
 /// default here instead of a Cargo dependency because `recipes/tools/rust`
 /// is a separate submodule/workspace that must never depend on a crate
 /// outside itself (docs/rust-toolchain.md, "ask-specific `src/tools/*`
