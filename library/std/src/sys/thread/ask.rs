@@ -114,6 +114,8 @@ impl Thread {
     }
 
     pub fn join(self) {
+        #[cfg(ask_class1_verify)]
+        panic!("Class 1 verification tripwire: std::thread::JoinHandle::join is prohibited");
         // `JoinThread` already blocks until exit and reclaims the tid slot;
         // std's own `Packet`/`join()` contract only needs the wait, not the
         // exit code (that travels back through the `rust_start` closure's
@@ -131,6 +133,8 @@ pub fn yield_now() {
 }
 
 pub fn sleep(duration: Duration) {
+    #[cfg(ask_class1_verify)]
+    panic!("Class 1 verification tripwire: std::thread::sleep is prohibited");
     let Some(deadline) = Instant::now().checked_add(duration) else {
         // An unrepresentable deadline is effectively forever. Park in the
         // largest supported chunks, still permitting explicit wakes.

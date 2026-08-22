@@ -212,6 +212,11 @@ impl SyncChannel {
     /// check stays as a defensive assertion against a future
     /// multi-in-flight caller.
     pub fn wait_for_completion(&mut self, user_data: u64) -> io::Result<Completion> {
+        #[cfg(ask_class1_verify)]
+        return Err(io::const_error!(
+            io::ErrorKind::Unsupported,
+            "Class 1 verification tripwire: blocking std ASK channel wait is prohibited",
+        ));
         loop {
             if let Some(completion) = self.try_pop_completion()? {
                 if completion.user_data == user_data {
@@ -237,6 +242,11 @@ impl SyncChannel {
         user_data: u64,
         timeout: Option<Duration>,
     ) -> io::Result<Completion> {
+        #[cfg(ask_class1_verify)]
+        return Err(io::const_error!(
+            io::ErrorKind::Unsupported,
+            "Class 1 verification tripwire: blocking std ASK channel wait is prohibited",
+        ));
         let Some(timeout) = timeout else {
             return self.wait_for_completion(user_data);
         };
