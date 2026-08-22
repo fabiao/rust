@@ -311,7 +311,7 @@ pub(super) fn op_to_const<'tcx>(
                     imm.layout.ty,
                 );
                 let msg = "`op_to_const` on an immediate scalar pair must only be used on slice references to the beginning of an actual allocation";
-                let ptr = a.to_pointer(ecx).expect(msg);
+                let ptr = a.to_pointer(ecx);
                 let (prov, offset) =
                     ptr.into_pointer_or_addr().expect(msg).prov_and_relative_offset();
                 let alloc_id = prov.alloc_id();
@@ -484,7 +484,7 @@ fn const_validate_mplace<'tcx>(
                 CtfeValidationMode::Const { allow_immutable_unsafe_cell: !inner }
             }
         };
-        ecx.const_validate_operand(&mplace.into(), path, &mut ref_tracking, mode)
+        ecx.const_validate_place(&mplace.into(), path, &mut ref_tracking, mode)
             .report_err()
             // Instead of just reporting the `InterpError` via the usual machinery, we give a more targeted
             // error about the validation failure.

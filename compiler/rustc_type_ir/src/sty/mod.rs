@@ -2,7 +2,7 @@ use std::fmt;
 
 use derive_where::derive_where;
 #[cfg(feature = "nightly")]
-use rustc_macros::StableHash_NoContext;
+use rustc_macros::{Decodable_NoContext, Encodable_NoContext, StableHash_NoContext};
 use rustc_type_ir_macros::{GenericTypeVisitable, Lift_Generic};
 use tracing::debug;
 
@@ -11,7 +11,7 @@ use crate::intern::Interned;
 use crate::relate::{Relate, RelateResult, TypeRelation};
 use crate::{
     BoundRegion, BoundRegionKind, BoundVar, BoundVarIndexKind, DebruijnIndex, FallibleTypeFolder,
-    Flags, Interner, PlaceholderRegion, RegionKind, TypeFlags, TypeFoldable, TypeFolder,
+    Flags, Interner, PlaceholderRegion, RegionKind, RegionVid, TypeFlags, TypeFoldable, TypeFolder,
     TypeVisitable, TypeVisitor,
 };
 
@@ -52,6 +52,58 @@ impl<I: Interner> Region<I> {
     #[inline]
     pub fn is_bound(self) -> bool {
         matches!(self.0.get(), RegionKind::ReBound(..))
+    }
+
+    #[inline]
+    pub fn is_error(self) -> bool {
+        matches!(self.kind(), RegionKind::ReError(_))
+    }
+
+    #[inline]
+    pub fn is_static(self) -> bool {
+        matches!(self.kind(), RegionKind::ReStatic)
+    }
+
+    #[inline]
+    pub fn is_erased(self) -> bool {
+        matches!(self.kind(), RegionKind::ReErased)
+    }
+
+    #[inline]
+    pub fn is_placeholder(self) -> bool {
+        matches!(self.kind(), RegionKind::RePlaceholder(..))
+    }
+
+    /// True for free regions other than `'static`.
+    pub fn is_param(self) -> bool {
+        matches!(self.kind(), RegionKind::ReEarlyParam(_) | RegionKind::ReLateParam(_))
+    }
+
+    /// True for free region in the current context.
+    ///
+    /// This is the case for `'static` and param regions.
+    pub fn is_free(self) -> bool {
+        match self.kind() {
+            RegionKind::ReStatic | RegionKind::ReEarlyParam(..) | RegionKind::ReLateParam(..) => {
+                true
+            }
+            RegionKind::ReVar(..)
+            | RegionKind::RePlaceholder(..)
+            | RegionKind::ReBound(..)
+            | RegionKind::ReErased
+            | RegionKind::ReError(..) => false,
+        }
+    }
+
+    pub fn is_var(self) -> bool {
+        matches!(self.kind(), RegionKind::ReVar(_))
+    }
+
+    pub fn as_var(self) -> RegionVid {
+        match self.kind() {
+            RegionKind::ReVar(vid) => vid,
+            _ => panic!("expected region {:?} to be of kind ReVar", self),
+        }
     }
 
     // FIXME this should be made private and instead accessed via the
@@ -159,5 +211,29 @@ impl<I: Interner> TypeFoldable<I> for Region<I> {
 
     fn fold_with<F: TypeFolder<I>>(self, folder: &mut F) -> Self {
         folder.fold_region(self)
+    }
+}
+
+#[derive_where(Clone, Copy, PartialEq, Eq, Hash; I: Interner)]
+#[cfg_attr(
+    feature = "nightly",
+    derive(Encodable_NoContext, Decodable_NoContext, StableHash_NoContext)
+)]
+/// The parameter representation of late-bound function parameters, "some region
+/// at least as big as the scope `fr.scope`".
+///
+/// Similar to a placeholder region as we create `LateParam` regions when entering a binder
+/// except they are always in the root universe and instead of using a boundvar to distinguish
+/// between others we use the `DefId` of the parameter. For this reason the `bound_region` field
+/// should basically always be `BoundRegionKind::Named` as otherwise there is no way of telling
+/// different parameters apart.
+pub struct LateParamRegion<I: Interner> {
+    pub scope: I::DefId,
+    pub kind: I::LateParamRegionKind,
+}
+
+impl<I: Interner> fmt::Debug for LateParamRegion<I> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ReLateParam({:?}, {:?})", self.scope, self.kind)
     }
 }

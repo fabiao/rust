@@ -772,8 +772,8 @@ impl<'tcx> Stable<'tcx> for ty::ClauseKind<'tcx> {
                 crate::ty::ClauseKind::RegionOutlives(region_outlives.stable(tables, cx))
             }
             ClauseKind::TypeOutlives(type_outlives) => {
-                let ty::OutlivesPredicate::<_, _>(a, b) = type_outlives;
-                crate::ty::ClauseKind::TypeOutlives(crate::ty::OutlivesPredicate(
+                let ty::OutlivesClause::<_, _>(a, b) = type_outlives;
+                crate::ty::ClauseKind::TypeOutlives(crate::ty::OutlivesClause(
                     a.stable(tables, cx),
                     b.stable(tables, cx),
                 ))
@@ -840,48 +840,48 @@ impl<'tcx> Stable<'tcx> for ty::CoercePredicate<'tcx> {
     }
 }
 
-impl<'tcx> Stable<'tcx> for ty::TraitPredicate<'tcx> {
-    type T = crate::ty::TraitPredicate;
+impl<'tcx> Stable<'tcx> for ty::TraitClause<'tcx> {
+    type T = crate::ty::TraitClause;
 
     fn stable<'cx>(
         &self,
         tables: &mut Tables<'cx, BridgeTys>,
         cx: &CompilerCtxt<'cx, BridgeTys>,
     ) -> Self::T {
-        let ty::TraitPredicate { trait_ref, polarity } = self;
-        crate::ty::TraitPredicate {
+        let ty::TraitClause { trait_ref, polarity } = self;
+        crate::ty::TraitClause {
             trait_ref: trait_ref.stable(tables, cx),
             polarity: polarity.stable(tables, cx),
         }
     }
 }
 
-impl<'tcx, T> Stable<'tcx> for ty::OutlivesPredicate<'tcx, T>
+impl<'tcx, T> Stable<'tcx> for ty::OutlivesClause<'tcx, T>
 where
     T: Stable<'tcx>,
 {
-    type T = crate::ty::OutlivesPredicate<T::T, Region>;
+    type T = crate::ty::OutlivesClause<T::T, Region>;
 
     fn stable<'cx>(
         &self,
         tables: &mut Tables<'cx, BridgeTys>,
         cx: &CompilerCtxt<'cx, BridgeTys>,
     ) -> Self::T {
-        let ty::OutlivesPredicate(a, b) = self;
-        crate::ty::OutlivesPredicate(a.stable(tables, cx), b.stable(tables, cx))
+        let ty::OutlivesClause(a, b) = self;
+        crate::ty::OutlivesClause(a.stable(tables, cx), b.stable(tables, cx))
     }
 }
 
-impl<'tcx> Stable<'tcx> for ty::ProjectionPredicate<'tcx> {
-    type T = crate::ty::ProjectionPredicate;
+impl<'tcx> Stable<'tcx> for ty::ProjectionClause<'tcx> {
+    type T = crate::ty::ProjectionClause;
 
     fn stable<'cx>(
         &self,
         tables: &mut Tables<'cx, BridgeTys>,
         cx: &CompilerCtxt<'cx, BridgeTys>,
     ) -> Self::T {
-        let ty::ProjectionPredicate { projection_term, term } = self;
-        crate::ty::ProjectionPredicate {
+        let ty::ProjectionClause { projection_term, term } = self;
+        crate::ty::ProjectionClause {
             projection_term: projection_term.stable(tables, cx),
             term: term.kind().stable(tables, cx),
         }
@@ -901,14 +901,14 @@ impl<'tcx> Stable<'tcx> for ty::ImplPolarity {
     }
 }
 
-impl<'tcx> Stable<'tcx> for ty::PredicatePolarity {
-    type T = crate::ty::PredicatePolarity;
+impl<'tcx> Stable<'tcx> for ty::ClausePolarity {
+    type T = crate::ty::ClausePolarity;
 
     fn stable(&self, _: &mut Tables<'_, BridgeTys>, _: &CompilerCtxt<'_, BridgeTys>) -> Self::T {
-        use rustc_middle::ty::PredicatePolarity::*;
+        use rustc_middle::ty::ClausePolarity::*;
         match self {
-            Positive => crate::ty::PredicatePolarity::Positive,
-            Negative => crate::ty::PredicatePolarity::Negative,
+            Positive => crate::ty::ClausePolarity::Positive,
+            Negative => crate::ty::ClausePolarity::Negative,
         }
     }
 }
@@ -1047,7 +1047,7 @@ impl<'tcx> Stable<'tcx> for rustc_abi::ExternAbi {
     }
 }
 
-impl<'tcx> Stable<'tcx> for rustc_session::cstore::ForeignModule {
+impl<'tcx> Stable<'tcx> for rustc_crate_store::ForeignModule {
     type T = crate::ty::ForeignModule;
 
     fn stable<'cx>(

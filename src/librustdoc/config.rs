@@ -7,16 +7,17 @@ use std::{fmt, io};
 
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_errors::DiagCtxtHandle;
+use rustc_lint::Level;
 use rustc_session::config::{
-    self, CodegenOptions, CrateType, ErrorOutputType, Externs, Input, JsonUnusedExterns,
+    self, CodegenOptions, ErrorOutputType, Externs, Input, JsonUnusedExterns,
     OptionsTargetModifiers, OutFileName, Sysroot, UnstableOptions, get_cmd_lint_options,
     nightly_options, parse_crate_types_from_list, parse_externs, parse_target_triple,
 };
-use rustc_session::lint::Level;
 use rustc_session::search_paths::SearchPath;
 use rustc_session::{EarlyDiagCtxt, getopts};
 use rustc_span::edition::Edition;
 use rustc_span::{FileName, RemapPathScopeComponents};
+use rustc_structures::CrateType;
 use rustc_target::spec::TargetTuple;
 use smallvec::SmallVec;
 
@@ -613,7 +614,10 @@ impl Options {
             Ok(include_parts_dir) => include_parts_dir,
             Err(e) => dcx.fatal(e),
         };
-        let mut should_merge = compute_should_merge(matches);
+        let mut should_merge = match compute_should_merge(matches) {
+            Ok(should_merge) => should_merge,
+            Err(e) => dcx.fatal(e),
+        };
         if parts_out_dir.is_none() && include_parts_dir.is_empty() {
             // we'll need to get rid of this stuff once Cargo stops using them
             parts_out_dir =
@@ -726,7 +730,14 @@ impl Options {
                 output_to_stdout = out_dir == "-";
                 PathBuf::from(out_dir)
             }
-            (None, None) => PathBuf::from("doc"),
+            (None, None) => {
+                if show_coverage {
+                    // If no `-o` option is given and we're in the `--show-coverage` mode, by
+                    // default we print on the stdout.
+                    output_to_stdout = true;
+                }
+                PathBuf::from("doc")
+            }
         };
 
         let cfgs = matches.opt_strs("cfg");
@@ -1114,15 +1125,16 @@ pub(crate) struct ShouldMerge {
 
 /// Extracts read_rendered_cci and write_rendered_cci from command line arguments, or
 /// reports an error if an invalid option was provided
-fn compute_should_merge(m: &getopts::Matches) -> ShouldMerge {
+fn compute_should_merge(m: &getopts::Matches) -> Result<ShouldMerge, &'static str> {
     match (m.opt_present("read-doc-meta-dir"), m.opt_present("write-doc-meta-dir")) {
         // shared mode
-        (false, false) => ShouldMerge { read_rendered_cci: true, write_rendered_cci: true },
+        (false, false) => Ok(ShouldMerge { read_rendered_cci: true, write_rendered_cci: true }),
         // intermediate mode
-        (false, true) => ShouldMerge { read_rendered_cci: false, write_rendered_cci: false },
+        (false, true) => Ok(ShouldMerge { read_rendered_cci: false, write_rendered_cci: false }),
         // finalize mode
-        (true, false) => ShouldMerge { read_rendered_cci: false, write_rendered_cci: true },
-        (true, true) => ShouldMerge { read_rendered_cci: false, write_rendered_cci: true },
+        (true, false) => Ok(ShouldMerge { read_rendered_cci: false, write_rendered_cci: true }),
+        // not valid
+        (true, true) => Err("cannot pass both --read-doc-meta-dir and --write-doc-meta-dir"),
     }
 }
 

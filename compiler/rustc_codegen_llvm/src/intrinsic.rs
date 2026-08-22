@@ -17,16 +17,18 @@ use rustc_codegen_ssa::traits::*;
 use rustc_hir as hir;
 use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_hir::find_attr;
+use rustc_lint_defs::builtin::DEPRECATED_LLVM_INTRINSIC;
 use rustc_middle::mir::BinOp;
 use rustc_middle::ty::layout::{FnAbiOf, HasTyCtxt, HasTypingEnv, LayoutOf};
 use rustc_middle::ty::offload_meta::OffloadMetadata;
 use rustc_middle::ty::{self, GenericArgsRef, Instance, SimdAlign, Ty, TyCtxt, TypingEnv};
 use rustc_middle::{bug, span_bug};
-use rustc_session::config::CrateType;
 use rustc_session::diagnostics::feature_err;
-use rustc_session::lint::builtin::DEPRECATED_LLVM_INTRINSIC;
 use rustc_span::{ErrorGuaranteed, Span, Symbol, sym};
-use rustc_symbol_mangling::{mangle_internal_symbol, symbol_name_for_instance_in_crate};
+use rustc_structures::CrateType;
+use rustc_symbol_mangling::{
+    mangle_internal_symbol, mangle_offload_export, symbol_name_for_instance_in_crate,
+};
 use rustc_target::callconv::PassMode;
 use rustc_target::spec::Arch;
 use tracing::debug;
@@ -35,11 +37,11 @@ use crate::abi::FnAbiLlvmExt;
 use crate::builder::Builder;
 use crate::builder::autodiff::{adjust_activity_to_abi, generate_enzyme_call};
 use crate::builder::gpu_offload::{
-    OffloadKernelDims, gen_call_handling, gen_define_handling, register_offload,
+    self, OffloadKernelDims, declare_omp_get_num_devices, register_offload,
 };
 use crate::context::CodegenCx;
 use crate::declare::declare_raw_fn;
-use crate::errors::{
+use crate::diagnostics::{
     AutoDiffWithoutEnable, AutoDiffWithoutLto, IntrinsicSignatureMismatch, IntrinsicWrongArch,
     OffloadWithoutEnable, OffloadWithoutFatLTO, UnknownIntrinsic,
 };
@@ -239,6 +241,13 @@ impl<'ll, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
                 // offload *has* a return type, but somehow works without mentioning the place
                 return IntrinsicResult::WroteIntoPlace;
             }
+            sym::offload_get_num_devices => {
+                let (fn_decl, fn_ty) = declare_omp_get_num_devices(self.cx);
+
+                let llval = self.call(fn_ty, None, None, fn_decl, &[], None, None);
+
+                return IntrinsicResult::Operand(OperandValue::Immediate(llval));
+            },
             sym::is_val_statically_known => {
                 if let OperandValue::Immediate(imm) = args[0].val {
                     self.call_intrinsic(
@@ -962,7 +971,6 @@ impl<'ll, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
         for arg in args {
             match arg.val {
                 OperandValue::ZeroSized => {}
-                OperandValue::Uninit => {}
                 OperandValue::Immediate(a) => llargs.push(a),
                 OperandValue::Pair(a, b) => {
                     llargs.push(a);
@@ -1850,10 +1858,14 @@ fn codegen_offload<'ll, 'tcx>(
         OperandValue::Immediate(val) => val,
         _ => panic!("unparsable"),
     };
-    let args = get_args_from_tuple(bx, args[4], fn_target);
-    let target_symbol = symbol_name_for_instance_in_crate(tcx, fn_target, LOCAL_CRATE);
+    let device_id = match args[4].val {
+        OperandValue::Immediate(val) => val,
+        _ => panic!("unparsable"),
+    };
+    let args = get_args_from_tuple(bx, args[5], fn_target);
+    let target_symbol = mangle_offload_export(tcx, fn_target);
 
-    let sig = tcx.fn_sig(fn_target.def_id()).skip_binder();
+    let sig = tcx.fn_sig(fn_target.def_id()).instantiate(tcx, fn_target.args).skip_norm_wip();
     let sig = tcx.instantiate_bound_regions_with_erased(sig);
     let inputs = sig.inputs();
 
@@ -1881,8 +1893,9 @@ fn codegen_offload<'ll, 'tcx>(
         }
     };
     register_offload(cx);
-    let offload_data = gen_define_handling(&cx, &metadata, target_symbol, offload_globals);
-    gen_call_handling(
+    let offload_data =
+        gpu_offload::gen_define_handling(&cx, &metadata, target_symbol, offload_globals);
+    gpu_offload::gen_call_handling(
         bx,
         &offload_data,
         &args,
@@ -1891,6 +1904,7 @@ fn codegen_offload<'ll, 'tcx>(
         offload_globals,
         &offload_dims,
         &dyn_cache,
+        &device_id,
     );
 }
 
@@ -1940,7 +1954,7 @@ fn get_args_from_tuple<'ll, 'tcx>(
             result
         }
 
-        OperandValue::ZeroSized | OperandValue::Uninit => vec![],
+        OperandValue::ZeroSized => vec![],
     }
 }
 

@@ -7,6 +7,7 @@ use std::{cmp, env, iter};
 
 use rustc_ast::expand::allocator::{ALLOC_ERROR_HANDLER, AllocatorKind, global_fn_name};
 use rustc_ast::{self as ast, *};
+use rustc_crate_store::{CrateDepKind, CrateSource, ExternCrate, ExternCrateSource};
 use rustc_data_structures::fx::FxHashSet;
 use rustc_data_structures::owned_slice::OwnedSlice;
 use rustc_data_structures::svh::Svh;
@@ -17,24 +18,25 @@ use rustc_hir as hir;
 use rustc_hir::def_id::{CrateNum, LOCAL_CRATE, LocalDefId, StableCrateId};
 use rustc_hir::definitions::Definitions;
 use rustc_index::IndexVec;
+use rustc_lint_defs as lint;
+use rustc_lint_defs::builtin::UNUSED_CRATE_DEPENDENCIES;
 use rustc_middle::bug;
 use rustc_middle::ty::data_structures::IndexSet;
 use rustc_middle::ty::{TyCtxt, TyCtxtFeed};
 use rustc_proc_macro::bridge::client::Client as ProcMacroClient;
+use rustc_session::Session;
 use rustc_session::config::mitigation_coverage::DeniedPartialMitigationLevel;
 use rustc_session::config::{
-    CrateType, ExtendedTargetModifierInfo, ExternLocation, Externs, OptionsTargetModifiers,
-    TargetModifier,
+    ExtendedTargetModifierInfo, ExternLocation, Externs, OptionsTargetModifiers, TargetModifier,
 };
-use rustc_session::cstore::{CrateDepKind, CrateSource, ExternCrate, ExternCrateSource};
 use rustc_session::output::validate_crate_name;
 use rustc_session::search_paths::PathKind;
-use rustc_session::{Session, lint};
 use rustc_span::def_id::DefId;
 use rustc_span::edition::Edition;
 use rustc_span::{DUMMY_SP, Ident, Span, Symbol, sym};
+use rustc_structures::CrateType;
 use rustc_target::spec::{PanicStrategy, Target};
-use tracing::{debug, info, trace};
+use tracing::{debug, info};
 
 use crate::diagnostics;
 use crate::locator::{CrateError, CrateLocator, CratePaths, CrateRejections};
@@ -68,6 +70,9 @@ pub struct CStore {
     has_global_allocator: bool,
     /// This crate has a `#[alloc_error_handler]` item.
     has_alloc_error_handler: bool,
+
+    /// Cached map from hash to CrateNum, to avoid scanning metas during crate resolution.
+    hash_to_cnum: UnordMap<Svh, CrateNum>,
 
     /// Names that were used to load the crates via `extern crate` or paths.
     resolved_externs: UnordMap<Symbol, CrateNum>,
@@ -237,6 +242,7 @@ impl CStore {
 
     fn set_crate_data(&mut self, cnum: CrateNum, data: CrateMetadata) {
         assert!(self.metas[cnum].is_none(), "Overwriting crate metadata entry");
+        self.hash_to_cnum.insert(data.hash(), cnum);
         self.metas[cnum] = Some(Box::new(data));
     }
 
@@ -324,12 +330,8 @@ impl CStore {
         if !json_unused_externs.is_enabled() {
             return;
         }
-        let level = tcx
-            .lint_level_spec_at_node(
-                lint::builtin::UNUSED_CRATE_DEPENDENCIES,
-                rustc_hir::CRATE_HIR_ID,
-            )
-            .level();
+        let level =
+            tcx.lint_level_spec_at_node(UNUSED_CRATE_DEPENDENCIES, rustc_hir::CRATE_HIR_ID).level();
         if level != lint::Level::Allow {
             let unused_externs =
                 self.unused_externs.iter().map(|ident| ident.to_ident_string()).collect::<Vec<_>>();
@@ -340,12 +342,10 @@ impl CStore {
 
     fn report_target_modifiers_extended(
         tcx: TyCtxt<'_>,
-        krate: &Crate,
         mods: &TargetModifiers,
         dep_mods: &TargetModifiers,
         data: &CrateMetadata,
     ) {
-        let span = krate.spans.inner_span.shrink_to_lo();
         let allowed_flag_mismatches = &tcx.sess.opts.cg.unsafe_allow_abi_mismatch;
         let local_crate = tcx.crate_name(LOCAL_CRATE);
         let tmod_extender = |tmod: &TargetModifier| (tmod.extend(), tmod.clone());
@@ -363,7 +363,6 @@ impl CStore {
             match (flag_local_value, flag_extern_value) {
                 (Some(local_value), Some(extern_value)) => {
                     tcx.dcx().emit_err(diagnostics::IncompatibleTargetModifiers {
-                        span,
                         extern_crate,
                         local_crate,
                         flag_name,
@@ -374,7 +373,6 @@ impl CStore {
                 }
                 (None, Some(extern_value)) => {
                     tcx.dcx().emit_err(diagnostics::IncompatibleTargetModifiersLMissed {
-                        span,
                         extern_crate,
                         local_crate,
                         flag_name,
@@ -385,7 +383,6 @@ impl CStore {
                 }
                 (Some(local_value), None) => {
                     tcx.dcx().emit_err(diagnostics::IncompatibleTargetModifiersRMissed {
-                        span,
                         extern_crate,
                         local_crate,
                         flag_name,
@@ -449,16 +446,15 @@ impl CStore {
     }
 
     pub fn report_session_incompatibilities(&self, tcx: TyCtxt<'_>, krate: &Crate) {
-        self.report_incompatible_target_modifiers(tcx, krate);
-        self.report_incompatible_partial_mitigations(tcx, krate);
+        self.report_incompatible_target_modifiers(tcx);
+        self.report_incompatible_partial_mitigations(tcx);
         self.report_incompatible_async_drop_feature(tcx, krate);
     }
 
-    pub fn report_incompatible_target_modifiers(&self, tcx: TyCtxt<'_>, krate: &Crate) {
+    pub fn report_incompatible_target_modifiers(&self, tcx: TyCtxt<'_>) {
         for flag_name in &tcx.sess.opts.cg.unsafe_allow_abi_mismatch {
             if !OptionsTargetModifiers::is_target_modifier(flag_name) {
                 tcx.dcx().emit_err(diagnostics::UnknownTargetModifierUnsafeAllowed {
-                    span: krate.spans.inner_span.shrink_to_lo(),
                     flag_name: flag_name.clone(),
                 });
             }
@@ -470,12 +466,12 @@ impl CStore {
             }
             let dep_mods = data.target_modifiers();
             if mods != dep_mods {
-                Self::report_target_modifiers_extended(tcx, krate, &mods, &dep_mods, data);
+                Self::report_target_modifiers_extended(tcx, &mods, &dep_mods, data);
             }
         }
     }
 
-    pub fn report_incompatible_partial_mitigations(&self, tcx: TyCtxt<'_>, krate: &Crate) {
+    pub fn report_incompatible_partial_mitigations(&self, tcx: TyCtxt<'_>) {
         let my_mitigations = tcx.sess.gather_enabled_denied_partial_mitigations();
         let mut my_mitigations: BTreeMap<_, _> =
             my_mitigations.iter().map(|mitigation| (mitigation.kind, mitigation)).collect();
@@ -502,7 +498,6 @@ impl CStore {
                     *errors += 1;
 
                     tcx.dcx().emit_err(diagnostics::MitigationLessStrictInDependency {
-                        span: krate.spans.inner_span.shrink_to_lo(),
                         mitigation_name: my_mitigation.kind.to_string(),
                         mitigation_level: my_mitigation.level.level_str().to_string(),
                         extern_crate: data.name(),
@@ -546,6 +541,7 @@ impl CStore {
             alloc_error_handler_kind: None,
             has_global_allocator: false,
             has_alloc_error_handler: false,
+            hash_to_cnum: UnordMap::default(),
             resolved_externs: UnordMap::default(),
             unused_externs: Vec::new(),
             used_extern_options: Default::default(),
@@ -555,21 +551,9 @@ impl CStore {
 
     fn existing_match(&self, name: Symbol, hash: Option<Svh>) -> Option<CrateNum> {
         let hash = hash?;
-
-        for (cnum, data) in self.iter_crate_data() {
-            if data.name() != name {
-                trace!("{} did not match {}", data.name(), name);
-                continue;
-            }
-
-            if hash == data.hash() {
-                return Some(cnum);
-            } else {
-                debug!("actual hash {} did not match expected {}", hash, data.hash());
-            }
-        }
-
-        None
+        let cnum = *self.hash_to_cnum.get(&hash)?;
+        debug_assert_eq!(self.get_crate_data(cnum).name(), name);
+        Some(cnum)
     }
 
     /// Determine whether a dependency should be considered private.
@@ -732,13 +716,21 @@ impl CStore {
             // Load the proc macro crate for the host
             proc_macro_locator.for_proc_macro(sess, path_kind);
 
-            let Some(host_result) =
+            if let Some(host_result) =
                 self.load(&mut proc_macro_locator, &mut CrateRejections::default())?
-            else {
-                return Ok(None);
-            };
+            {
+                Ok(Some((host_result, None)))
+            } else if sess.opts.unstable_opts.wasm_proc_macros {
+                // Load the proc macro crate for wasm
+                proc_macro_locator.for_wasm_proc_macro(sess, path_kind);
 
-            Ok(Some((host_result, None)))
+                match self.load(&mut proc_macro_locator, &mut CrateRejections::default())? {
+                    Some(host_result) => Ok(Some((host_result, None))),
+                    None => Ok(None),
+                }
+            } else {
+                Ok(None)
+            }
         }
     }
 
@@ -1242,7 +1234,7 @@ impl CStore {
             }
 
             tcx.sess.psess.buffer_lint(
-                lint::builtin::UNUSED_CRATE_DEPENDENCIES,
+                UNUSED_CRATE_DEPENDENCIES,
                 span,
                 ast::CRATE_NODE_ID,
                 diagnostics::UnusedCrateDependency {

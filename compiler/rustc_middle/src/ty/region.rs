@@ -3,12 +3,15 @@ use rustc_hir::def_id::DefId;
 use rustc_macros::{StableHash, TyDecodable, TyEncodable, extension};
 use rustc_span::{DUMMY_SP, ErrorGuaranteed, Symbol, kw, sym};
 pub use rustc_type_ir::RegionVid;
-use rustc_type_ir::{Region as IrRegion, RegionKind as IrRegionKind};
+use rustc_type_ir::{
+    LateParamRegion as IrLateParamRegion, Region as IrRegion, RegionKind as IrRegionKind,
+};
 
 use crate::ty::{self, BoundVar, TyCtxt};
 
 pub type Region<'tcx> = IrRegion<TyCtxt<'tcx>>;
 pub type RegionKind<'tcx> = IrRegionKind<TyCtxt<'tcx>>;
+pub type LateParamRegion<'tcx> = IrLateParamRegion<TyCtxt<'tcx>>;
 
 #[extension(pub trait RegionExt<'tcx>)]
 impl<'tcx> Region<'tcx> {
@@ -86,11 +89,7 @@ impl<'tcx> Region<'tcx> {
             ty::ReError(reported) => Region::new_error(tcx, reported),
         }
     }
-}
 
-/// Region utilities
-#[extension(pub trait RegionUtilitiesExt<'tcx>)]
-impl<'tcx> Region<'tcx> {
     fn get_name(self, tcx: TyCtxt<'tcx>) -> Option<Symbol> {
         match self.kind() {
             ty::ReEarlyParam(ebr) => ebr.is_named().then_some(ebr.name),
@@ -124,60 +123,10 @@ impl<'tcx> Region<'tcx> {
     }
 
     #[inline]
-    fn is_error(self) -> bool {
-        matches!(self.kind(), ty::ReError(_))
-    }
-
-    #[inline]
-    fn is_static(self) -> bool {
-        matches!(self.kind(), ty::ReStatic)
-    }
-
-    #[inline]
-    fn is_erased(self) -> bool {
-        matches!(self.kind(), ty::ReErased)
-    }
-
-    #[inline]
-    fn is_placeholder(self) -> bool {
-        matches!(self.kind(), ty::RePlaceholder(..))
-    }
-
-    #[inline]
     fn bound_at_or_above_binder(self, index: ty::DebruijnIndex) -> bool {
         match self.kind() {
             ty::ReBound(ty::BoundVarIndexKind::Bound(debruijn), _) => debruijn >= index,
             _ => false,
-        }
-    }
-
-    /// True for free regions other than `'static`.
-    fn is_param(self) -> bool {
-        matches!(self.kind(), ty::ReEarlyParam(_) | ty::ReLateParam(_))
-    }
-
-    /// True for free region in the current context.
-    ///
-    /// This is the case for `'static` and param regions.
-    fn is_free(self) -> bool {
-        match self.kind() {
-            ty::ReStatic | ty::ReEarlyParam(..) | ty::ReLateParam(..) => true,
-            ty::ReVar(..)
-            | ty::RePlaceholder(..)
-            | ty::ReBound(..)
-            | ty::ReErased
-            | ty::ReError(..) => false,
-        }
-    }
-
-    fn is_var(self) -> bool {
-        matches!(self.kind(), ty::ReVar(_))
-    }
-
-    fn as_var(self) -> RegionVid {
-        match self.kind() {
-            ty::ReVar(vid) => vid,
-            _ => bug!("expected region {:?} to be of kind ReVar", self),
         }
     }
 
@@ -222,21 +171,6 @@ impl std::fmt::Debug for EarlyParamRegion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}/#{}", self.name, self.index)
     }
-}
-
-#[derive(Clone, PartialEq, Eq, Hash, TyEncodable, TyDecodable, Copy)]
-#[derive(StableHash)]
-/// The parameter representation of late-bound function parameters, "some region
-/// at least as big as the scope `fr.scope`".
-///
-/// Similar to a placeholder region as we create `LateParam` regions when entering a binder
-/// except they are always in the root universe and instead of using a boundvar to distinguish
-/// between others we use the `DefId` of the parameter. For this reason the `bound_region` field
-/// should basically always be `BoundRegionKind::Named` as otherwise there is no way of telling
-/// different parameters apart.
-pub struct LateParamRegion {
-    pub scope: DefId,
-    pub kind: LateParamRegionKind,
 }
 
 /// When liberating bound regions, we map their [`ty::BoundRegionKind`]

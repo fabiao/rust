@@ -1,5 +1,5 @@
 use expect_test::expect;
-use hir_def::ModuleDefId;
+use hir_def::{AdtId, ModuleDefId};
 use rustc_type_ir::inherent::IntoKind as _;
 use test_fixture::WithFixture;
 
@@ -9,6 +9,23 @@ use crate::{
     test_db::TestDB,
     tests::{check_infer, check_no_mismatches, check_types},
 };
+
+#[test]
+fn nested_argument_position_impl_trait_captures_lifetime() {
+    check_no_mismatches(
+        r#"
+//- minicore: iterator
+trait Trait<'a> {}
+
+fn f<'a>(_values: impl IntoIterator<Item = impl Trait<'a>>) {}
+
+fn crash<'a>(expr: &'a (), values: impl IntoIterator<Item = impl Trait<'a>>) -> &'a () {
+    f(values);
+    expr
+}
+"#,
+    );
+}
 
 #[test]
 fn liberating_distinct_late_bound_lifetimes_preserves_identity() {
@@ -279,63 +296,6 @@ fn main() {
     debug(&1);
 }"#,
     );
-
-    // toolchains <= 1.88.0, before sized-hierarchy.
-    check_no_mismatches(
-        r#"
-#![feature(lang_items)]
-#[lang = "sized"]
-pub trait Sized {}
-
-#[lang = "unsize"]
-pub trait Unsize<T: ?Sized> {}
-
-#[lang = "coerce_unsized"]
-pub trait CoerceUnsized<T: ?Sized> {}
-
-impl<'a, T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<&'a mut U> for &'a mut T {}
-
-impl<'a, 'b: 'a, T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<&'a U> for &'b mut T {}
-
-impl<'a, T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<*mut U> for &'a mut T {}
-
-impl<'a, T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<*const U> for &'a mut T {}
-
-impl<'a, 'b: 'a, T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<&'a U> for &'b T {}
-
-impl<'a, T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<*const U> for &'a T {}
-
-impl<T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<*mut U> for *mut T {}
-
-impl<T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<*const U> for *mut T {}
-
-impl<T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<*const U> for *const T {}
-
-#[lang = "dispatch_from_dyn"]
-pub trait DispatchFromDyn<T> {}
-
-impl<'a, T: ?Sized + Unsize<U>, U: ?Sized> DispatchFromDyn<&'a U> for &'a T {}
-
-impl<'a, T: ?Sized + Unsize<U>, U: ?Sized> DispatchFromDyn<&'a mut U> for &'a mut T {}
-
-impl<T: ?Sized + Unsize<U>, U: ?Sized> DispatchFromDyn<*const U> for *const T {}
-
-impl<T: ?Sized + Unsize<U>, U: ?Sized> DispatchFromDyn<*mut U> for *mut T {}
-
-trait Foo {
-    fn bar(&self) -> u32 {
-        0xCAFE
-    }
-}
-
-fn debug(_: &dyn Foo) {}
-
-impl Foo for i32 {}
-
-fn main() {
-    debug(&1);
-}"#,
-    );
 }
 
 #[test]
@@ -461,6 +421,41 @@ fn oversized_array_len_does_not_panic() {
 fn f(_: [u8; 18446744073709551616]) {}
     "#,
     );
+}
+
+#[test]
+fn invalid_string_array_len_is_error() {
+    let (db, file_id) = TestDB::with_single_file(
+        r#"
+pub union U {
+    foo: [usize; ""],
+}
+"#,
+    );
+
+    crate::attach_db(&db, || {
+        let module_id = db.module_for_file(file_id.file_id(&db));
+        let def_map = module_id.def_map(&db);
+        let union_id = def_map[module_id]
+            .scope
+            .declarations()
+            .find_map(|decl| match decl {
+                ModuleDefId::AdtId(AdtId::UnionId(id)) => Some(id),
+                _ => None,
+            })
+            .unwrap();
+        let field_ty = db
+            .field_types(union_id.into())
+            .iter()
+            .next()
+            .unwrap()
+            .1
+            .ty()
+            .instantiate_identity()
+            .skip_norm_wip();
+        let TyKind::Array(_, len) = field_ty.kind() else { unreachable!() };
+        assert!(len.is_error());
+    });
 }
 
 #[test]
@@ -952,5 +947,33 @@ fn test2<T: FooFactory>(factory: T) {
             454..478 'factor....bar()': <impl Foo + Bar<Baz = u8> + ?Sized as Foo>::Bar
             454..484 'factor....baz()': u8
         "#]],
+    );
+}
+
+#[test]
+fn infer_method_call_recovery_hrtb_does_not_panic() {
+    check_no_mismatches(
+        r#"
+//- minicore: coerce_unsized, dispatch_from_dyn, fn, option, phantom_data, sized
+use core::marker::PhantomData;
+
+trait Any {}
+
+impl<T: 'static> Any for T {}
+
+struct Bar<'a>(PhantomData<&'a ()>);
+
+type FooFn = for<'a> fn(&'a dyn Any) -> Option<Bar<'a>>;
+
+struct Foo {
+    bar: FooFn,
+}
+
+impl Foo {
+    fn baz<'a, T: 'static>(&self, x: &'a T) -> Option<Bar<'a>> {
+        self.bar(x)
+    }
+}
+"#,
     );
 }

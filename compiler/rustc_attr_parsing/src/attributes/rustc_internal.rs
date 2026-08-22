@@ -1,20 +1,22 @@
 use std::path::PathBuf;
 
 use rustc_ast::{LitIntType, LitKind, MetaItemLit};
-use rustc_feature::AttributeStability;
-use rustc_hir::LangItem;
-use rustc_hir::attrs::{
+use rustc_attr_ir::lang_items::LangItem;
+use rustc_attr_ir::target::GenericParamKind;
+use rustc_attr_ir::{
     BorrowckGraphvizFormatKind, CguFields, CguKind, DivergingBlockBehavior,
     DivergingFallbackBehavior, RustcCleanAttribute, RustcCleanQueries, RustcMirKind,
 };
+use rustc_data_structures::fx::FxHashMap;
+use rustc_feature::AttributeStability;
 use rustc_span::Symbol;
 
 use super::prelude::*;
 use super::util::parse_single_integer;
 use crate::diagnostics;
-use crate::diagnostics::UnknownExternLangItem;
-use crate::session_diagnostics::{
-    AttributeRequiresOpt, CguFieldsMissing, RustcScalableVectorCountOutOfRange, UnknownLangItem,
+use crate::diagnostics::{
+    AttributeRequiresOpt, CguFieldsMissing, RustcScalableVectorCountOutOfRange,
+    UnknownExternLangItem, UnknownLangItem,
 };
 
 pub(crate) struct RustcMainParser;
@@ -71,6 +73,18 @@ impl SingleAttributeParser for RustcMustImplementOneOfParser {
             return None;
         }
 
+        if cx.target == Target::Trait {
+            // Check for duplicates
+            let mut seen: FxHashMap<Symbol, Span> = FxHashMap::default();
+            for ident in &fn_names {
+                if let Some(dup) = seen.insert(ident.name, ident.span) {
+                    cx.emit_err(diagnostics::FunctionNamesDuplicated {
+                        spans: vec![dup, ident.span],
+                    });
+                }
+            }
+        }
+
         Some(AttributeKind::RustcMustImplementOneOf { attr_span: cx.attr_span, fn_names })
     }
 }
@@ -90,6 +104,20 @@ impl NoArgsAttributeParser for RustcNeverReturnsNullPtrParser {
 
     const CREATE: fn(Span) -> AttributeKind = |_| AttributeKind::RustcNeverReturnsNullPtr;
 }
+
+pub(crate) struct RustcPanicsWhenZeroParser;
+
+impl NoArgsAttributeParser for RustcPanicsWhenZeroParser {
+    const PATH: &[Symbol] = &[sym::rustc_panics_when_zero];
+    const ALLOWED_TARGETS: AllowedTargets<'_> = AllowedTargets::AllowList(&[
+        Allow(Target::GenericParam { kind: GenericParamKind::Const, has_default: true }),
+        Allow(Target::GenericParam { kind: GenericParamKind::Const, has_default: false }),
+    ]);
+    const STABILITY: AttributeStability = unstable!(rustc_attrs);
+
+    const CREATE: fn(Span) -> AttributeKind = |_| AttributeKind::RustcPanicsWhenZero;
+}
+
 pub(crate) struct RustcNoImplicitAutorefsParser;
 
 impl NoArgsAttributeParser for RustcNoImplicitAutorefsParser {
@@ -579,9 +607,9 @@ impl SingleAttributeParser for LangParser {
             return None;
         };
 
-        // Only weak lang items may be applied to foreign items
-        if [Target::ForeignFn, Target::ForeignStatic, Target::ForeignTy, Target::ForeignMod]
-            .contains(&cx.target)
+        // Only weak lang items may be applied to foreign items,
+        // except for `ForeignTy` which can be a normal lang item.
+        if [Target::ForeignFn, Target::ForeignStatic, Target::ForeignMod].contains(&cx.target)
             && !lang_item.is_weak()
         {
             cx.emit_err(UnknownExternLangItem { span: cx.attr_span, lang_item: lang_item.name() });
@@ -749,8 +777,12 @@ impl CombineAttributeParser for RustcCleanParser {
     const CONVERT: ConvertFn<Self::Item> = |items, _| AttributeKind::RustcClean(items);
     const ALLOWED_TARGETS: AllowedTargets<'_> = AllowedTargets::AllowList(&[
         // tidy-alphabetical-start
-        Allow(Target::AssocConst),
-        Allow(Target::AssocTy),
+        Allow(Target::AssocConst(AssocCtxt::Impl { of_trait: false })),
+        Allow(Target::AssocConst(AssocCtxt::Impl { of_trait: true })),
+        Allow(Target::AssocConst(AssocCtxt::Trait)),
+        Allow(Target::AssocTy(AssocCtxt::Impl { of_trait: false })),
+        Allow(Target::AssocTy(AssocCtxt::Impl { of_trait: true })),
+        Allow(Target::AssocTy(AssocCtxt::Trait)),
         Allow(Target::Const),
         Allow(Target::Enum),
         Allow(Target::Expression),
@@ -842,8 +874,12 @@ impl SingleAttributeParser for RustcIfThisChangedParser {
     const PATH: &[Symbol] = &[sym::rustc_if_this_changed];
     const ALLOWED_TARGETS: AllowedTargets<'_> = AllowedTargets::AllowList(&[
         // tidy-alphabetical-start
-        Allow(Target::AssocConst),
-        Allow(Target::AssocTy),
+        Allow(Target::AssocConst(AssocCtxt::Impl { of_trait: false })),
+        Allow(Target::AssocConst(AssocCtxt::Impl { of_trait: true })),
+        Allow(Target::AssocConst(AssocCtxt::Trait)),
+        Allow(Target::AssocTy(AssocCtxt::Impl { of_trait: false })),
+        Allow(Target::AssocTy(AssocCtxt::Impl { of_trait: true })),
+        Allow(Target::AssocTy(AssocCtxt::Trait)),
         Allow(Target::Const),
         Allow(Target::Enum),
         Allow(Target::Expression),
@@ -900,8 +936,12 @@ impl CombineAttributeParser for RustcThenThisWouldNeedParser {
         |items, _span| AttributeKind::RustcThenThisWouldNeed(items);
     const ALLOWED_TARGETS: AllowedTargets<'_> = AllowedTargets::AllowList(&[
         // tidy-alphabetical-start
-        Allow(Target::AssocConst),
-        Allow(Target::AssocTy),
+        Allow(Target::AssocConst(AssocCtxt::Impl { of_trait: false })),
+        Allow(Target::AssocConst(AssocCtxt::Impl { of_trait: true })),
+        Allow(Target::AssocConst(AssocCtxt::Trait)),
+        Allow(Target::AssocTy(AssocCtxt::Impl { of_trait: false })),
+        Allow(Target::AssocTy(AssocCtxt::Impl { of_trait: true })),
+        Allow(Target::AssocTy(AssocCtxt::Trait)),
         Allow(Target::Const),
         Allow(Target::Enum),
         Allow(Target::Expression),
@@ -976,12 +1016,16 @@ impl NoArgsAttributeParser for RustcEffectiveVisibilityParser {
         Allow(Target::TraitAlias),
         Allow(Target::Impl { of_trait: false }),
         Allow(Target::Impl { of_trait: true }),
-        Allow(Target::AssocConst),
+        Allow(Target::AssocConst(AssocCtxt::Impl { of_trait: false })),
+        Allow(Target::AssocConst(AssocCtxt::Trait)),
+        Allow(Target::AssocConst(AssocCtxt::Impl { of_trait: true })),
         Allow(Target::Method(MethodKind::Inherent)),
         Allow(Target::Method(MethodKind::Trait { body: false })),
         Allow(Target::Method(MethodKind::Trait { body: true })),
         Allow(Target::Method(MethodKind::TraitImpl)),
-        Allow(Target::AssocTy),
+        Allow(Target::AssocTy(AssocCtxt::Impl { of_trait: false })),
+        Allow(Target::AssocTy(AssocCtxt::Trait)),
+        Allow(Target::AssocTy(AssocCtxt::Impl { of_trait: true })),
         Allow(Target::ForeignFn),
         Allow(Target::ForeignStatic),
         Allow(Target::ForeignTy),
@@ -1003,8 +1047,12 @@ impl SingleAttributeParser for RustcDiagnosticItemParser {
         Allow(Target::Enum),
         Allow(Target::MacroDef),
         Allow(Target::TyAlias),
-        Allow(Target::AssocTy),
-        Allow(Target::AssocConst),
+        Allow(Target::AssocConst(AssocCtxt::Impl { of_trait: false })),
+        Allow(Target::AssocConst(AssocCtxt::Trait)),
+        Allow(Target::AssocConst(AssocCtxt::Impl { of_trait: true })),
+        Allow(Target::AssocTy(AssocCtxt::Impl { of_trait: false })),
+        Allow(Target::AssocTy(AssocCtxt::Trait)),
+        Allow(Target::AssocTy(AssocCtxt::Impl { of_trait: true })),
         Allow(Target::Fn),
         Allow(Target::Const),
         Allow(Target::Mod),
@@ -1104,7 +1152,7 @@ pub(crate) struct RustcDocPrimitiveParser;
 
 impl SingleAttributeParser for RustcDocPrimitiveParser {
     const PATH: &[Symbol] = &[sym::rustc_doc_primitive];
-    const ALLOWED_TARGETS: AllowedTargets<'_> = AllowedTargets::AllowList(&[Allow(Target::Mod)]);
+    const ALLOWED_TARGETS: AllowedTargets<'_> = AllowedTargets::AllowList(&[Allow(Target::Const)]);
     const TEMPLATE: AttributeTemplate = template!(NameValueStr: "primitive name");
     const STABILITY: AttributeStability = unstable!(
         rustc_attrs,

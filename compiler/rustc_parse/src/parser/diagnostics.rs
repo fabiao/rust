@@ -15,7 +15,6 @@ use rustc_errors::{
     Applicability, Diag, DiagCtxtHandle, ErrorGuaranteed, PResult, Subdiagnostic, Suggestions, msg,
     pluralize,
 };
-use rustc_session::diagnostics::ExprParenthesesNeeded;
 use rustc_span::symbol::used_keywords;
 use rustc_span::{BytePos, DUMMY_SP, Ident, Span, SpanSnippetError, Spanned, Symbol, kw, sym};
 use thin_vec::{ThinVec, thin_vec};
@@ -31,7 +30,7 @@ use crate::diagnostics::{
     AwaitSuggestion, BadQPathStage2, BadTypePlus, BadTypePlusSub, ColonAsSemi,
     ComparisonOperatorsCannotBeChained, ComparisonOperatorsCannotBeChainedSugg,
     DocCommentDoesNotDocumentAnything, DocCommentOnParamType, DoubleColonInBound,
-    ExpectedIdentifier, ExpectedSemi, ExpectedSemiSugg, FoundPathInGenerics,
+    ExpectedIdentifier, ExpectedSemi, ExpectedSemiSugg, ExprParenthesesNeeded, FoundPathInGenerics,
     GenericParamsWithoutAngleBrackets, GenericParamsWithoutAngleBracketsSugg,
     HelpIdentifierStartsWithNumber, HelpUseLatestEdition, InInTypo, IncorrectAwait,
     IncorrectSemicolon, IncorrectUseOfAwait, IncorrectUseOfUse, MisspelledKw,
@@ -43,9 +42,8 @@ use crate::diagnostics::{
     UseEqInstead, WrapType,
 };
 use crate::exp;
-use crate::parser::FnContext;
 use crate::parser::attr::InnerAttrPolicy;
-use crate::parser::item::IsDotDotDot;
+use crate::parser::{FnContext, IsDotDotDot};
 
 /// Creates a placeholder argument.
 pub(super) fn dummy_arg(ident: Ident, guar: ErrorGuaranteed) -> Param {
@@ -2240,7 +2238,7 @@ impl<'a> Parser<'a> {
         pat: Box<ast::Pat>,
         require_name: bool,
         first_param: bool,
-        fn_parse_mode: &crate::parser::item::FnParseMode,
+        fn_parse_mode: &crate::parser::FnParseMode,
     ) -> Option<Ident> {
         // If we find a pattern followed by an identifier, it could be an (incorrect)
         // C-style parameter declaration.
@@ -2265,7 +2263,7 @@ impl<'a> Parser<'a> {
         {
             let maybe_emit_anon_params_note = |this: &mut Self, err: &mut Diag<'_>| {
                 let ed = this.token.span.with_neighbor(this.prev_token.span).edition();
-                if matches!(fn_parse_mode.context, crate::parser::item::FnContext::Trait)
+                if matches!(fn_parse_mode.context, crate::parser::FnContext::Trait)
                     && (fn_parse_mode.req_name)(ed, IsDotDotDot::No)
                 {
                     err.note("anonymous parameters are removed in the 2018 edition (see RFC 1685)");
@@ -2386,12 +2384,22 @@ impl<'a> Parser<'a> {
     }
 
     #[cold]
-    pub(super) fn recover_arg_parse(&mut self) -> PResult<'a, (Box<ast::Pat>, Box<ast::Ty>)> {
+    pub(super) fn recover_arg_parse(
+        &mut self,
+        context: FnContext,
+    ) -> PResult<'a, (Box<ast::Pat>, Box<ast::Ty>)> {
         let pat = self.parse_pat_no_top_alt(Some(Expected::ArgumentName), None)?;
         self.expect(exp!(Colon))?;
         let ty = self.parse_ty()?;
-
-        self.dcx().emit_err(PatternMethodParamWithoutBody { span: pat.span });
+        self.dcx().emit_err(PatternMethodParamWithoutBody {
+            span: pat.span,
+            target: match context {
+                FnContext::Trait => "methods without bodies",
+                FnContext::FunctionPtrType => "function pointer types",
+                FnContext::Free => unreachable!("This method is not called in free functions, as patterns are always allowed there"),
+                FnContext::Impl => unreachable!("This method is not called in impls, as patterns are always allowed there"),
+            },
+        });
 
         // Pretend the pattern is `_`, to avoid duplicate errors from AST validation.
         let pat = Box::new(Pat { kind: PatKind::Wild, span: pat.span, id: ast::DUMMY_NODE_ID });
@@ -2642,11 +2650,8 @@ impl<'a> Parser<'a> {
         if is_op_or_dot {
             self.bump();
         }
-        match (|| {
-            let attrs = self.parse_outer_attributes()?;
-            self.parse_expr_res(Restrictions::CONST_EXPR, attrs)
-        })() {
-            Ok((expr, _)) => {
+        match (|| self.parse_expr_res(Restrictions::CONST_EXPR))() {
+            Ok(expr) => {
                 // Find a mistake like `MyTrait<Assoc == S::Assoc>`.
                 if snapshot.token == token::EqEq {
                     err.span_suggestion_verbose(
@@ -2698,13 +2703,10 @@ impl<'a> Parser<'a> {
         &mut self,
         mut snapshot: SnapshotParser<'a>,
     ) -> Option<Box<ast::Expr>> {
-        match (|| {
-            let attrs = self.parse_outer_attributes()?;
-            snapshot.parse_expr_res(Restrictions::CONST_EXPR, attrs)
-        })() {
+        match (|| snapshot.parse_expr_res(Restrictions::CONST_EXPR))() {
             // Since we don't know the exact reason why we failed to parse the type or the
             // expression, employ a simple heuristic to weed out some pathological cases.
-            Ok((expr, _)) if let token::Comma | token::Gt = snapshot.token.kind => {
+            Ok(expr) if let token::Comma | token::Gt = snapshot.token.kind => {
                 self.restore_snapshot(snapshot);
                 Some(expr)
             }

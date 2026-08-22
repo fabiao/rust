@@ -338,7 +338,17 @@ fn print_where_clauses(
                     w!(p, ",\n");
                 }
                 match pred {
-                    WherePredicate::TypeBound { target, bound } => {
+                    WherePredicate::TypeBound { lifetimes, target, bound } => {
+                        if let Some(lifetimes) = lifetimes {
+                            w!(p, "for<");
+                            for (i, lifetime) in lifetimes.iter().enumerate() {
+                                if i != 0 {
+                                    w!(p, ", ");
+                                }
+                                w!(p, "{}", lifetime.display(db, p.edition));
+                            }
+                            w!(p, "> ");
+                        }
                         p.print_type_ref(*target);
                         w!(p, ": ");
                         p.print_type_bounds(std::slice::from_ref(bound));
@@ -347,19 +357,6 @@ fn print_where_clauses(
                         p.print_lifetime_ref(*target);
                         w!(p, ": ");
                         p.print_lifetime_ref(*bound);
-                    }
-                    WherePredicate::ForLifetime { lifetimes, target, bound } => {
-                        w!(p, "for<");
-                        for (i, lifetime) in lifetimes.iter().enumerate() {
-                            if i != 0 {
-                                w!(p, ", ");
-                            }
-                            w!(p, "{}", lifetime.display(db, p.edition));
-                        }
-                        w!(p, "> ");
-                        p.print_type_ref(*target);
-                        w!(p, ": ");
-                        p.print_type_bounds(std::slice::from_ref(bound));
                     }
                 }
             }
@@ -730,10 +727,6 @@ impl Printer<'_> {
                 }
                 self.print_expr_in(prec, *expr);
             }
-            Expr::Box { expr } => {
-                w!(self, "box ");
-                self.print_expr_in(prec, *expr);
-            }
             Expr::UnaryOp { expr, op } => {
                 let op = match op {
                     ast::UnaryOp::Deref => "*",
@@ -752,18 +745,6 @@ impl Printer<'_> {
                 }
                 self.whitespace();
                 self.print_expr_in(prec, *rhs);
-            }
-            Expr::Range { lhs, rhs, range_type } => {
-                if let Some(lhs) = lhs {
-                    self.print_expr_in(prec, *lhs);
-                }
-                match range_type {
-                    RangeOp::Exclusive => w!(self, ".."),
-                    RangeOp::Inclusive => w!(self, "..="),
-                };
-                if let Some(rhs) = rhs {
-                    self.print_expr_in(prec, *rhs);
-                }
             }
             Expr::Index { base, index } => {
                 self.print_expr_in(prec, *base);
@@ -1331,6 +1312,17 @@ impl Printer<'_> {
             TypeRef::Fn(fn_) => {
                 let ((_, return_type), args) =
                     fn_.params.split_last().expect("TypeRef::Fn is missing return type");
+                if let Some(binder) = &fn_.binder {
+                    w!(
+                        self,
+                        "for<{}> ",
+                        binder
+                            .iter()
+                            .map(|it| it.display(self.db, self.edition))
+                            .format(", ")
+                            .to_string()
+                    );
+                }
                 if fn_.is_unsafe {
                     w!(self, "unsafe ");
                 }

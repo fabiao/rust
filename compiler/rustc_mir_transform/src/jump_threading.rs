@@ -68,6 +68,7 @@ use rustc_mir_dataflow::value_analysis::{
 use rustc_span::DUMMY_SP;
 use tracing::{debug, instrument, trace};
 
+use crate::PassPolicy;
 use crate::cost_checker::CostChecker;
 
 pub(super) struct JumpThreading;
@@ -75,16 +76,18 @@ pub(super) struct JumpThreading;
 const MAX_COST: u8 = 100;
 
 impl<'tcx> crate::MirPass<'tcx> for JumpThreading {
-    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
-        if sess.target.is_like_gpu {
+    fn policy(&self, sess: &rustc_session::Session) -> PassPolicy {
+        let enabled_by_default = if sess.target.is_like_gpu {
             // Jump threading can duplicate calls in control-flow.
             // This leads to incorrect code when done for so called "convergent" operations on GPU
             // targets, similar to how inline assembly cannot be duplicated on all targets.
             // Conservatively prevent this by disabling the pass.
             // See also issue #137086.
-            return false;
-        }
-        sess.mir_opt_level() >= 2
+            false
+        } else {
+            sess.mir_opt_level() >= 2
+        };
+        PassPolicy::optimization(enabled_by_default)
     }
 
     #[instrument(skip_all level = "debug")]
@@ -147,10 +150,6 @@ impl<'tcx> crate::MirPass<'tcx> for JumpThreading {
         if let Some(opportunities) = OpportunitySet::new(body, entry_states) {
             opportunities.apply();
         }
-    }
-
-    fn is_required(&self) -> bool {
-        false
     }
 }
 
@@ -721,7 +720,7 @@ impl<'a, 'tcx> TOFinder<'a, 'tcx> {
                 // had in the previous arm. All we can conclude is that the replacement condition
                 // `discr != value` can be threaded, and nothing else.
                 if c.polarity == Polarity::Ne
-                    && let Ok(value) = c.value.try_to_bits(discr_layout.size)
+                    && let value = c.value.to_bits(discr_layout.size)
                     && targets.all_values().contains(&value.into())
                 {
                     edges_fulfilling_condition.insert(targets.otherwise());

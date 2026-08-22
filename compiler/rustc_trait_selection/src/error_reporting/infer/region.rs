@@ -13,7 +13,7 @@ use rustc_middle::traits::ObligationCauseCode;
 use rustc_middle::ty::error::TypeError;
 use rustc_middle::ty::print::RegionHighlightMode;
 use rustc_middle::ty::{
-    self, IsSuggestable, Region, RegionUtilitiesExt, Ty, TyCtxt, TypeVisitableExt as _, Upcast as _,
+    self, IsSuggestable, Region, RegionExt, Ty, TyCtxt, TypeVisitableExt as _, Upcast as _,
 };
 use rustc_span::{BytePos, ErrorGuaranteed, Span, Symbol, kw, sym};
 use tracing::{debug, instrument};
@@ -297,7 +297,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             SubregionOrigin::SolverRegionConstraint(span) => {
                 RegionOriginNote::Plain {
                     span,
-                    msg: msg!("this diagnostic is currently WIP while -Zassumptions-on-binders is incomplete"),
+                    msg: msg!("...so that a higher-ranked lifetime bound can be satisfied"),
                 }
                 .add_to_diag(err);
             }
@@ -450,9 +450,9 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     && let Some(def_id) = preds.principal_def_id()
                 {
                     for (clause, span) in
-                        self.tcx.predicates_of(def_id).instantiate_identity(self.tcx).into_iter()
+                        self.tcx.clauses_of(def_id).instantiate_identity(self.tcx).into_iter()
                     {
-                        if let ty::ClauseKind::TypeOutlives(ty::OutlivesPredicate(a, b)) =
+                        if let ty::ClauseKind::TypeOutlives(ty::OutlivesClause(a, b)) =
                             clause.kind().skip_binder()
                             && let ty::Param(param) = a.kind()
                             && param.name == kw::SelfUpper
@@ -569,14 +569,9 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     notes: instantiated.into_iter().chain(must_outlive).collect(),
                 })
             }
-            SubregionOrigin::SolverRegionConstraint(span) => {
-                let mut d = self.dcx().struct_span_err(
-                    span,
-                    "unsatisfied lifetime constraint from -Zassumptions-on-binders :3",
-                );
-                d.note("meoow :c");
-                d
-            }
+            SubregionOrigin::SolverRegionConstraint(span) => self
+                .dcx()
+                .struct_span_err(span, "higher-ranked lifetime bound could not be satisfied"),
         };
         if sub.is_error() || sup.is_error() {
             err.downgrade_to_delayed_bug();
@@ -610,11 +605,15 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
 
         let Ok(trait_predicates) = self
             .tcx
-            .explicit_predicates_of(trait_item_def_id)
+            .explicit_clauses_of(trait_item_def_id)
             .instantiate_own(self.tcx, trait_item_args)
-            .map(|(pred, _)| {
-                let pred = pred.skip_norm_wip();
-                if pred.is_suggestable(self.tcx, false) { Ok(pred.to_string()) } else { Err(()) }
+            .map(|(clause, _)| {
+                let clause = clause.skip_norm_wip();
+                if clause.is_suggestable(self.tcx, false) {
+                    Ok(clause.to_string())
+                } else {
+                    Err(())
+                }
             })
             .collect::<Result<Vec<_>, ()>>()
         else {

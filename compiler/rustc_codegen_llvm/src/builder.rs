@@ -44,6 +44,7 @@ use crate::type_of::LayoutLlvmExt;
 pub(crate) struct GenericBuilder<'a, 'll, CX: Borrow<SCx<'ll>>> {
     pub llbuilder: &'ll mut llvm::Builder<'ll>,
     pub cx: &'a GenericCx<'ll, CX>,
+    pub span: rustc_span::Span,
 }
 
 pub(crate) type SBuilder<'a, 'll> = GenericBuilder<'a, 'll, SCx<'ll>>;
@@ -94,7 +95,7 @@ impl<'a, 'll, CX: Borrow<SCx<'ll>>> GenericBuilder<'a, 'll, CX> {
     fn with_cx(scx: &'a GenericCx<'ll, CX>) -> Self {
         // Create a fresh builder from the simple context.
         let llbuilder = unsafe { llvm::LLVMCreateBuilderInContext(scx.deref().borrow().llcx) };
-        GenericBuilder { llbuilder, cx: scx }
+        GenericBuilder { llbuilder, cx: scx, span: rustc_span::DUMMY_SP }
     }
 
     pub(crate) fn append_block(
@@ -304,7 +305,9 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         unsafe { llvm::LLVMGetInsertBlock(self.llbuilder) }
     }
 
-    fn set_span(&mut self, _span: Span) {}
+    fn set_span(&mut self, span: rustc_span::Span) {
+        self.span = span;
+    }
 
     fn append_block(cx: &'a CodegenCx<'ll, 'tcx>, llfn: &'ll Value, name: &str) -> &'ll BasicBlock {
         unsafe {
@@ -700,12 +703,16 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         ty: &'ll Type,
         ptr: &'ll Value,
         order: rustc_middle::ty::AtomicOrdering,
+        volatile: bool,
         size: Size,
     ) -> &'ll Value {
         unsafe {
             let load = llvm::LLVMBuildLoad2(self.llbuilder, ty, ptr, UNNAMED);
             // Set atomic ordering
             llvm::LLVMSetOrdering(load, AtomicOrdering::from_generic(order));
+            if volatile {
+                llvm::LLVMSetVolatile(load, llvm::TRUE);
+            }
             // LLVM requires the alignment of atomic loads to be at least the size of the type.
             llvm::LLVMSetAlignment(load, size.bytes() as c_uint);
             load
@@ -927,6 +934,7 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         val: &'ll Value,
         ptr: &'ll Value,
         order: rustc_middle::ty::AtomicOrdering,
+        volatile: bool,
         size: Size,
     ) {
         debug!("Store {:?} -> {:?}", val, ptr);
@@ -935,6 +943,9 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
             let store = llvm::LLVMBuildStore(self.llbuilder, val, ptr);
             // Set atomic ordering
             llvm::LLVMSetOrdering(store, AtomicOrdering::from_generic(order));
+            if volatile {
+                llvm::LLVMSetVolatile(store, llvm::TRUE);
+            }
             // LLVM requires the alignment of atomic stores to be at least the size of the type.
             llvm::LLVMSetAlignment(store, size.bytes() as c_uint);
         }
@@ -1564,6 +1575,51 @@ impl<'a, 'll, 'tcx> Builder<'a, 'll, 'tcx> {
     pub(crate) fn llfn(&self) -> &'ll Value {
         unsafe { llvm::LLVMGetBasicBlockParent(self.llbb()) }
     }
+
+    fn generate_ubsan_cfi_diag_data(
+        &mut self,
+        span: rustc_span::Span,
+        expected_ty: String,
+        check_kind: u8,
+    ) -> &'ll Value {
+        let cx = self.cx();
+        let tcx = cx.tcx;
+
+        let loc = tcx.sess.source_map().lookup_char_pos(span.lo());
+
+        let filename_str = format!("{}\0", loc.file.name.prefer_local_unconditionally());
+        let filename_val = cx.const_bytes(filename_str.as_bytes());
+        let filename_ptr = cx.static_addr_of_impl(filename_val, Align::ONE, None);
+
+        // SourceLocation UBSan struct: { const char *filename, uint32_t line, uint32_t column }
+        let source_location = cx.const_struct(
+            &[
+                filename_ptr,
+                cx.const_u32(loc.line as u32),
+                // UBSan columns are 1-based
+                cx.const_u32(loc.col.0 as u32 + 1),
+            ],
+            false, // packed = false
+        );
+
+        let ty_name = format!("{}\0", expected_ty);
+        let ty_name_val = cx.const_bytes(ty_name.as_bytes());
+
+        // TypeDescriptor UBSan struct: { uint16_t TypeKind, uint16_t TypeInfo, const char *TypeName }
+        let type_descriptor =
+            cx.const_struct(&[cx.const_i16(0xffffu16 as i16), cx.const_i16(0), ty_name_val], false);
+
+        let type_descriptor_ptr =
+            cx.static_addr_of_impl(type_descriptor, Align::from_bytes(2).unwrap(), None);
+
+        // CFICheckFailData UBSan struct: { uint8_t CheckKind, SourceLocation Loc, TypeDescriptor *Type }
+        let cfi_check_fail_data = cx
+            .const_struct(&[cx.const_u8(check_kind), source_location, type_descriptor_ptr], false);
+        let align = tcx.data_layout.aggregate_align;
+
+        // Returns the final opaque pointer to the struct to be passed to __ubsan_handle_cfi_check_fail
+        cx.static_addr_of_mut(cfi_check_fail_data, align, Some("__ubsan_cfi_check_fail_data"))
+    }
 }
 
 impl<'a, 'll, CX: Borrow<SCx<'ll>>> GenericBuilder<'a, 'll, CX> {
@@ -1983,8 +2039,64 @@ impl<'a, 'll, 'tcx> Builder<'a, 'll, 'tcx> {
             if let Some(dbg_loc) = dbg_loc {
                 self.set_dbg_loc(dbg_loc);
             }
-            self.abort();
-            self.unreachable();
+
+            let is_diag = self.tcx.sess.opts.unstable_opts.sanitizer_cfi_diag.unwrap_or(false);
+            let is_recover =
+                self.tcx.sess.opts.unstable_opts.sanitizer_cfi_recover.unwrap_or(false);
+
+            if is_diag || is_recover {
+                let fty = self.cx.type_func(
+                    &[self.cx.type_ptr(), self.cx.type_isize(), self.cx.type_isize()],
+                    self.cx.type_void(),
+                );
+                let ubsan_handler = self.declare_cfn(
+                    if is_recover {
+                        "__ubsan_handle_cfi_check_fail"
+                    } else {
+                        "__ubsan_handle_cfi_check_fail_abort"
+                    },
+                    llvm::UnnamedAddr::Global,
+                    fty,
+                );
+
+                let mut expected_ty = String::from("fn(");
+                for (i, arg) in fn_abi.args.iter().enumerate() {
+                    if i > 0 {
+                        expected_ty.push_str(", ");
+                    }
+                    use std::fmt::Write;
+                    write!(&mut expected_ty, "{}", arg.layout.ty).unwrap();
+                }
+                expected_ty.push(')');
+                if !fn_abi.ret.layout.ty.is_unit() {
+                    use std::fmt::Write;
+                    write!(&mut expected_ty, " -> {}", fn_abi.ret.layout.ty).unwrap();
+                }
+
+                // 4 for cfi-icall (indirect call)
+                let check_kind = 4;
+                let diag_data =
+                    self.generate_ubsan_cfi_diag_data(self.span, expected_ty, check_kind);
+
+                let function_address = self.ptrtoint(llfn, self.cx.type_isize());
+                self.call(
+                    fty,
+                    None,
+                    None,
+                    ubsan_handler,
+                    &[diag_data, function_address, self.const_usize(0)],
+                    None,
+                    None,
+                );
+                if is_recover {
+                    self.br(bb_pass);
+                } else {
+                    self.unreachable();
+                }
+            } else {
+                self.abort();
+                self.unreachable();
+            }
 
             self.switch_to_block(bb_pass);
             if let Some(dbg_loc) = dbg_loc {

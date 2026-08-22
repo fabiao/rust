@@ -619,7 +619,7 @@ impl<T> Vec<T> {
     /// use std::alloc::{alloc, Layout};
     ///
     /// fn main() {
-    ///     let layout = Layout::array::<u32>(16).expect("overflow cannot happen");
+    ///     let layout = Layout::array::<u32>(16).expect("16 u32s take 64 bytes, so it shouldn't overflow");
     ///
     ///     let vec = unsafe {
     ///         let mem = alloc(layout).cast::<u32>();
@@ -695,8 +695,6 @@ impl<T> Vec<T> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(box_vec_non_null)]
-    ///
     /// let v = vec![1, 2, 3];
     ///
     /// // Deconstruct the vector into parts.
@@ -717,13 +715,11 @@ impl<T> Vec<T> {
     /// Using memory that was allocated elsewhere:
     ///
     /// ```rust
-    /// #![feature(box_vec_non_null)]
-    ///
     /// use std::alloc::{alloc, Layout};
     /// use std::ptr::NonNull;
     ///
     /// fn main() {
-    ///     let layout = Layout::array::<u32>(16).expect("overflow cannot happen");
+    ///     let layout = Layout::array::<u32>(16).expect("16 u32s take 64 bytes, so it shouldn't overflow");
     ///
     ///     let vec = unsafe {
     ///         let Some(mem) = NonNull::new(alloc(layout).cast::<u32>()) else {
@@ -740,8 +736,8 @@ impl<T> Vec<T> {
     /// }
     /// ```
     #[inline]
-    #[unstable(feature = "box_vec_non_null", issue = "130364")]
-    #[rustc_const_unstable(feature = "box_vec_non_null", issue = "130364")]
+    #[stable(feature = "box_vec_non_null", since = "1.99.0")]
+    #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
     pub const unsafe fn from_parts(ptr: NonNull<T>, length: usize, capacity: usize) -> Self {
         unsafe { Self::from_parts_in(ptr, length, capacity, Global) }
     }
@@ -861,8 +857,6 @@ impl<T> Vec<T> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(box_vec_non_null)]
-    ///
     /// let v: Vec<i32> = vec![-1, 0, 1];
     ///
     /// let (ptr, len, cap) = v.into_parts();
@@ -877,8 +871,8 @@ impl<T> Vec<T> {
     /// assert_eq!(rebuilt, [4294967295, 0, 1]);
     /// ```
     #[must_use = "losing the pointer will leak memory"]
-    #[unstable(feature = "box_vec_non_null", issue = "130364")]
-    #[rustc_const_unstable(feature = "box_vec_non_null", issue = "130364")]
+    #[stable(feature = "box_vec_non_null", since = "1.99.0")]
+    #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
     pub const fn into_parts(self) -> (NonNull<T>, usize, usize) {
         let (ptr, len, capacity) = self.into_raw_parts();
         // SAFETY: A `Vec` always has a non-null pointer.
@@ -1146,7 +1140,7 @@ impl<T, A: Allocator> Vec<T, A> {
     /// v.push(3);
     ///
     /// // Deconstruct the vector into parts.
-    /// let (p, len, cap, alloc) = v.into_raw_parts_with_alloc();
+    /// let (p, len, cap, alloc) = v.into_raw_parts_with_allocator();
     ///
     /// unsafe {
     ///     // Overwrite memory with 4, 5, 6
@@ -1168,7 +1162,7 @@ impl<T, A: Allocator> Vec<T, A> {
     /// use std::alloc::{AllocError, Allocator, Global, Layout};
     ///
     /// fn main() {
-    ///     let layout = Layout::array::<u32>(16).expect("overflow cannot happen");
+    ///     let layout = Layout::array::<u32>(16).expect("16 u32s take 64 bytes, so it shouldn't overflow");
     ///
     ///     let vec = unsafe {
     ///         let mem = match Global.allocate(layout) {
@@ -1261,7 +1255,7 @@ impl<T, A: Allocator> Vec<T, A> {
     /// v.push(3);
     ///
     /// // Deconstruct the vector into parts.
-    /// let (p, len, cap, alloc) = v.into_parts_with_alloc();
+    /// let (p, len, cap, alloc) = v.into_parts_with_allocator();
     ///
     /// unsafe {
     ///     // Overwrite memory with 4, 5, 6
@@ -1283,7 +1277,7 @@ impl<T, A: Allocator> Vec<T, A> {
     /// use std::alloc::{AllocError, Allocator, Global, Layout};
     ///
     /// fn main() {
-    ///     let layout = Layout::array::<u32>(16).expect("overflow cannot happen");
+    ///     let layout = Layout::array::<u32>(16).expect("16 u32s take 64 bytes, so it shouldn't overflow");
     ///
     ///     let vec = unsafe {
     ///         let mem = match Global.allocate(layout) {
@@ -1303,7 +1297,6 @@ impl<T, A: Allocator> Vec<T, A> {
     #[inline]
     #[unstable(feature = "allocator_api", issue = "32838")]
     #[rustc_const_unstable(feature = "allocator_api", issue = "32838")]
-    // #[unstable(feature = "box_vec_non_null", issue = "130364")]
     pub const unsafe fn from_parts_in(
         ptr: NonNull<T>,
         length: usize,
@@ -1344,7 +1337,7 @@ impl<T, A: Allocator> Vec<T, A> {
     /// v.push(0);
     /// v.push(1);
     ///
-    /// let (ptr, len, cap, alloc) = v.into_raw_parts_with_alloc();
+    /// let (ptr, len, cap, alloc) = v.into_raw_parts_with_allocator();
     ///
     /// let rebuilt = unsafe {
     ///     // We can now make changes to the components, such as
@@ -1358,7 +1351,7 @@ impl<T, A: Allocator> Vec<T, A> {
     #[must_use = "losing the pointer will leak memory"]
     #[unstable(feature = "allocator_api", issue = "32838")]
     #[rustc_const_unstable(feature = "allocator_api", issue = "32838")]
-    pub const fn into_raw_parts_with_alloc(self) -> (*mut T, usize, usize, A) {
+    pub const fn into_raw_parts_with_allocator(self) -> (*mut T, usize, usize, A) {
         let mut me = ManuallyDrop::new(self);
         let len = me.len();
         let capacity = me.capacity();
@@ -1394,7 +1387,7 @@ impl<T, A: Allocator> Vec<T, A> {
     /// v.push(0);
     /// v.push(1);
     ///
-    /// let (ptr, len, cap, alloc) = v.into_parts_with_alloc();
+    /// let (ptr, len, cap, alloc) = v.into_parts_with_allocator();
     ///
     /// let rebuilt = unsafe {
     ///     // We can now make changes to the components, such as
@@ -1408,9 +1401,8 @@ impl<T, A: Allocator> Vec<T, A> {
     #[must_use = "losing the pointer will leak memory"]
     #[unstable(feature = "allocator_api", issue = "32838")]
     #[rustc_const_unstable(feature = "allocator_api", issue = "32838")]
-    // #[unstable(feature = "box_vec_non_null", issue = "130364")]
-    pub const fn into_parts_with_alloc(self) -> (NonNull<T>, usize, usize, A) {
-        let (ptr, len, capacity, alloc) = self.into_raw_parts_with_alloc();
+    pub const fn into_parts_with_allocator(self) -> (NonNull<T>, usize, usize, A) {
+        let (ptr, len, capacity, alloc) = self.into_raw_parts_with_allocator();
         // SAFETY: A `Vec` always has a non-null pointer.
         (unsafe { NonNull::new_unchecked(ptr) }, len, capacity, alloc)
     }
@@ -1529,7 +1521,7 @@ impl<T, A: Allocator> Vec<T, A> {
     ///
     ///     Ok(output)
     /// }
-    /// # process_data(&[1, 2, 3]).expect("why is the test harness OOMing on 12 bytes?");
+    /// # process_data(&[1, 2, 3]).expect("this test needs 12 bytes, so it shouldn't fail");
     /// ```
     #[stable(feature = "try_reserve", since = "1.57.0")]
     pub fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError> {
@@ -1572,7 +1564,7 @@ impl<T, A: Allocator> Vec<T, A> {
     ///
     ///     Ok(output)
     /// }
-    /// # process_data(&[1, 2, 3]).expect("why is the test harness OOMing on 12 bytes?");
+    /// # process_data(&[1, 2, 3]).expect("this test needs 12 bytes, so it shouldn't fail");
     /// ```
     #[stable(feature = "try_reserve", since = "1.57.0")]
     pub fn try_reserve_exact(&mut self, additional: usize) -> Result<(), TryReserveError> {
@@ -1656,7 +1648,7 @@ impl<T, A: Allocator> Vec<T, A> {
     /// let mut vec = Vec::with_capacity(10);
     /// vec.extend([1, 2, 3]);
     /// assert!(vec.capacity() >= 10);
-    /// vec.try_shrink_to_fit().expect("why is the test harness failing to shrink to 12 bytes");
+    /// vec.try_shrink_to_fit().expect("for this test, shrink shouldn't fail");
     /// assert!(vec.capacity() >= 3);
     /// ```
     #[unstable(feature = "vec_fallible_shrink", issue = "152350")]
@@ -1686,7 +1678,7 @@ impl<T, A: Allocator> Vec<T, A> {
     /// let mut vec = Vec::with_capacity(10);
     /// vec.extend([1, 2, 3]);
     /// assert!(vec.capacity() >= 10);
-    /// vec.try_shrink_to(4).expect("why is the test harness failing to shrink to 12 bytes");
+    /// vec.try_shrink_to(4).expect("for this test, shrink shouldn't fail");
     /// assert!(vec.capacity() >= 4);
     /// vec.try_shrink_to(0).expect("this is a no-op and thus the allocator isn't involved.");
     /// assert!(vec.capacity() >= 3);
@@ -2081,7 +2073,7 @@ impl<T, A: Allocator> Vec<T, A> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(box_vec_non_null)]
+    /// #![feature(vec_as_non_null)]
     ///
     /// // Allocate vector big enough for 4 elements.
     /// let size = 4;
@@ -2101,7 +2093,7 @@ impl<T, A: Allocator> Vec<T, A> {
     /// Due to the aliasing guarantee, the following code is legal:
     ///
     /// ```rust
-    /// #![feature(box_vec_non_null)]
+    /// #![feature(vec_as_non_null)]
     ///
     /// unsafe {
     ///     let mut v = vec![0];
@@ -2117,8 +2109,9 @@ impl<T, A: Allocator> Vec<T, A> {
     /// [`as_mut_ptr`]: Vec::as_mut_ptr
     /// [`as_ptr`]: Vec::as_ptr
     /// [`as_non_null`]: Vec::as_non_null
-    #[unstable(feature = "box_vec_non_null", issue = "130364")]
-    #[rustc_const_unstable(feature = "box_vec_non_null", issue = "130364")]
+    #[unstable(feature = "vec_as_non_null", issue = "157843")]
+    #[rustc_const_unstable(feature = "vec_as_non_null", issue = "157843")]
+    #[rustc_as_ptr]
     #[inline]
     pub const fn as_non_null(&mut self) -> NonNull<T> {
         self.buf.non_null()
@@ -3302,8 +3295,9 @@ impl<T, A: Allocator> Vec<T, A> {
     /// assert_eq!(&v, &[0, 1, 2]);
     /// ```
     #[stable(feature = "vec_spare_capacity", since = "1.60.0")]
+    #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
     #[inline]
-    pub fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<T>] {
+    pub const fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<T>] {
         // Note:
         // This method is not implemented in terms of `split_at_spare_mut`,
         // to prevent invalidation of pointers to the buffer.
@@ -3367,8 +3361,9 @@ impl<T, A: Allocator> Vec<T, A> {
     /// assert_eq!(&v, &[1, 1, 2, 4, 8, 12, 16]);
     /// ```
     #[unstable(feature = "vec_split_at_spare", issue = "81944")]
+    #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
     #[inline]
-    pub fn split_at_spare_mut(&mut self) -> (&mut [T], &mut [MaybeUninit<T>]) {
+    pub const fn split_at_spare_mut(&mut self) -> (&mut [T], &mut [MaybeUninit<T>]) {
         // SAFETY:
         // - len is ignored and so never changed
         let (init, spare, _) = unsafe { self.split_at_spare_mut_with_len() };
@@ -3378,7 +3373,7 @@ impl<T, A: Allocator> Vec<T, A> {
     /// Safety: changing returned .2 (&mut usize) is considered the same as calling `.set_len(_)`.
     ///
     /// This method provides unique access to all vec parts at once in `extend_from_within`.
-    unsafe fn split_at_spare_mut_with_len(
+    const unsafe fn split_at_spare_mut_with_len(
         &mut self,
     ) -> (&mut [T], &mut [MaybeUninit<T>], &mut usize) {
         let ptr = self.as_mut_ptr();
@@ -3444,10 +3439,10 @@ impl<T, A: Allocator> Vec<T, A> {
             self.buf.shrink_to_fit(cap - cap_remainder);
         }
 
-        let (ptr, _, _, alloc) = self.into_raw_parts_with_alloc();
+        let (ptr, _, _, alloc) = self.into_raw_parts_with_allocator();
 
         // SAFETY:
-        // - `ptr` and `alloc` were just returned from `self.into_raw_parts_with_alloc()`
+        // - `ptr` and `alloc` were just returned from `self.into_raw_parts_with_allocator()`
         // - `[T; N]` has the same alignment as `T`
         // - `size_of::<[T; N]>() * cap / N == size_of::<T>() * cap`
         // - `len / N <= cap / N` because `len <= cap`
@@ -3517,10 +3512,10 @@ impl<T, A: Allocator> Vec<T, A> {
             assert!(size_of::<T>() == size_of::<U>());
             assert!(align_of::<T>() == align_of::<U>());
         };
-        let (ptr, length, capacity, alloc) = self.into_parts_with_alloc();
+        let (ptr, length, capacity, alloc) = self.into_parts_with_allocator();
         debug_assert_eq!(length, 0);
         // SAFETY:
-        // - `ptr` and `alloc` were just returned from `self.into_raw_parts_with_alloc()`
+        // - `ptr` and `alloc` were just returned from `self.into_raw_parts_with_allocator()`
         // - `T` & `U` have the same layout, so `capacity` does not need to be changed and we can safely use `alloc.dealloc` later
         // - the original vector was cleared, so there is no problem with "transmuting" the stored values
         unsafe { Vec::from_parts_in(ptr.cast::<U>(), length, capacity, alloc) }
@@ -3691,9 +3686,12 @@ impl<T, A: Allocator, const N: usize> Vec<[T; N], A> {
     /// ```
     #[stable(feature = "slice_flatten", since = "1.80.0")]
     pub fn into_flattened(self) -> Vec<T, A> {
-        let (ptr, len, cap, alloc) = self.into_raw_parts_with_alloc();
+        let (ptr, len, cap, alloc) = self.into_raw_parts_with_allocator();
         let (new_len, new_cap) = if T::IS_ZST {
-            (len.checked_mul(N).expect("vec len overflow"), usize::MAX)
+            (
+                len.checked_mul(N).expect("the product of vec len and N shouldn't overflow"),
+                usize::MAX,
+            )
         } else {
             // SAFETY:
             // - `cap * N` cannot overflow because the allocation is already in
@@ -3880,7 +3878,7 @@ impl<T: Clone, A: Allocator + Clone> Clone for Vec<T, A> {
     /// capacity of the original.
     fn clone(&self) -> Self {
         let alloc = self.allocator().clone();
-        <[T]>::to_vec_in(&**self, alloc)
+        <[T]>::to_vec_in(self, alloc)
     }
 
     /// Overwrites the contents of `self` with a clone of the contents of `source`.

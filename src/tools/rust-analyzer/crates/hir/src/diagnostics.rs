@@ -32,7 +32,7 @@ use syntax::{
 };
 use triomphe::Arc;
 
-use crate::{AssocItem, Field, Function, GenericDef, Local, Trait, Type, TypeOwnerId, Variant};
+use crate::{AssocItem, Field, Function, GenericDef, Trait, Type, TypeOwnerId, Variant};
 
 pub use hir_def::VariantId;
 pub use hir_ty::{
@@ -134,10 +134,8 @@ diagnostics![AnyDiagnostic<'db> ->
     MissingFields,
     MissingMatchArms,
     MissingUnsafe,
-    MovedOutOfRef<'db>,
     MutRefInImmRefPat,
     MutableRefBinding,
-    NeedMut,
     NonExhaustiveLet,
     NonExhaustiveRecordExpr,
     NonExhaustiveRecordPat,
@@ -168,8 +166,6 @@ diagnostics![AnyDiagnostic<'db> ->
     UnresolvedMethodCall<'db>,
     UnresolvedModule,
     UnresolvedIdent,
-    UnusedMut,
-    UnusedVariable,
     GenericArgsProhibited,
     ParenthesizedGenericArgsWithoutFnTrait,
     BadRtn,
@@ -309,8 +305,8 @@ pub struct MismatchedTupleStructPatArgCount {
 #[derive(Debug)]
 pub struct MismatchedArrayPatLen {
     pub pat: InFile<ExprOrPatPtr>,
-    pub expected: u128,
-    pub found: u128,
+    pub expected: u64,
+    pub found: u64,
     pub has_rest: bool,
 }
 
@@ -441,6 +437,9 @@ pub struct MismatchedArgCount {
     pub call_expr: InFile<ExprOrPatPtr>,
     pub expected: usize,
     pub found: usize,
+    /// True when the call is through a `Fn`/`FnMut`/`FnOnce` trait (E0057)
+    /// rather than a regular function call (E0061).
+    pub is_fn_trait_call: bool,
 }
 
 #[derive(Debug)]
@@ -471,28 +470,6 @@ pub struct TypeMismatch<'db> {
     pub expr_or_pat: InFile<ExprOrPatPtr>,
     pub expected: Type<'db>,
     pub actual: Type<'db>,
-}
-
-#[derive(Debug)]
-pub struct NeedMut {
-    pub local: Local,
-    pub span: InFile<SyntaxNodePtr>,
-}
-
-#[derive(Debug)]
-pub struct UnusedMut {
-    pub local: Local,
-}
-
-#[derive(Debug)]
-pub struct UnusedVariable {
-    pub local: Local,
-}
-
-#[derive(Debug)]
-pub struct MovedOutOfRef<'db> {
-    pub ty: Type<'db>,
-    pub span: InFile<SyntaxNodePtr>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -677,7 +654,7 @@ pub struct PatternArgInExternFn {
 pub struct UnimplementedTrait<'db> {
     pub span: SpanSyntax,
     pub trait_predicate: crate::TraitPredicate<'db>,
-    pub root_trait_predicate: Option<crate::TraitPredicate<'db>>,
+    pub parent_trait_predicates: Vec<crate::TraitPredicate<'db>>,
 }
 
 #[derive(Debug)]
@@ -835,7 +812,7 @@ impl<'db> AnyDiagnostic<'db> {
         d: &'db InferenceDiagnostic,
         source_map: &hir_def::expr_store::BodySourceMap,
         sig_map: &hir_def::expr_store::ExpressionStoreSourceMap,
-        type_owner: TypeOwnerId,
+        type_owner: TypeOwnerId<'db>,
     ) -> Option<AnyDiagnostic<'db>> {
         let expr_syntax = |expr| Self::expr_syntax(expr, source_map);
         let pat_syntax = |pat| Self::pat_syntax(pat, source_map);
@@ -847,7 +824,7 @@ impl<'db> AnyDiagnostic<'db> {
         let span_syntax = |span| Self::span_syntax(span, source_map);
         Some(match d {
             &InferenceDiagnostic::NoSuchField { field: expr, private, variant } => {
-                let expr_or_pat = match expr {
+                let expr_or_pat = match expr.unpack() {
                     ExprOrPatId::ExprId(expr) => {
                         source_map.field_syntax(expr).map(AstPtr::wrap_left)
                     }
@@ -877,7 +854,7 @@ impl<'db> AnyDiagnostic<'db> {
                 InvalidRangePatType { pat }.into()
             }
             &InferenceDiagnostic::DuplicateField { field: expr, variant } => {
-                let expr_or_pat = match expr {
+                let expr_or_pat = match expr.unpack() {
                     ExprOrPatId::ExprId(expr) => {
                         source_map.field_syntax(expr).map(AstPtr::wrap_left)
                     }
@@ -885,16 +862,25 @@ impl<'db> AnyDiagnostic<'db> {
                 };
                 DuplicateField { field: expr_or_pat, variant: variant.into() }.into()
             }
-            &InferenceDiagnostic::MismatchedArgCount { call_expr, expected, found } => {
-                MismatchedArgCount { call_expr: expr_syntax(call_expr)?, expected, found }.into()
+            &InferenceDiagnostic::MismatchedArgCount {
+                call_expr,
+                expected,
+                found,
+                is_fn_trait_call,
+            } => MismatchedArgCount {
+                call_expr: expr_syntax(call_expr)?,
+                expected,
+                found,
+                is_fn_trait_call,
             }
+            .into(),
             &InferenceDiagnostic::PrivateField { expr, field } => {
                 let expr = expr_syntax(expr)?;
                 let field = field.into();
                 PrivateField { expr, field }.into()
             }
             &InferenceDiagnostic::PrivateAssocItem { id, item } => {
-                let expr_or_pat = expr_or_pat_syntax(id)?;
+                let expr_or_pat = expr_or_pat_syntax(id.unpack())?;
                 let item = item.into();
                 PrivateAssocItem { expr_or_pat, item }.into()
             }
@@ -937,11 +923,11 @@ impl<'db> AnyDiagnostic<'db> {
                 .into()
             }
             &InferenceDiagnostic::UnresolvedAssocItem { id } => {
-                let expr_or_pat = expr_or_pat_syntax(id)?;
+                let expr_or_pat = expr_or_pat_syntax(id.unpack())?;
                 UnresolvedAssocItem { expr_or_pat }.into()
             }
             &InferenceDiagnostic::UnresolvedIdent { id } => {
-                let node = match id {
+                let node = match id.unpack() {
                     ExprOrPatId::ExprId(id) => match source_map.expr_syntax(id) {
                         Ok(syntax) => syntax.map(|it| (it, None)),
                         Err(SyntheticSyntax) => source_map
@@ -1019,7 +1005,7 @@ impl<'db> AnyDiagnostic<'db> {
                 Self::ty_diagnostic(diag, source_map, db)?
             }
             InferenceDiagnostic::PathDiagnostic { node, diag } => {
-                let source = expr_or_pat_syntax(*node)?;
+                let source = expr_or_pat_syntax(node.unpack())?;
                 let syntax = source.value.to_node(&source.file_id.parse_or_expand(db));
                 let path = match_ast! {
                     match (syntax.syntax()) {
@@ -1100,7 +1086,7 @@ impl<'db> AnyDiagnostic<'db> {
                 UnionExprMustHaveExactlyOneField { expr }.into()
             }
             InferenceDiagnostic::TypeMismatch { node, expected, found } => {
-                let expr_or_pat = expr_or_pat_syntax(*node)?;
+                let expr_or_pat = expr_or_pat_syntax(node.unpack())?;
                 TypeMismatch {
                     expr_or_pat,
                     expected: Type { owner: type_owner, ty: EarlyBinder::bind(expected.as_ref()) },
@@ -1120,7 +1106,7 @@ impl<'db> AnyDiagnostic<'db> {
                         Either::Left(expr)
                     }
                     ExplicitDropMethodUseKind::Path(path_expr_id) => {
-                        let syntax = expr_or_pat_syntax(*path_expr_id)?;
+                        let syntax = expr_or_pat_syntax(path_expr_id.unpack())?;
                         let file_id = syntax.file_id;
                         let syntax =
                             syntax.with_value(syntax.value.cast::<ast::PathExpr>()?).to_node(db);
@@ -1141,6 +1127,52 @@ impl<'db> AnyDiagnostic<'db> {
             &InferenceDiagnostic::ReturnOutsideFunction { expr, kind } => {
                 ReturnOutsideFunction { expr: expr_syntax(expr)?, kind }.into()
             }
+            &InferenceDiagnostic::RecordMissingFields { record, variant, ref missed_fields } => {
+                let record = expr_or_pat_syntax(record)?;
+                let file = record.file_id;
+                let root = record.file_syntax(db);
+                let variant_data = variant.fields(db);
+                let missed_fields = missed_fields
+                    .iter()
+                    .map(|&idx| {
+                        (
+                            variant_data.fields()[idx].name.clone(),
+                            Field { parent: variant.into(), id: idx },
+                        )
+                    })
+                    .collect();
+                match record.value.to_node(&root) {
+                    Either::Left(ast::Expr::RecordExpr(record_expr))
+                        if record_expr.record_expr_field_list().is_some() =>
+                    {
+                        let field_list_parent_path =
+                            record_expr.path().map(|path| AstPtr::new(&path));
+                        return Some(
+                            MissingFields {
+                                file,
+                                field_list_parent: AstPtr::new(&Either::Left(record_expr)),
+                                field_list_parent_path,
+                                missed_fields,
+                            }
+                            .into(),
+                        );
+                    }
+                    Either::Right(ast::Pat::RecordPat(record_pat))
+                        if record_pat.record_pat_field_list().is_some() =>
+                    {
+                        let field_list_parent_path =
+                            record_pat.path().map(|path| AstPtr::new(&path));
+                        MissingFields {
+                            file,
+                            field_list_parent: AstPtr::new(&Either::Right(record_pat)),
+                            field_list_parent_path,
+                            missed_fields,
+                        }
+                        .into()
+                    }
+                    _ => return None,
+                }
+            }
         })
     }
 
@@ -1148,23 +1180,26 @@ impl<'db> AnyDiagnostic<'db> {
         db: &'db dyn HirDatabase,
         d: &'db SolverDiagnosticKind,
         span: SpanSyntax,
-        type_owner: TypeOwnerId,
+        type_owner: TypeOwnerId<'db>,
     ) -> Option<AnyDiagnostic<'db>> {
         let interner = DbInterner::new_no_crate(db);
         Some(match d {
-            SolverDiagnosticKind::TraitUnimplemented { trait_predicate, root_trait_predicate } => {
+            SolverDiagnosticKind::TraitUnimplemented {
+                trait_predicate,
+                parent_trait_predicates,
+            } => {
                 let trait_predicate = crate::TraitPredicate {
                     inner: trait_predicate.get(interner),
                     owner: type_owner,
                 };
-                let root_trait_predicate =
-                    root_trait_predicate.as_ref().map(|root_trait_predicate| {
-                        crate::TraitPredicate {
-                            inner: root_trait_predicate.get(interner),
-                            owner: type_owner,
-                        }
-                    });
-                UnimplementedTrait { span, trait_predicate, root_trait_predicate }.into()
+                let parent_trait_predicates = parent_trait_predicates
+                    .iter()
+                    .map(|trait_predicate| crate::TraitPredicate {
+                        inner: trait_predicate.get(interner),
+                        owner: type_owner,
+                    })
+                    .collect();
+                UnimplementedTrait { span, trait_predicate, parent_trait_predicates }.into()
             }
         })
     }

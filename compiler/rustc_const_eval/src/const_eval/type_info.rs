@@ -4,7 +4,7 @@ use std::borrow::Cow;
 
 use rustc_abi::{ExternAbi, FieldIdx};
 use rustc_ast::Mutability;
-use rustc_hir::LangItem;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_middle::span_bug;
 use rustc_middle::ty::layout::TyAndLayout;
 use rustc_middle::ty::{self, Const, FnHeader, FnSigKind, FnSigTys, ScalarInt, Ty, TyCtxt};
@@ -20,7 +20,7 @@ impl<'tcx> InterpCx<'tcx, CompileTimeMachine<'tcx>> {
     // A general method to write an array to a static slice place.
     fn allocate_fill_and_write_slice_ptr(
         &mut self,
-        slice_place: impl Writeable<'tcx, CtfeProvenance>,
+        slice_place: &impl Writeable<'tcx, CtfeProvenance>,
         len: u64,
         writer: impl Fn(&mut Self, /* index */ u64, MPlaceTy<'tcx>) -> InterpResult<'tcx>,
     ) -> InterpResult<'tcx> {
@@ -45,7 +45,7 @@ impl<'tcx> InterpCx<'tcx, CompileTimeMachine<'tcx>> {
         // Write the slice pointing to the array
         let array_place = array_place.map_provenance(CtfeProvenance::as_immutable);
         let ptr = Immediate::new_slice(array_place.ptr(), len, self);
-        self.write_immediate(ptr, &slice_place)
+        self.write_immediate(ptr, slice_place)
     }
 
     /// Writes a `core::mem::type_info::TypeInfo` for a given type, `ty` to the given place.
@@ -61,7 +61,6 @@ impl<'tcx> InterpCx<'tcx, CompileTimeMachine<'tcx>> {
         // Fill all fields of the `TypeInfo` struct.
         for (idx, field) in ty_struct.fields.iter_enumerated() {
             let field_dest = self.project_field(dest, idx)?;
-            let ptr_bit_width = || self.tcx.data_layout.pointer_size().bits();
             match field.name {
                 sym::kind => {
                     let variant_index = match ty.kind() {
@@ -115,33 +114,19 @@ impl<'tcx> InterpCx<'tcx, CompileTimeMachine<'tcx>> {
                                 self.project_downcast_named(&field_dest, sym::Char)?;
                             variant
                         }
-                        ty::Int(int_ty) => {
-                            let (variant, variant_place) =
+                        ty::Int(_) => {
+                            let (variant, _variant_place) =
                                 self.project_downcast_named(&field_dest, sym::Int)?;
-                            let place = self.project_field(&variant_place, FieldIdx::ZERO)?;
-                            self.write_int_type_info(
-                                place,
-                                int_ty.bit_width().unwrap_or_else(/* isize */ ptr_bit_width),
-                                true,
-                            )?;
                             variant
                         }
-                        ty::Uint(uint_ty) => {
-                            let (variant, variant_place) =
+                        ty::Uint(_) => {
+                            let (variant, _variant_place) =
                                 self.project_downcast_named(&field_dest, sym::Int)?;
-                            let place = self.project_field(&variant_place, FieldIdx::ZERO)?;
-                            self.write_int_type_info(
-                                place,
-                                uint_ty.bit_width().unwrap_or_else(/* usize */ ptr_bit_width),
-                                false,
-                            )?;
                             variant
                         }
-                        ty::Float(float_ty) => {
-                            let (variant, variant_place) =
+                        ty::Float(_) => {
+                            let (variant, _variant_place) =
                                 self.project_downcast_named(&field_dest, sym::Float)?;
-                            let place = self.project_field(&variant_place, FieldIdx::ZERO)?;
-                            self.write_float_type_info(place, float_ty.bit_width())?;
                             variant
                         }
                         ty::Str => {
@@ -262,7 +247,7 @@ impl<'tcx> InterpCx<'tcx, CompileTimeMachine<'tcx>> {
         let tuple_layout = self.layout_of(tuple_ty)?;
         let fields_slice_place = self.project_field(&tuple_place, FieldIdx::ZERO)?;
         self.allocate_fill_and_write_slice_ptr(
-            fields_slice_place,
+            &fields_slice_place,
             fields.len() as u64,
             |this, i, place| {
                 let field_ty = fields[i as usize];
@@ -316,48 +301,6 @@ impl<'tcx> InterpCx<'tcx, CompileTimeMachine<'tcx>> {
         interp_ok(())
     }
 
-    fn write_int_type_info(
-        &mut self,
-        place: impl Writeable<'tcx, CtfeProvenance>,
-        bit_width: u64,
-        signed: bool,
-    ) -> InterpResult<'tcx> {
-        for (field_idx, field) in
-            place.layout().ty.ty_adt_def().unwrap().non_enum_variant().fields.iter_enumerated()
-        {
-            let field_place = self.project_field(&place, field_idx)?;
-            match field.name {
-                sym::bits => self.write_scalar(
-                    Scalar::from_u32(bit_width.try_into().expect("bit_width overflowed")),
-                    &field_place,
-                )?,
-                sym::signed => self.write_scalar(Scalar::from_bool(signed), &field_place)?,
-                other => span_bug!(self.tcx.def_span(field.did), "unimplemented field {other}"),
-            }
-        }
-        interp_ok(())
-    }
-
-    fn write_float_type_info(
-        &mut self,
-        place: impl Writeable<'tcx, CtfeProvenance>,
-        bit_width: u64,
-    ) -> InterpResult<'tcx> {
-        for (field_idx, field) in
-            place.layout().ty.ty_adt_def().unwrap().non_enum_variant().fields.iter_enumerated()
-        {
-            let field_place = self.project_field(&place, field_idx)?;
-            match field.name {
-                sym::bits => self.write_scalar(
-                    Scalar::from_u32(bit_width.try_into().expect("bit_width overflowed")),
-                    &field_place,
-                )?,
-                other => span_bug!(self.tcx.def_span(field.did), "unimplemented field {other}"),
-            }
-        }
-        interp_ok(())
-    }
-
     pub(crate) fn write_reference_type_info(
         &mut self,
         place: impl Writeable<'tcx, CtfeProvenance>,
@@ -381,6 +324,49 @@ impl<'tcx> InterpCx<'tcx, CompileTimeMachine<'tcx>> {
             }
         }
         interp_ok(())
+    }
+
+    pub(crate) fn write_type_id_generics(
+        &mut self,
+        place: &impl Writeable<'tcx, CtfeProvenance>,
+        ty: Ty<'tcx>,
+    ) -> InterpResult<'tcx> {
+        let generics: ty::Binder<'_, ty::GenericArgsRef<'_>> = match *ty.kind() {
+            ty::Bool
+            | ty::Char
+            | ty::Int(..)
+            | ty::Uint(..)
+            | ty::Float(..)
+            | ty::Foreign(..)
+            | ty::Str
+            | ty::Array(..)
+            | ty::Pat(..)
+            | ty::RawPtr(..)
+            | ty::Ref(..)
+            | ty::FnPtr(..)
+            | ty::Dynamic(..)
+            | ty::CoroutineWitness(..)
+            | ty::Never
+            | ty::Tuple(..)
+            | ty::Alias(..)
+            | ty::Param(..)
+            | ty::Bound(..)
+            | ty::Placeholder(..)
+            | ty::Infer(..)
+            | ty::Error(..)
+            | ty::Slice(..) => ty::Binder::dummy(ty::GenericArgsRef::default()),
+            ty::Adt(_, args) => ty::Binder::dummy(args),
+            ty::FnDef(_, binder) => binder,
+            ty::UnsafeBinder(binder) => binder.rebind(ty::GenericArgsRef::default()),
+            ty::Closure(_, args) => ty::Binder::dummy(args),
+            ty::CoroutineClosure(_, args) => ty::Binder::dummy(args),
+            ty::Coroutine(_, args) => ty::Binder::dummy(args),
+        };
+
+        // FIXME(type_info): also provide the late bound vars to reflection
+        let generics = generics.skip_binder();
+
+        self.write_generics(place, generics)
     }
 
     pub(crate) fn write_fn_ptr_type_info(
@@ -424,7 +410,7 @@ impl<'tcx> InterpCx<'tcx, CompileTimeMachine<'tcx>> {
                 sym::inputs => {
                     let inputs = sig.inputs();
                     self.allocate_fill_and_write_slice_ptr(
-                        field_place,
+                        &field_place,
                         inputs.len() as _,
                         |this, i, place| this.write_type_id(inputs[i as usize], &place),
                     )?;

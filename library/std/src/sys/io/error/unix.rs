@@ -60,11 +60,13 @@ pub fn errno() -> i32 {
 // needed for readdir and syscall!
 #[cfg(not(any(
     target_os = "dragonfly",
-    target_os = "vxworks",
+    target_os = "espidf",
+    target_os = "lynxos178",
+    target_os = "qurt",
     target_os = "rtems",
+    target_os = "vxworks",
     target_os = "wasi",
 )))]
-#[allow(dead_code)] // but not all target cfgs actually end up using it
 #[inline]
 pub fn set_errno(e: i32) {
     unsafe { *errno_location() = e as c_int }
@@ -92,14 +94,13 @@ pub fn errno() -> i32 {
 pub fn errno() -> i32 {
     unsafe extern "C" {
         #[thread_local]
-        static errno: c_int;
+        static mut errno: c_int;
     }
 
     unsafe { errno as i32 }
 }
 
 #[cfg(target_os = "dragonfly")]
-#[allow(dead_code)]
 #[inline]
 pub fn set_errno(e: i32) {
     unsafe extern "C" {
@@ -107,9 +108,7 @@ pub fn set_errno(e: i32) {
         static mut errno: c_int;
     }
 
-    unsafe {
-        errno = e;
-    }
+    unsafe { errno = e };
 }
 
 #[cfg(target_os = "wasi")]
@@ -158,7 +157,6 @@ pub fn decode_error_kind(errno: i32) -> io::ErrorKind {
         libc::ENOENT => NotFound,
         libc::ENOMEM => OutOfMemory,
         libc::ENOSPC => StorageFull,
-        libc::ENOSYS => Unsupported,
         libc::EMLINK => TooManyLinks,
         libc::ENAMETOOLONG => InvalidFilename,
         libc::ENETDOWN => NetworkDown,
@@ -176,10 +174,15 @@ pub fn decode_error_kind(errno: i32) -> io::ErrorKind {
         libc::EXDEV => CrossesDevices,
         libc::EINPROGRESS => InProgress,
         libc::EMFILE | libc::ENFILE => TooManyOpenFiles,
-        libc::EOPNOTSUPP => Unsupported,
         libc::EIO => InputOutputError,
 
         libc::EACCES | libc::EPERM => PermissionDenied,
+
+        libc::ENOSYS => Unsupported,
+        // EOPNOTSUPP and ENOTSUP can have the same value on some systems,
+        // but different values on others (e.g. Apple), so we can't use a
+        // match clause
+        x if x == libc::EOPNOTSUPP || x == libc::ENOTSUP => Unsupported,
 
         // These two constants can have the same value on some systems,
         // but different values on others, so we can't use a match
@@ -202,7 +205,8 @@ pub fn error_string(errno: i32) -> String {
                     target_os = "linux",
                     target_os = "hurd",
                     target_env = "newlib",
-                    target_os = "cygwin"
+                    target_os = "cygwin",
+                    target_env = "uclibc",
                 ),
                 not(target_env = "ohos")
             ),

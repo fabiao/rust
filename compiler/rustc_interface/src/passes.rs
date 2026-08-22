@@ -5,16 +5,17 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::{env, fs, iter};
 
-use rustc_ast::{self as ast, CRATE_NODE_ID};
+use rustc_ast as ast;
 use rustc_attr_parsing::{AttributeParser, ShouldEmit};
 use rustc_codegen_ssa::traits::CodegenBackend;
 use rustc_codegen_ssa::{CompiledModules, CrateInfo};
+use rustc_crate_store::Untracked;
 use rustc_data_structures::indexmap::IndexMap;
 use rustc_data_structures::steal::Steal;
 use rustc_data_structures::sync::{
     AppendOnlyIndexVec, DynSend, DynSync, FreezeLock, WorkerLocal, par_fns,
 };
-use rustc_data_structures::{Limit, thousands};
+use rustc_data_structures::thousands;
 use rustc_errors::timings::TimingSection;
 use rustc_errors::{Diag, DiagCtxtHandle, Diagnostic, Level};
 use rustc_expand::base::{ExtCtxt, LintStoreExpand};
@@ -23,7 +24,7 @@ use rustc_fs_util::try_canonicalize;
 use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def_id::{LOCAL_CRATE, StableCrateId, StableCrateIdMap};
 use rustc_hir::definitions::Definitions;
-use rustc_hir::{Attribute, Target, find_attr};
+use rustc_hir::{Attribute, find_attr};
 use rustc_incremental::setup_dep_graph;
 use rustc_lint::{BufferedEarlyLint, EarlyCheckNode, LintStore, unerased_lint_store};
 use rustc_metadata::EncodedMetadata;
@@ -35,15 +36,15 @@ use rustc_parse::lexer::StripTokens;
 use rustc_parse::{new_parser_from_file, new_parser_from_source_str, unwrap_or_emit_fatal};
 use rustc_passes::{abi_test, input_stats, layout_test};
 use rustc_resolve::{Resolver, ResolverOutputs};
-use rustc_session::Session;
-use rustc_session::config::{CrateType, Input, OutFileName, OutputFilenames, OutputType};
-use rustc_session::cstore::Untracked;
+use rustc_session::config::{Input, OutFileName, OutputFilenames, OutputType};
 use rustc_session::diagnostics::feature_err;
 use rustc_session::output::{filename_for_input, invalid_output_for_target};
 use rustc_session::search_paths::PathKind;
+use rustc_session::{IncrCompSession, Session};
 use rustc_span::{
     DUMMY_SP, ErrorGuaranteed, ExpnKind, SourceFileHash, SourceFileHashAlgorithm, Span, Symbol, sym,
 };
+use rustc_structures::{CrateType, Limit};
 use rustc_trait_selection::{solve, traits};
 use tracing::{info, instrument};
 
@@ -87,7 +88,7 @@ fn pre_expansion_lint<'a>(
     sess: &Session,
     features: &Features,
     lint_store: &LintStore,
-    registered_tools: &RegisteredTools,
+    registered_lint_tools: &RegisteredTools,
     check_node: EarlyCheckNode<'a>,
     node_name: Symbol,
 ) {
@@ -98,7 +99,7 @@ fn pre_expansion_lint<'a>(
                 features,
                 true,
                 lint_store,
-                registered_tools,
+                registered_lint_tools,
                 None,
                 check_node,
             );
@@ -114,14 +115,14 @@ impl LintStoreExpand for LintStoreExpandImpl<'_> {
         &self,
         sess: &Session,
         features: &Features,
-        registered_tools: &RegisteredTools,
+        registered_lint_tools: &RegisteredTools,
         node_id: ast::NodeId,
         attrs: &[ast::Attribute],
         items: &[Box<ast::Item>],
         name: Symbol,
     ) {
         let check_node = EarlyCheckNode::LoadedMod(node_id, attrs, items);
-        pre_expansion_lint(sess, features, self.0, registered_tools, check_node, name);
+        pre_expansion_lint(sess, features, self.0, registered_lint_tools, check_node, name);
     }
 }
 
@@ -144,7 +145,7 @@ fn configure_and_expand(
         sess,
         features,
         lint_store,
-        tcx.registered_tools(()),
+        tcx.registered_lint_tools(()),
         EarlyCheckNode::CrateRoot(&krate, pre_configured_attrs),
         crate_name,
     );
@@ -179,7 +180,7 @@ fn configure_and_expand(
         if cfg!(windows) {
             old_path = env::var_os("PATH").unwrap_or(old_path);
             let mut new_path = Vec::from_iter(
-                sess.host_filesearch().search_paths(PathKind::Native).map(|p| p.dir.clone()),
+                sess.host_filesearch().search_paths(PathKind::Native).map(|p| p.dir.to_path_buf()),
             );
             for path in env::split_paths(&old_path) {
                 if !new_path.contains(&path) {
@@ -275,6 +276,12 @@ fn configure_and_expand(
             sess.dcx().emit_err(diagnostics::MixedProcMacroCrate);
         }
     }
+
+    if is_proc_macro_crate && sess.target.is_like_wasm && !sess.opts.unstable_opts.wasm_proc_macros
+    {
+        sess.dcx().emit_err(diagnostics::UnstableWasmProcMacro);
+    }
+
     if crate_types.contains(&CrateType::Sdylib) && !tcx.features().export_stable() {
         feature_err(sess, sym::export_stable, DUMMY_SP, "`sdylib` crate type is unstable").emit();
     }
@@ -475,7 +482,7 @@ fn early_lint_checks(tcx: TyCtxt<'_>, (): ()) {
         tcx.features(),
         false,
         lint_store,
-        tcx.registered_tools(()),
+        tcx.registered_lint_tools(()),
         Some(lint_buffer),
         EarlyCheckNode::CrateRoot(&*krate, &*krate.attrs),
     )
@@ -654,7 +661,7 @@ fn write_out_deps(tcx: TyCtxt<'_>, outputs: &OutputFilenames, out_filenames: &[P
                 checksum_hash_algo,
             ));
         }
-        if let Some(ref profile_sample) = sess.opts.unstable_opts.profile_sample_use {
+        if let Some(ref profile_sample) = sess.opts.cg.profile_sample_use {
             files.extend(hash_iter_files(
                 iter::once(normalize_path(profile_sample.as_path().to_path_buf())),
                 checksum_hash_algo,
@@ -791,7 +798,8 @@ fn resolver_for_lowering_raw<'tcx>(
     &'tcx ty::ResolverGlobalCtxt,
 ) {
     let arenas = WorkerLocal::new(|_| Resolver::arenas());
-    let _ = tcx.registered_tools(()); // Uses `crate_for_resolver`.
+    let _ = tcx.registered_attr_tools(()); // Uses `crate_for_resolver`.
+    let _ = tcx.registered_lint_tools(()); // Uses `crate_for_resolver`.
     let (krate, pre_configured_attrs) = tcx.crate_for_resolver(()).steal();
     let mut resolver = Resolver::new(
         tcx,
@@ -868,7 +876,7 @@ pub fn write_dep_info(tcx: TyCtxt<'_>) {
 }
 
 pub fn write_interface<'tcx>(tcx: TyCtxt<'tcx>) {
-    if !tcx.crate_types().contains(&rustc_session::config::CrateType::Sdylib) {
+    if !tcx.crate_types().contains(&rustc_structures::CrateType::Sdylib) {
         return;
     }
     let _timer = tcx.sess.timer("write_interface");
@@ -929,7 +937,7 @@ pub fn create_and_enter_global_ctxt<T, F: for<'tcx> FnOnce(TyCtxt<'tcx>) -> T>(
     compiler: &Compiler,
     krate: rustc_ast::Crate,
     f: F,
-) -> T {
+) -> (T, Option<IncrCompSession>) {
     let sess = &compiler.sess;
 
     let pre_configured_attrs = rustc_expand::config::pre_configure_attrs(sess, &krate.attrs);
@@ -951,7 +959,7 @@ pub fn create_and_enter_global_ctxt<T, F: for<'tcx> FnOnce(TyCtxt<'tcx>) -> T>(
 
     let outputs = util::build_output_filenames(&pre_configured_attrs, sess);
 
-    let dep_graph = setup_dep_graph(sess, crate_name, stable_crate_id);
+    let (dep_graph, incr_comp_session) = setup_dep_graph(sess, crate_name, stable_crate_id);
 
     let cstore =
         FreezeLock::new(Box::new(CStore::new(compiler.codegen_backend.metadata_loader())) as _);
@@ -966,7 +974,8 @@ pub fn create_and_enter_global_ctxt<T, F: for<'tcx> FnOnce(TyCtxt<'tcx>) -> T>(
     // incr. comp. yet.
     dep_graph.assert_ignored();
 
-    let query_result_on_disk_cache = rustc_incremental::load_query_result_cache(sess);
+    let query_result_on_disk_cache =
+        rustc_incremental::load_query_result_cache(sess, incr_comp_session.as_ref());
 
     let codegen_backend = &compiler.codegen_backend;
     let mut providers = *DEFAULT_QUERY_PROVIDERS;
@@ -993,7 +1002,7 @@ pub fn create_and_enter_global_ctxt<T, F: for<'tcx> FnOnce(TyCtxt<'tcx>) -> T>(
     let arena = WorkerLocal::new(|_| Arena::default());
     let hir_arena = WorkerLocal::new(|_| rustc_hir::Arena::default());
 
-    TyCtxt::create_global_ctxt(
+    let res = TyCtxt::create_global_ctxt(
         &gcx_cell,
         &compiler.sess,
         crate_types,
@@ -1001,9 +1010,10 @@ pub fn create_and_enter_global_ctxt<T, F: for<'tcx> FnOnce(TyCtxt<'tcx>) -> T>(
         &arena,
         &hir_arena,
         untracked,
+        incr_comp_session.as_ref(),
         dep_graph,
-        rustc_query_impl::make_dep_kind_vtables(&arena),
         rustc_query_impl::query_system(
+            &arena,
             providers.queries,
             providers.extern_queries,
             query_result_on_disk_cache,
@@ -1046,7 +1056,9 @@ pub fn create_and_enter_global_ctxt<T, F: for<'tcx> FnOnce(TyCtxt<'tcx>) -> T>(
             tcx.finish();
             res
         },
-    )
+    );
+
+    (res, incr_comp_session)
 }
 
 struct DiagCallback<'tcx> {
@@ -1153,6 +1165,9 @@ fn run_required_analyses(tcx: TyCtxt<'_>) {
             if not_typeck_child {
                 tcx.ensure_ok().mir_borrowck(def_id);
                 tcx.ensure_ok().check_transmutes(def_id);
+                if !tcx.sess.opts.unstable_opts.offload.is_empty() {
+                    tcx.ensure_ok().check_offloads(def_id);
+                }
             }
             tcx.ensure_ok().has_ffi_unwind_calls(def_id);
             tcx.ensure_ok().check_liveness(def_id);
@@ -1299,12 +1314,26 @@ pub(crate) fn start_codegen<'tcx>(
 
     let metadata = rustc_metadata::fs::encode_and_write_metadata(tcx);
 
+    let is_host_metadata = tcx
+        .sess
+        .opts
+        .unstable_opts
+        .offload
+        .iter()
+        .any(|o| matches!(o, rustc_session::config::Offload::HostMetadata(_)));
+
     let codegen = tcx.sess.time("codegen_crate", || {
-        if tcx.sess.opts.unstable_opts.no_codegen || !tcx.sess.opts.output_types.should_codegen() {
-            // Skip crate items and just output metadata in -Z no-codegen mode.
+        if tcx.sess.opts.unstable_opts.no_codegen
+            || !tcx.sess.opts.output_types.should_codegen()
+            || is_host_metadata
+        {
             tcx.sess.dcx().abort_if_errors();
 
-            // Linker::link will skip join_codegen in case of a CodegenResults Any value.
+            if is_host_metadata {
+                rustc_monomorphize::write_host_metadata_offload_manifest(tcx);
+            }
+
+            // Linker::link will skip join_codegen in case of a `CompiledModules` Any value.
             Box::new(CompiledModules { modules: vec![], allocator_module: None })
         } else {
             codegen_backend.codegen_crate(tcx)
@@ -1378,13 +1407,11 @@ pub(crate) fn parse_crate_name(
     emit_errors: ShouldEmit,
 ) -> Option<(Symbol, Span)> {
     let rustc_hir::Attribute::Parsed(AttributeKind::CrateName { name, name_span, .. }) =
-        AttributeParser::parse_limited_should_emit(
+        AttributeParser::parse_limited_sym_should_emit(
             sess,
             attrs,
             &[sym::crate_name],
             DUMMY_SP,
-            rustc_ast::node_id::CRATE_NODE_ID,
-            Target::Crate,
             None,
             emit_errors,
         )?
@@ -1428,13 +1455,11 @@ pub fn collect_crate_types(
     let mut base = session.opts.crate_types.clone();
     if base.is_empty() {
         if let Some(Attribute::Parsed(AttributeKind::CrateType(crate_type))) =
-            AttributeParser::parse_limited_should_emit(
+            AttributeParser::parse_limited_sym_should_emit(
                 session,
                 attrs,
                 &[sym::crate_type],
                 crate_span,
-                CRATE_NODE_ID,
-                Target::Crate,
                 None,
                 ShouldEmit::EarlyFatal { also_emit_lints: false },
             )
@@ -1485,13 +1510,11 @@ fn default_output_for_target(sess: &Session) -> CrateType {
 }
 
 fn get_recursion_limit(krate_attrs: &[ast::Attribute], sess: &Session) -> Limit {
-    let attr = AttributeParser::parse_limited_should_emit(
+    let attr = AttributeParser::parse_limited_sym_should_emit(
         sess,
         &krate_attrs,
         &[sym::recursion_limit],
         DUMMY_SP,
-        rustc_ast::node_id::CRATE_NODE_ID,
-        Target::Crate,
         None,
         // errors are fatal here, but lints aren't.
         // If things aren't fatal we continue, and will parse this again.

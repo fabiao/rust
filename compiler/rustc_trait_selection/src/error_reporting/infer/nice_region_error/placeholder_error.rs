@@ -1,6 +1,5 @@
 use std::fmt;
 
-use rustc_data_structures::Limit;
 use rustc_data_structures::intern::Interned;
 use rustc_errors::{Applicability, Diag, IntoDiagArg};
 use rustc_hir as hir;
@@ -10,9 +9,9 @@ use rustc_middle::bug;
 use rustc_middle::ty::error::ExpectedFound;
 use rustc_middle::ty::print::{FmtPrinter, Print, PrintTraitRefExt as _, RegionHighlightMode};
 use rustc_middle::ty::{
-    self, GenericArgsRef, IsSuggestable, RePlaceholder, Region, RegionExt, RegionUtilitiesExt,
-    TyCtxt,
+    self, GenericArgsRef, IsSuggestable, RePlaceholder, Region, RegionExt, TyCtxt,
 };
+use rustc_structures::Limit;
 use tracing::{debug, instrument};
 
 use crate::diagnostics::{

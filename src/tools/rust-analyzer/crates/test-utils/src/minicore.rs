@@ -22,6 +22,7 @@
 //!     cell: copy, drop
 //!     clone: sized
 //!     coerce_pointee: derive, sized, unsize, coerce_unsized, dispatch_from_dyn
+//!     reborrow: derive, copy
 //!     coerce_unsized: unsize
 //!     concat:
 //!     copy: clone
@@ -37,8 +38,6 @@
 //!     error: fmt
 //!     float_consts:
 //!     fmt: option, result, transmute, coerce_unsized, copy, clone, derive
-//!     fmt_before_1_93_0: fmt
-//!     fmt_before_1_89_0: fmt_before_1_93_0
 //!     fn: sized, tuple
 //!     from: sized, result
 //!     future: pin
@@ -210,6 +209,20 @@ pub mod marker {
         /* compiler built-in */
     }
     // endregion:coerce_pointee
+
+    // region:reborrow
+    #[rustc_builtin_macro(Reborrow)]
+    pub macro Reborrow($item:item) {}
+
+    #[lang = "reborrow"]
+    pub trait Reborrow {}
+
+    #[rustc_builtin_macro(CoerceShared, attributes(coerce_shared))]
+    pub macro CoerceShared($item:item) {}
+
+    #[lang = "coerce_shared"]
+    pub trait CoerceShared<Target: Copy>: Reborrow {}
+    // endregion:reborrow
 }
 
 // region:default
@@ -782,6 +795,13 @@ pub mod ops {
             pub(crate) exhausted: bool,
         }
 
+        impl<Idx> RangeInclusive<Idx> {
+            #[lang = "range_inclusive_new"]
+            pub const fn new(start: Idx, end: Idx) -> Self {
+                Self { start, end, exhausted: false }
+            }
+        }
+
         #[lang = "RangeToInclusive"]
         pub struct RangeToInclusive<Idx> {
             pub end: Idx,
@@ -1252,12 +1272,12 @@ pub mod range {
     #[lang = "RangeInclusiveCopy"]
     pub struct RangeInclusive<Idx> {
         pub start: Idx,
-        pub end: Idx,
+        pub last: Idx,
     }
 
     #[lang = "RangeToInclusiveCopy"]
     pub struct RangeToInclusive<Idx> {
-        pub end: Idx,
+        pub last: Idx,
     }
 }
 // endregion:new_range
@@ -1428,111 +1448,8 @@ pub mod fmt {
             Center,
             Unknown,
         }
-
-        // region:fmt_before_1_93_0
-        #[lang = "format_count"]
-        pub enum Count {
-            Is(usize),
-            Param(usize),
-            Implied,
-        }
-
-        #[lang = "format_placeholder"]
-        pub struct Placeholder {
-            pub position: usize,
-            pub fill: char,
-            pub align: Alignment,
-            pub flags: u32,
-            pub precision: Count,
-            pub width: Count,
-        }
-
-        impl Placeholder {
-            pub const fn new(
-                position: usize,
-                fill: char,
-                align: Alignment,
-                flags: u32,
-                precision: Count,
-                width: Count,
-            ) -> Self {
-                Placeholder { position, fill, align, flags, precision, width }
-            }
-        }
-        // endregion:fmt_before_1_93_0
-
-        // region:fmt_before_1_89_0
-        #[lang = "format_unsafe_arg"]
-        pub struct UnsafeArg {
-            _private: (),
-        }
-
-        impl UnsafeArg {
-            pub unsafe fn new() -> Self {
-                UnsafeArg { _private: () }
-            }
-        }
-        // endregion:fmt_before_1_89_0
     }
 
-    // region:fmt_before_1_93_0
-    #[derive(Copy, Clone)]
-    #[lang = "format_arguments"]
-    pub struct Arguments<'a> {
-        pieces: &'a [&'static str],
-        fmt: Option<&'a [rt::Placeholder]>,
-        args: &'a [rt::Argument<'a>],
-    }
-
-    impl<'a> Arguments<'a> {
-        pub const fn new_v1(pieces: &'a [&'static str], args: &'a [Argument<'a>]) -> Arguments<'a> {
-            Arguments { pieces, fmt: None, args }
-        }
-
-        pub const fn new_const(pieces: &'a [&'static str]) -> Arguments<'a> {
-            Arguments { pieces, fmt: None, args: &[] }
-        }
-
-        // region:fmt_before_1_89_0
-        pub fn new_v1_formatted(
-            pieces: &'a [&'static str],
-            args: &'a [rt::Argument<'a>],
-            fmt: &'a [rt::Placeholder],
-            _unsafe_arg: rt::UnsafeArg,
-        ) -> Arguments<'a> {
-            Arguments { pieces, fmt: Some(fmt), args }
-        }
-        // endregion:fmt_before_1_89_0
-
-        // region:!fmt_before_1_89_0
-        pub unsafe fn new_v1_formatted(
-            pieces: &'a [&'static str],
-            args: &'a [rt::Argument<'a>],
-            fmt: &'a [rt::Placeholder],
-        ) -> Arguments<'a> {
-            Arguments { pieces, fmt: Some(fmt), args }
-        }
-        // endregion:!fmt_before_1_89_0
-
-        pub fn from_str_nonconst(s: &'static str) -> Arguments<'a> {
-            Self::from_str(s)
-        }
-
-        pub const fn from_str(s: &'static str) -> Arguments<'a> {
-            Arguments { pieces: &[s], fmt: None, args: &[] }
-        }
-
-        pub const fn as_str(&self) -> Option<&'static str> {
-            match (self.pieces, self.args) {
-                ([], []) => Some(""),
-                ([s], []) => Some(s),
-                _ => None,
-            }
-        }
-    }
-    // endregion:fmt_before_1_93_0
-
-    // region:!fmt_before_1_93_0
     #[lang = "format_arguments"]
     #[derive(Copy, Clone)]
     pub struct Arguments<'a> {
@@ -1564,7 +1481,6 @@ pub mod fmt {
             }
         }
     }
-    // endregion:!fmt_before_1_93_0
 
     // region:derive
     pub(crate) mod derive {

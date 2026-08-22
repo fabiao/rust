@@ -4,14 +4,13 @@ use clippy_utils::sugg::Sugg;
 use hir::Param;
 use rustc_errors::Applicability;
 use rustc_hir as hir;
-use rustc_hir::intravisit::{Visitor as HirVisitor, Visitor};
+use rustc_hir::intravisit::Visitor;
 use rustc_hir::{
     CaptureBy, ClosureKind, CoroutineDesugaring, CoroutineKind, CoroutineSource, ExprKind, intravisit as hir_visit,
 };
-use rustc_lint::{LateContext, LateLintPass, LintContext};
+use rustc_lint::{LateContext, LateLintPass, LintContext as _, declare_lint_pass};
 use rustc_middle::hir::nested_filter;
 use rustc_middle::ty;
-use rustc_session::declare_lint_pass;
 use rustc_span::ExpnKind;
 use std::ops::ControlFlow;
 

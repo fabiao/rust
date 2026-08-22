@@ -8,6 +8,7 @@ use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::jobserver;
 use rustc_errors::{DiagCtxtHandle, ErrorGuaranteed};
 use rustc_lint::LintStore;
+use rustc_lint_defs::{Level, LintId};
 use rustc_middle::ty;
 use rustc_middle::ty::CurrentGcx;
 use rustc_middle::util::Providers;
@@ -17,7 +18,7 @@ use rustc_parse::parser::Recovery;
 use rustc_query_impl::print_query_stack;
 use rustc_session::config::{self, Cfg, CheckCfg, ExpectedValues, Input, OutFileName};
 use rustc_session::parse::ParseSess;
-use rustc_session::{CompilerIO, EarlyDiagCtxt, Session, lint};
+use rustc_session::{CompilerIO, EarlyDiagCtxt, Session};
 use rustc_span::source_map::{FileLoader, RealFileLoader, SourceMapInputs};
 use rustc_span::{FileName, sym};
 use tracing::trace;
@@ -326,7 +327,7 @@ pub struct Config {
     /// running rustc without having to save". (See #102759.)
     pub file_loader: Option<Box<dyn FileLoader + Send + Sync>>,
 
-    pub lint_caps: FxHashMap<lint::LintId, lint::Level>,
+    pub lint_caps: FxHashMap<LintId, Level>,
 
     /// This is a callback from the driver that is called when [`ParseSess`] is created.
     pub psess_created: Option<Box<dyn FnOnce(&mut ParseSess) + Send>>,
@@ -371,18 +372,17 @@ pub fn run_compiler<R: Send>(config: Config, f: impl FnOnce(&Compiler) -> R + Se
     trace!("run_compiler");
 
     // Set parallel mode before thread pool creation, which will create `Lock`s.
-    rustc_data_structures::sync::set_dyn_thread_safe_mode(
-        config.opts.unstable_opts.threads.is_some(),
-    );
+    rustc_data_structures::sync::set_dyn_thread_safe_mode(config.opts.jobs.frontend.is_some());
 
     // Initialize jobserver as early as possible.
     let early_dcx = EarlyDiagCtxt::new(config.opts.error_format);
-    jobserver::initialize_checked(|err| {
-        early_dcx
-            .early_struct_warn(err)
-            .with_note("the build environment is likely misconfigured")
-            .emit()
-    });
+    let jobs = config.opts.jobs;
+    if let Some(limit) = jobs.frontend.max(jobs.backend).max(jobs.linker.limit()) {
+        jobserver::initialize(limit.get(), |err| {
+            let note = "the build environment is likely misconfigured";
+            early_dcx.early_struct_warn(err).with_note(note).emit()
+        });
+    }
 
     crate::callbacks::setup_callbacks();
 
@@ -400,7 +400,7 @@ pub fn run_compiler<R: Send>(config: Config, f: impl FnOnce(&Compiler) -> R + Se
     util::run_in_thread_pool_with_globals(
         &early_dcx,
         config.opts.edition,
-        config.opts.unstable_opts.threads.unwrap_or(1),
+        jobs,
         &config.extra_symbols,
         SourceMapInputs { file_loader, path_mapping, hash_kind, checksum_hash_kind },
         |current_gcx| {

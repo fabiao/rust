@@ -354,7 +354,7 @@ pub struct BuiltinDeriveImplLoc {
     pub derive_index: u32,
 }
 
-#[salsa::interned(debug, no_lifetime)]
+#[salsa::interned(debug, unsafe(no_lifetime), revisions = usize::MAX)]
 #[derive(PartialOrd, Ord)]
 pub struct BuiltinDeriveImplId {
     #[returns(ref)]
@@ -465,7 +465,7 @@ pub struct ProcMacroLoc {
 impl_intern!(ProcMacroId, ProcMacroLoc);
 impl_loc!(ProcMacroLoc, id: Fn, container: ModuleId);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, salsa::Update)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub enum LoweringMode {
     Analysis,
     Ide,
@@ -492,11 +492,13 @@ mod tracked_struct_token {
     }
 }
 
-#[salsa_macros::tracked(constructor = new_)]
+#[salsa::tracked(constructor = new_)]
 #[derive(PartialOrd, Ord)]
 pub struct BlockIdLt<'db> {
+    #[returns(copy)]
     pub ast_id: AstId<ast::BlockExpr>,
     /// The containing module.
+    #[returns(copy)]
     pub module: ModuleIdLt<'db>,
 }
 pub type BlockId = BlockIdLt<'static>;
@@ -534,19 +536,22 @@ impl BlockId {
     }
 }
 
-#[salsa_macros::tracked(debug)]
+#[salsa::tracked(debug)]
 #[derive(PartialOrd, Ord)]
 pub struct ModuleIdLt<'db> {
     /// The crate this module belongs to.
+    #[returns(copy)]
     pub krate: Crate,
     /// If this `ModuleId` was derived from a `DefMap` for a block expression, this stores the
     /// `BlockId` of that block expression. If `None`, this module is part of the crate-level
     /// `DefMap` of `krate`.
+    #[returns(copy)]
     pub block: Option<BlockIdLt<'db>>,
     /// The parent module of this module, or `None` if this is the root module inside the def
     /// map (including for block def maps).
     pub containing_module_inside_def_map: Option<ModuleIdLt<'db>>,
     /// The name of this module, or [`sym::__empty`] for the root module.
+    #[returns(clone)]
     name_or_empty: Name,
 }
 pub type ModuleId = ModuleIdLt<'static>;
@@ -620,17 +625,17 @@ impl HasModule for ModuleId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, salsa::Update)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub struct FieldId {
     // FIXME: Store this as an erased `salsa::Id` to save space
     pub parent: VariantId,
     pub local_id: LocalFieldId,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, salsa::Update)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub struct TupleId(pub u32);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, salsa::Update)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub struct TupleFieldId {
     pub tuple: TupleId,
     pub index: u32,
@@ -712,7 +717,13 @@ pub struct LifetimeParamId {
     pub local_id: LocalLifetimeParamId,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, salsa_macros::Supertype)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HrtbLifetimeParamId {
+    pub scope: GenericDefId,
+    pub local_id: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, salsa::Supertype)]
 pub enum ItemContainerId {
     ExternBlockId(ExternBlockId),
     ModuleId(ModuleId),
@@ -722,7 +733,7 @@ pub enum ItemContainerId {
 impl_from!(ModuleId for ItemContainerId);
 
 /// A Data Type
-#[derive(Debug, PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, salsa_macros::Supertype)]
+#[derive(Debug, PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, salsa::Supertype)]
 pub enum AdtId {
     StructId(StructId),
     UnionId(UnionId),
@@ -731,7 +742,7 @@ pub enum AdtId {
 impl_from!(StructId, UnionId, EnumId for AdtId);
 
 /// A macro
-#[derive(Debug, PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, salsa_macros::Supertype)]
+#[derive(Debug, PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, salsa::Supertype)]
 pub enum MacroId {
     Macro2Id(Macro2Id),
     MacroRulesId(MacroRulesId),
@@ -748,7 +759,7 @@ impl MacroId {
 #[salsa::tracked]
 impl MacroId {
     /// Turns a MacroId into a MacroDefId, describing the macro's definition post name resolution.
-    #[salsa::tracked]
+    #[salsa::tracked(returns(copy))]
     pub fn definition(self, db: &dyn SourceDatabase) -> MacroDefId {
         let kind = |expander, file_id, m| {
             let in_file = InFile::new(file_id, m);
@@ -853,7 +864,7 @@ impl From<DefWithBodyId> for ModuleDefId {
 }
 
 /// The defs which have a body.
-#[derive(Debug, PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, salsa_macros::Supertype)]
+#[derive(Debug, PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, salsa::Supertype)]
 pub enum DefWithBodyId {
     /// A function body.
     FunctionId(FunctionId),
@@ -883,7 +894,7 @@ impl DefWithBodyId {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, salsa_macros::Supertype)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, salsa::Supertype)]
 pub enum AssocItemId {
     FunctionId(FunctionId),
     ConstId(ConstId),
@@ -896,17 +907,16 @@ pub enum AssocItemId {
 // casting them, and somehow making the constructors private, which would be annoying.
 impl_from!(FunctionId, ConstId, TypeAliasId for AssocItemId);
 
-impl From<AssocItemId> for ModuleDefId {
-    fn from(item: AssocItemId) -> Self {
-        match item {
-            AssocItemId::FunctionId(f) => f.into(),
-            AssocItemId::ConstId(c) => c.into(),
-            AssocItemId::TypeAliasId(t) => t.into(),
-        }
+impl_from!(
+    AssocItemId {
+        FunctionId => FunctionId,
+        ConstId => ConstId,
+        TypeAliasId => TypeAliasId,
     }
-}
+    for ModuleDefId
+);
 
-#[derive(Debug, PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, salsa_macros::Supertype)]
+#[derive(Debug, PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, salsa::Supertype)]
 pub enum GenericDefId {
     AdtId(AdtId),
     // consts can have type parameters from their parents (i.e. associated consts of traits)
@@ -1044,17 +1054,16 @@ impl GenericDefId {
     }
 }
 
-impl From<AssocItemId> for GenericDefId {
-    fn from(item: AssocItemId) -> Self {
-        match item {
-            AssocItemId::FunctionId(f) => f.into(),
-            AssocItemId::ConstId(c) => c.into(),
-            AssocItemId::TypeAliasId(t) => t.into(),
-        }
+impl_from!(
+    AssocItemId {
+        FunctionId => FunctionId,
+        ConstId => ConstId,
+        TypeAliasId => TypeAliasId,
     }
-}
+    for GenericDefId
+);
 
-#[derive(Debug, PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, salsa_macros::Supertype)]
+#[derive(Debug, PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, salsa::Supertype)]
 pub enum CallableDefId {
     FunctionId(FunctionId),
     StructId(StructId),
@@ -1062,15 +1071,14 @@ pub enum CallableDefId {
 }
 
 impl_from!(FunctionId, StructId, EnumVariantId for CallableDefId);
-impl From<CallableDefId> for ModuleDefId {
-    fn from(def: CallableDefId) -> ModuleDefId {
-        match def {
-            CallableDefId::FunctionId(f) => ModuleDefId::FunctionId(f),
-            CallableDefId::StructId(s) => ModuleDefId::AdtId(AdtId::StructId(s)),
-            CallableDefId::EnumVariantId(e) => ModuleDefId::EnumVariantId(e),
-        }
+impl_from!(
+    CallableDefId {
+        FunctionId => FunctionId,
+        StructId => AdtId,
+        EnumVariantId => EnumVariantId,
     }
-}
+    for ModuleDefId
+);
 
 impl CallableDefId {
     pub fn krate(self, db: &dyn SourceDatabase) -> Crate {
@@ -1082,7 +1090,7 @@ impl CallableDefId {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, salsa_macros::Supertype)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, salsa::Supertype)]
 pub enum AttrDefId {
     ModuleId(ModuleId),
     AdtId(AdtId),
@@ -1100,6 +1108,7 @@ pub enum AttrDefId {
 }
 
 impl_from!(
+    ModuleId,
     AdtId(StructId, EnumId, UnionId),
     EnumVariantId,
     StaticId,
@@ -1114,27 +1123,14 @@ impl_from!(
     for AttrDefId
 );
 
-impl From<AssocItemId> for AttrDefId {
-    fn from(assoc: AssocItemId) -> Self {
-        match assoc {
-            AssocItemId::FunctionId(it) => AttrDefId::FunctionId(it),
-            AssocItemId::ConstId(it) => AttrDefId::ConstId(it),
-            AssocItemId::TypeAliasId(it) => AttrDefId::TypeAliasId(it),
-        }
-    }
-}
-impl From<VariantId> for AttrDefId {
-    fn from(vid: VariantId) -> Self {
-        match vid {
-            VariantId::EnumVariantId(id) => id.into(),
-            VariantId::StructId(id) => id.into(),
-            VariantId::UnionId(id) => id.into(),
-        }
-    }
-}
+impl_from!(AssocItemId { FunctionId, ConstId, TypeAliasId } for AttrDefId);
+impl_from!(
+    VariantId { EnumVariantId => EnumVariantId, StructId => AdtId, UnionId => AdtId }
+    for AttrDefId
+);
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, salsa_macros::Supertype, salsa::Update,
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::Supertype, salsa::SalsaValue,
 )]
 pub enum VariantId {
     EnumVariantId(EnumVariantId),
@@ -1445,6 +1441,7 @@ pub fn macro_call_as_call_id(
     call_site: SyntaxContext,
     expand_to: ExpandTo,
     krate: Crate,
+    macro_depth: u32,
     resolver: impl Fn(&ModPath) -> Option<MacroDefId> + Copy,
     eager_callback: &mut dyn FnMut(
         InFile<(syntax::AstPtr<ast::MacroCall>, span::FileAstId<ast::MacroCall>)>,
@@ -1461,6 +1458,7 @@ pub fn macro_call_as_call_id(
             ast_id,
             def,
             call_site,
+            macro_depth,
             &|path| resolver(path).filter(MacroDefId::is_fn_like),
             eager_callback,
         ),
@@ -1470,6 +1468,7 @@ pub fn macro_call_as_call_id(
                 krate,
                 MacroCallKind::FnLike { ast_id, expand_to, eager: None },
                 call_site,
+                macro_depth,
             )),
             err: None,
         },

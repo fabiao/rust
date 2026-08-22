@@ -36,7 +36,7 @@ use rustc_target::spec::{HasTargetSpec, HasX86AbiOpt, Target, X86Abi};
 use crate::abi::FnAbiGccExt;
 use crate::common::{SignType, TypeReflection, type_is_pointer};
 use crate::context::CodegenCx;
-use crate::errors;
+use crate::diagnostics;
 use crate::intrinsic::llvm;
 use crate::type_of::LayoutGccExt;
 
@@ -81,8 +81,13 @@ impl<'a, 'gcc, 'tcx> Builder<'a, 'gcc, 'tcx> {
             AtomicOrdering::AcqRel | AtomicOrdering::Release => AtomicOrdering::Acquire,
             _ => order,
         };
-        let previous_value =
-            self.atomic_load(dst.get_type(), dst, load_ordering, Size::from_bytes(size));
+        let previous_value = self.atomic_load(
+            dst.get_type(),
+            dst,
+            load_ordering,
+            /* volatile */ false,
+            Size::from_bytes(size),
+        );
         let previous_var =
             func.new_local(self.location, previous_value.get_type(), "previous_value");
         let return_value = func.new_local(self.location, previous_value.get_type(), "return_value");
@@ -1008,6 +1013,7 @@ impl<'a, 'gcc, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'gcc, 'tcx> {
         _ty: Type<'gcc>,
         ptr: RValue<'gcc>,
         order: AtomicOrdering,
+        _volatile: bool, // FIXME we are always making the load volatile
         size: Size,
     ) -> RValue<'gcc> {
         // FIXME(antoyo): use ty.
@@ -1177,6 +1183,7 @@ impl<'a, 'gcc, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'gcc, 'tcx> {
         value: RValue<'gcc>,
         ptr: RValue<'gcc>,
         order: AtomicOrdering,
+        _volatile: bool, // FIXME we are always making the store volatile
         size: Size,
     ) {
         // FIXME(antoyo): handle alignment.
@@ -1803,7 +1810,7 @@ impl<'a, 'gcc, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'gcc, 'tcx> {
         _instance: Option<Instance<'tcx>>,
     ) {
         // FIXME: implement support for explicit tail calls like rustc_codegen_llvm.
-        self.tcx.dcx().emit_fatal(errors::ExplicitTailCallsUnsupported);
+        self.tcx.dcx().emit_fatal(diagnostics::ExplicitTailCallsUnsupported);
     }
 
     fn zext(&mut self, value: RValue<'gcc>, dest_typ: Type<'gcc>) -> RValue<'gcc> {

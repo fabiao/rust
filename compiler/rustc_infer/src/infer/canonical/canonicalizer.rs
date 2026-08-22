@@ -10,8 +10,8 @@ use rustc_data_structures::sso::SsoHashMap;
 use rustc_index::Idx;
 use rustc_middle::bug;
 use rustc_middle::ty::{
-    self, BoundVar, Flags, GenericArg, InferConst, List, RegionUtilitiesExt, Ty, TyCtxt, TypeFlags,
-    TypeFoldable, TypeFolder, TypeSuperFoldable, TypeVisitableExt, TypingModeEqWrapper,
+    self, BoundVar, Flags, GenericArg, InferConst, List, Ty, TyCtxt, TypeFlags, TypeFoldable,
+    TypeFolder, TypeSuperFoldable, TypeVisitableExt, TypingModeEqWrapper,
 };
 use smallvec::SmallVec;
 use tracing::debug;
@@ -46,7 +46,7 @@ impl<'tcx> InferCtxt<'tcx> {
         V: TypeFoldable<TyCtxt<'tcx>>,
     {
         let ty::ParamEnvAnd { param_env, value } = value;
-        let canonical_param_env = self.tcx.canonical_param_env_cache.get_or_insert(
+        let canonical_param_env = self.tcx.caches.canonical_param_env_cache.get_or_insert(
             self.tcx,
             param_env,
             query_state,

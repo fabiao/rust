@@ -1,13 +1,12 @@
 use rustc_ast::visit::{self, AssocCtxt, FnKind, Visitor};
 use rustc_ast::{self as ast, AttrVec, GenericBound, NodeId, PatKind, attr, token};
+use rustc_attr_ir::{Attribute, AttributeKind};
 use rustc_attr_parsing::AttributeParser;
 use rustc_errors::msg;
 use rustc_feature::Features;
-use rustc_hir::Attribute;
-use rustc_hir::attrs::AttributeKind;
 use rustc_session::Session;
 use rustc_session::diagnostics::{feature_err, feature_warn};
-use rustc_span::{Span, Spanned, Symbol, sym};
+use rustc_span::{Span, Spanned, sym};
 
 use crate::diagnostics;
 
@@ -437,7 +436,7 @@ pub fn check_crate(krate: &ast::Crate, sess: &Session, features: &Features) {
     maybe_stage_features(sess, features, krate);
     check_incompatible_features(sess, features);
     check_dependent_features(sess, features);
-    check_new_solver_banned_features(sess, features);
+    warn_next_solver_and_gce(sess, features);
     check_features_requiring_new_solver(sess, features);
 
     let mut visitor = PostExpansionVisitor { sess, features };
@@ -483,7 +482,11 @@ pub fn check_crate(krate: &ast::Crate, sess: &Session, features: &Features) {
     gate_all!(pin_ergonomics, "pinned reference syntax is experimental");
     gate_all!(postfix_match, "postfix match is experimental");
     gate_all!(return_type_notation, "return type notation is experimental");
-    gate_all!(splat, "`fn(#[splat] (a, ...))` is incomplete", "call as func((a, ...)) instead");
+    gate_all!(
+        splat,
+        "`fn(#[rustc_splat] (a, ...))` is incomplete",
+        "call as func((a, ...)) instead"
+    );
     gate_all!(super_let, "`super let` is experimental");
     gate_all!(try_blocks_heterogeneous, "`try bikeshed` expression is experimental");
     gate_all!(unnamed_enum_variants, "unnamed enum variants are experimental");
@@ -502,11 +505,16 @@ pub fn check_crate(krate: &ast::Crate, sess: &Session, features: &Features) {
     gate_all!(
         closure_lifetime_binder,
         "`for<...>` binders for closures are experimental",
-        "consider removing `for<...>`"
+        "consider using a type annotation instead: \
+         `let closure: for<...> fn(...) -> ... = /* closure */;`"
     );
     gate_all!(
         half_open_range_patterns_in_slices,
         "half-open range patterns in slices are unstable"
+    );
+    gate_all!(
+        named_fn_trait_parameters,
+        "named parameters in parenthesized generic argument lists are experimental"
     );
 
     // `associated_const_equality` will be stabilized as part of `min_generic_const_args`.
@@ -634,7 +642,7 @@ fn maybe_stage_features(sess: &Session, features: &Features, krate: &ast::Crate)
     let mut errored = false;
 
     if let Some(Attribute::Parsed(AttributeKind::Feature(feature_idents, first_span))) =
-        AttributeParser::parse_limited(sess, &krate.attrs, &[sym::feature])
+        AttributeParser::parse_limited_sym(sess, &krate.attrs, &[sym::feature])
     {
         // `feature(...)` used on non-nightly. This is definitely an error.
         let mut err = diagnostics::FeatureOnNonNightly {
@@ -714,26 +722,21 @@ fn check_dependent_features(sess: &Session, features: &Features) {
     }
 }
 
-fn check_new_solver_banned_features(sess: &Session, features: &Features) {
+fn warn_next_solver_and_gce(sess: &Session, features: &Features) {
     if !sess.opts.unstable_opts.next_solver.globally {
         return;
     }
 
-    // Ban GCE with the new solver, because it does not implement GCE correctly.
+    // Warn people who uses GCE and -Znext-solver=globally
+    // that their trait solver was downgraded to -Znext-solver=no
     if let Some(gce_span) = features
         .enabled_lang_features()
         .iter()
         .find(|feat| feat.gate_name == sym::generic_const_exprs)
         .map(|feat| feat.attr_sp)
     {
-        // Abort immediately, otherwise GCE can lower to `ConstKind::Expr`,
-        // which the new solver intentionally does not support.
-        #[allow(rustc::symbol_intern_string_literal)]
-        sess.dcx().emit_fatal(diagnostics::IncompatibleFeatures {
-            spans: vec![gce_span],
-            f1: Symbol::intern("-Znext-solver=globally"),
-            f2: sym::generic_const_exprs,
-        });
+        sess.dcx()
+            .emit_warn(diagnostics::NextSolverDisabledForGenericConstExprs { span: gce_span });
     }
 }
 

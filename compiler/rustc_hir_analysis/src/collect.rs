@@ -8,7 +8,7 @@
 //!
 //! Collecting is ultimately defined by a bundle of queries that
 //! inquire after various facts about the items in the crate (e.g.,
-//! `type_of`, `generics_of`, `predicates_of`, etc). See the `provide` function
+//! `type_of`, `generics_of`, `clauses_of`, etc). See the `provide` function
 //! for the full set.
 //!
 //! At present, however, we do run collection across all items in the
@@ -20,6 +20,7 @@ use std::{assert_matches, debug_assert_matches, iter};
 use rustc_abi::{ExternAbi, Size};
 use rustc_ast::Recovered;
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap};
+use rustc_data_structures::thin_vec::{ThinVec, thin_vec};
 use rustc_errors::{
     Applicability, Diag, DiagCtxtHandle, Diagnostic, E0228, ErrorGuaranteed, Level, StashKey,
 };
@@ -29,6 +30,7 @@ use rustc_hir::intravisit::{InferKind, Visitor, VisitorExt};
 use rustc_hir::{self as hir, GenericParamKind, HirId, Node, PreciseCapturingArgKind, find_attr};
 use rustc_infer::infer::{InferCtxt, TyCtxtInferExt};
 use rustc_infer::traits::{DynCompatibilityViolation, ObligationCause};
+use rustc_lint_defs::builtin::REPR_C_ENUMS_LARGER_THAN_INT;
 use rustc_middle::query::Providers;
 use rustc_middle::ty::util::{Discr, IntTypeExt};
 use rustc_middle::ty::{
@@ -47,10 +49,10 @@ use tracing::{debug, instrument};
 use crate::diagnostics::{self, ElidedLifetimesAreNotAllowedInDelegations};
 use crate::hir_ty_lowering::{HirTyLowerer, InherentAssocCandidate, RegionInferReason};
 
+mod clauses_of;
 pub(crate) mod dump;
 mod generics_of;
 mod item_bounds;
-mod predicates_of;
 mod resolve_bound_vars;
 mod type_of;
 
@@ -71,16 +73,16 @@ pub(crate) fn provide(providers: &mut Providers) {
         item_non_self_bounds: item_bounds::item_non_self_bounds,
         impl_super_outlives: item_bounds::impl_super_outlives,
         generics_of: generics_of::generics_of,
-        predicates_of: predicates_of::predicates_of,
-        explicit_predicates_of: predicates_of::explicit_predicates_of,
-        explicit_super_predicates_of: predicates_of::explicit_super_predicates_of,
-        explicit_implied_predicates_of: predicates_of::explicit_implied_predicates_of,
+        clauses_of: clauses_of::clauses_of,
+        explicit_clauses_of: clauses_of::explicit_clauses_of,
+        explicit_super_clauses_of: clauses_of::explicit_super_clauses_of,
+        explicit_implied_clauses_of: clauses_of::explicit_implied_clauses_of,
         explicit_supertraits_containing_assoc_item:
-            predicates_of::explicit_supertraits_containing_assoc_item,
-        trait_explicit_predicates_and_bounds: predicates_of::trait_explicit_predicates_and_bounds,
-        const_conditions: predicates_of::const_conditions,
-        explicit_implied_const_bounds: predicates_of::explicit_implied_const_bounds,
-        type_param_predicates: predicates_of::type_param_predicates,
+            clauses_of::explicit_supertraits_containing_assoc_item,
+        trait_explicit_clauses_and_bounds: clauses_of::trait_explicit_clauses_and_bounds,
+        const_conditions: clauses_of::const_conditions,
+        explicit_implied_const_bounds: clauses_of::explicit_implied_const_bounds,
+        type_param_clauses: clauses_of::type_param_clauses,
         trait_def,
         adt_def,
         fn_sig,
@@ -261,7 +263,7 @@ impl<'tcx> ItemCtxt<'tcx> {
         ItemCtxt::new_internal(tcx, item_def_id, true)
     }
 
-    pub(crate) fn lower_ty(&self, hir_ty: &hir::Ty<'tcx>) -> Ty<'tcx> {
+    pub(crate) fn lower_ty(&self, hir_ty: &hir::Ty<'_>) -> Ty<'tcx> {
         self.lowerer().lower_ty(hir_ty)
     }
 
@@ -391,7 +393,7 @@ impl<'tcx> HirTyLowerer<'tcx> for ItemCtxt<'tcx> {
         def_id: LocalDefId,
         assoc_ident: Ident,
     ) -> ty::EarlyBinder<'tcx, &'tcx [(ty::Clause<'tcx>, Span)]> {
-        self.tcx.at(span).type_param_predicates((self.item_def_id, def_id, assoc_ident))
+        self.tcx.at(span).type_param_clauses((self.item_def_id, def_id, assoc_ident))
     }
 
     #[instrument(level = "debug", skip(self, _span), ret)]
@@ -400,7 +402,7 @@ impl<'tcx> HirTyLowerer<'tcx> for ItemCtxt<'tcx> {
         _span: Span,
         self_ty: Ty<'tcx>,
         candidates: Vec<InherentAssocCandidate>,
-    ) -> (Vec<InherentAssocCandidate>, Vec<FulfillmentError<'tcx>>) {
+    ) -> (Vec<InherentAssocCandidate>, ThinVec<FulfillmentError<'tcx>>) {
         assert!(!self_ty.has_infer());
 
         // We don't just call the normal normalization routine here as we can't provide the
@@ -443,14 +445,14 @@ impl<'tcx> HirTyLowerer<'tcx> for ItemCtxt<'tcx> {
             })
             .collect();
 
-        (candidates, vec![])
+        (candidates, thin_vec![])
     }
 
     fn lower_assoc_item_path(
         &self,
         span: Span,
         item_def_id: DefId,
-        item_segment: &rustc_hir::PathSegment<'tcx>,
+        item_segment: &rustc_hir::PathSegment<'_>,
         poly_trait_ref: ty::PolyTraitRef<'tcx>,
     ) -> Result<(DefId, ty::GenericArgsRef<'tcx>), ErrorGuaranteed> {
         if let Some(trait_ref) = poly_trait_ref.no_bound_vars() {
@@ -548,7 +550,7 @@ impl<'tcx> HirTyLowerer<'tcx> for ItemCtxt<'tcx> {
 
     fn lower_fn_sig(
         &self,
-        decl: &hir::FnDecl<'tcx>,
+        decl: &hir::FnDecl<'_>,
         _generics: Option<&hir::Generics<'_>>,
         hir_id: rustc_hir::HirId,
         _hir_ty: Option<&hir::Ty<'_>>,
@@ -634,7 +636,7 @@ fn get_new_lifetime_name<'tcx>(
 pub(super) fn check_ctor(tcx: TyCtxt<'_>, def_id: LocalDefId) {
     tcx.ensure_ok().generics_of(def_id);
     tcx.ensure_ok().type_of(def_id);
-    tcx.ensure_ok().predicates_of(def_id);
+    tcx.ensure_ok().clauses_of(def_id);
 }
 
 pub(super) fn check_enum_variant_types(tcx: TyCtxt<'_>, def_id: LocalDefId) {
@@ -701,7 +703,7 @@ pub(super) fn check_enum_variant_types(tcx: TyCtxt<'_>, def_id: LocalDefId) {
                     "`repr(C)` enum discriminant does not fit into C `int`, and a previous discriminant does not fit into C `unsigned int`"
                 };
                 tcx.emit_node_span_lint(
-                    rustc_session::lint::builtin::REPR_C_ENUMS_LARGER_THAN_INT,
+                    REPR_C_ENUMS_LARGER_THAN_INT,
                     tcx.local_def_id_to_hir_id(def_id),
                     span,
                     ReprCIssue { msg },
@@ -714,7 +716,7 @@ pub(super) fn check_enum_variant_types(tcx: TyCtxt<'_>, def_id: LocalDefId) {
         for f in &variant.fields {
             tcx.ensure_ok().generics_of(f.did);
             tcx.ensure_ok().type_of(f.did);
-            tcx.ensure_ok().predicates_of(f.did);
+            tcx.ensure_ok().clauses_of(f.did);
         }
 
         // Lower the ctor, if any. This also registers the variant as an item.
@@ -835,6 +837,12 @@ fn lower_variant<'tcx>(
             did: f.def_id.to_def_id(),
             name: f.ident.name,
             vis: tcx.visibility(f.def_id),
+            mut_restriction: match f.mut_restriction.kind {
+                hir::RestrictionKind::Unrestricted => ty::RestrictionKind::Unrestricted,
+                hir::RestrictionKind::Restricted(path) => {
+                    ty::RestrictionKind::Restricted(path.res, f.mut_restriction.span)
+                }
+            },
             safety: f.safety,
             value: f.default.map(|v| v.def_id.to_def_id()),
         })
@@ -926,19 +934,16 @@ fn trait_def(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::TraitDef {
             false,
             is_auto == hir::IsAuto::Yes,
             safety,
-            if let hir::RestrictionKind::Restricted(path) = impl_restriction.kind {
-                ty::trait_def::ImplRestrictionKind::Restricted(path.res, impl_restriction.span)
-            } else {
-                ty::trait_def::ImplRestrictionKind::Unrestricted
+            match impl_restriction.kind {
+                hir::RestrictionKind::Restricted(path) => {
+                    ty::RestrictionKind::Restricted(path.res, impl_restriction.span)
+                }
+                hir::RestrictionKind::Unrestricted => ty::RestrictionKind::Unrestricted,
             },
         ),
-        hir::ItemKind::TraitAlias(constness, ..) => (
-            constness,
-            true,
-            false,
-            hir::Safety::Safe,
-            ty::trait_def::ImplRestrictionKind::Unrestricted,
-        ),
+        hir::ItemKind::TraitAlias(constness, ..) => {
+            (constness, true, false, hir::Safety::Safe, ty::RestrictionKind::Unrestricted)
+        }
         _ => span_bug!(item.span, "trait_def_of_item invoked on non-trait"),
     };
 
@@ -947,9 +952,6 @@ fn trait_def(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::TraitDef {
     let attrs = tcx.get_all_attrs(def_id);
 
     let paren_sugar = find_attr!(attrs, RustcParenSugar);
-    if paren_sugar && !tcx.features().unboxed_closures() {
-        tcx.dcx().emit_err(diagnostics::ParenSugarAttribute { span: item.span });
-    }
 
     // Only regular traits can be marker.
     let is_marker = !is_alias && find_attr!(attrs, Marker);
@@ -963,7 +965,7 @@ fn trait_def(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::TraitDef {
     )
     .unwrap_or([false; 2]);
 
-    let specialization_kind = if find_attr!(attrs, RustcUnsafeSpecializationMarker) {
+    let specialization_kind = if find_attr!(attrs, RustcAllowLifetimeDependentSpecialization) {
         ty::trait_def::TraitSpecializationKind::Marker
     } else if find_attr!(attrs, RustcSpecializationTrait) {
         ty::trait_def::TraitSpecializationKind::AlwaysApplicable
@@ -1372,7 +1374,7 @@ pub fn suggest_impl_trait<'tcx>(
                 )),
             );
             // FIXME(compiler-errors): We may benefit from resolving regions here.
-            if ocx.try_evaluate_obligations().is_empty()
+            if ocx.try_evaluate_obligations().no_errors()
                 && let item_ty = infcx.resolve_vars_if_possible(item_ty)
                 && let Some(item_ty) = item_ty.make_suggestable(infcx.tcx, false, None)
                 && let Some(sugg) = formatter(
@@ -1398,7 +1400,7 @@ pub fn suggest_impl_trait<'tcx>(
 
 fn impl_is_fully_generic_for_reflection(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
     tcx.impl_trait_header(def_id).is_fully_generic_for_reflection()
-        && tcx.explicit_predicates_of(def_id).is_fully_generic_for_reflection()
+        && tcx.explicit_clauses_of(def_id).is_fully_generic_for_reflection()
 }
 
 fn impl_trait_header(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::ImplTraitHeader<'_> {

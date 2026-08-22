@@ -8,7 +8,7 @@ use rustc_macros::{Diagnostic, Subdiagnostic};
 use rustc_span::{Ident, Span, Spanned, Symbol};
 
 use crate::Res;
-use crate::late::{PatternSource, ResolvingRestrictionKind};
+use crate::late::PatternSource;
 
 pub(crate) mod impls;
 
@@ -386,6 +386,10 @@ pub(crate) struct SelfInGenericParamDefault {
 pub(crate) struct SelfInConstGenericTy {
     #[primary_span]
     pub(crate) span: Span,
+    #[help(
+        "add `#![feature(min_adt_const_params)]` to the crate attributes to enable `Self` as a const parameter type"
+    )]
+    pub(crate) enable_feature: bool,
 }
 
 #[derive(Diagnostic)]
@@ -546,19 +550,6 @@ pub(crate) struct ExpectedModuleFound {
 #[derive(Diagnostic)]
 #[diag("cannot determine resolution for the visibility", code = E0578)]
 pub(crate) struct Indeterminate(#[primary_span] pub(crate) Span);
-
-#[derive(Diagnostic)]
-#[diag(
-    "{$kind ->
-    [impl] trait implementation
-    *[mut] field mutation
-} can only be restricted to ancestor modules"
-)]
-pub(crate) struct RestrictionAncestorOnly {
-    #[primary_span]
-    pub(crate) span: Span,
-    pub(crate) kind: ResolvingRestrictionKind,
-}
 
 #[derive(Diagnostic)]
 #[diag("cannot use a tool module through an import")]
@@ -1230,26 +1221,16 @@ pub(crate) struct CannotFindBuiltinMacroWithName {
     pub(crate) ident: Ident,
 }
 
-#[derive(Diagnostic)]
-#[diag("tool `{$tool}` was already registered")]
-pub(crate) struct ToolWasAlreadyRegistered {
-    #[primary_span]
-    pub(crate) span: Span,
-    pub(crate) tool: Ident,
-    #[label("already registered here")]
-    pub(crate) old_ident_span: Span,
-}
-
 #[derive(Subdiagnostic)]
 pub(crate) enum DefinedHere {
-    #[label("similarly named {$candidate_descr} `{$candidate}` defined here")]
+    #[note("similarly named {$candidate_descr} `{$candidate}` defined here")]
     SimilarlyNamed {
         #[primary_span]
         span: Span,
         candidate_descr: &'static str,
         candidate: Symbol,
     },
-    #[label("{$candidate_descr} `{$candidate}` defined here")]
+    #[note("{$candidate_descr} `{$candidate}` defined here")]
     SingleItem {
         #[primary_span]
         span: Span,
@@ -1511,30 +1492,6 @@ pub(crate) struct RedundantImportVisibility {
     pub help: (),
     pub import_vis: String,
     pub max_vis: String,
-}
-
-#[derive(Diagnostic)]
-#[diag("unknown diagnostic attribute")]
-pub(crate) struct UnknownDiagnosticAttribute {
-    #[subdiagnostic]
-    pub help: Option<UnknownDiagnosticAttributeHelp>,
-}
-
-#[derive(Subdiagnostic)]
-pub(crate) enum UnknownDiagnosticAttributeHelp {
-    #[suggestion(
-        "an attribute with a similar name exists",
-        style = "verbose",
-        code = "{typo_name}",
-        applicability = "machine-applicable"
-    )]
-    Typo {
-        #[primary_span]
-        span: Span,
-        typo_name: Symbol,
-    },
-    #[help("add `#![feature({$feature})]` to the crate attributes to enable")]
-    UseFeature { feature: Symbol },
 }
 
 // FIXME: Make this properly translatable.

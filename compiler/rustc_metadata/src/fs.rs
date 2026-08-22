@@ -5,8 +5,9 @@ use rustc_data_structures::temp_dir::MaybeTempDir;
 use rustc_fs_util::TempDirBuilder;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::Session;
-use rustc_session::config::{CrateType, OutFileName, OutputType};
+use rustc_session::config::{OutFileName, OutputType};
 use rustc_session::output::filename_for_metadata;
+use rustc_structures::CrateType;
 
 use crate::diagnostics::{
     BinaryOutputToTty, FailedCopyToStdout, FailedCreateEncodedMetadata, FailedCreateFile,
@@ -96,7 +97,7 @@ pub fn encode_and_write_metadata(tcx: TyCtxt<'_>) -> EncodedMetadata {
         if tcx.sess.opts.json_artifact_notifications {
             tcx.dcx().emit_artifact_notification(out_filename.as_path(), "metadata");
         }
-        (filename, None)
+        (filename, Some(metadata_tmpdir))
     } else {
         (metadata_filename, Some(metadata_tmpdir))
     };

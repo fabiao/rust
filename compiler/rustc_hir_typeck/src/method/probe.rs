@@ -6,13 +6,16 @@ use std::ops::Deref;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_data_structures::sso::SsoHashSet;
 use rustc_errors::{Applicability, Diag, DiagCtxtHandle, Diagnostic, Level};
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def::DefKind;
 use rustc_hir::{self as hir, ExprKind, HirId, Node, find_attr};
 use rustc_hir_analysis::autoderef::{self, Autoderef};
 use rustc_infer::infer::canonical::{Canonical, OriginalQueryValues, QueryResponse};
 use rustc_infer::infer::{BoundRegionConversionTime, DefineOpaqueTypes, InferOk, TyCtxtInferExt};
 use rustc_infer::traits::{ObligationCauseCode, PredicateObligation, query};
-use rustc_lint::builtin::METHOD_CALL_ON_DIVERGING_INFER_VAR;
+use rustc_lint_defs::builtin::{
+    METHOD_CALL_ON_DIVERGING_INFER_VAR, TYVAR_BEHIND_RAW_POINTER, UNSTABLE_NAME_COLLISIONS,
+};
 use rustc_macros::Diagnostic;
 use rustc_middle::middle::stability;
 use rustc_middle::ty::elaborate::supertrait_def_ids;
@@ -22,7 +25,6 @@ use rustc_middle::ty::{
     Ty, TyCtxt, TypeVisitableExt, Unnormalized, Upcast,
 };
 use rustc_middle::{bug, span_bug};
-use rustc_session::lint;
 use rustc_span::def_id::{DefId, LocalDefId};
 use rustc_span::edit_distance::{
     edit_distance_with_substrings, find_best_match_for_name_with_substrings,
@@ -501,7 +503,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 // so we do a future-compat lint here for the 2015 edition
                 // (see https://github.com/rust-lang/rust/issues/46906)
                 self.tcx.emit_node_span_lint(
-                    lint::builtin::TYVAR_BEHIND_RAW_POINTER,
+                    TYVAR_BEHIND_RAW_POINTER,
                     scope_expr_id,
                     span,
                     MissingTypeAnnot,
@@ -1138,7 +1140,7 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
             for (bound_trait_pred, _) in
                 traits::expand_trait_aliases(self.tcx, [(trait_ref.upcast(self.tcx), self.span)]).0
             {
-                assert_eq!(bound_trait_pred.polarity(), ty::PredicatePolarity::Positive);
+                assert_eq!(bound_trait_pred.polarity(), ty::ClausePolarity::Positive);
                 let bound_trait_ref = bound_trait_pred.map_bound(|pred| pred.trait_ref);
                 for item in self.impl_or_trait_item(bound_trait_ref.def_id()) {
                     if !self.has_applicable_self(&item) {
@@ -1580,7 +1582,7 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
 
                     ty::Adt(def, args)
                         if self.tcx.features().pin_ergonomics()
-                            && self.tcx.is_lang_item(def.did(), hir::LangItem::Pin) =>
+                            && self.tcx.is_lang_item(def.did(), LangItem::Pin) =>
                     {
                         // make sure this is a pinned reference (and not a `Pin<Box>` or something)
                         if let ty::Ref(_, _, mutbl) = args[0].expect_ty().kind() {
@@ -1649,7 +1651,7 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
 
         // make sure self is a Pin<&mut T>
         let inner_ty = match self_ty.kind() {
-            ty::Adt(def, args) if self.tcx.is_lang_item(def.did(), hir::LangItem::Pin) => {
+            ty::Adt(def, args) if self.tcx.is_lang_item(def.did(), LangItem::Pin) => {
                 match args[0].expect_ty().kind() {
                     ty::Ref(_, ty, hir::Mutability::Mut) => *ty,
                     _ => {
@@ -1909,7 +1911,7 @@ impl<'tcx> Pick<'tcx> {
             return;
         }
         tcx.emit_node_span_lint(
-            lint::builtin::UNSTABLE_NAME_COLLISIONS,
+            UNSTABLE_NAME_COLLISIONS,
             scope_expr_id,
             span,
             ItemMaybeBeAddedToStd { this: self, tcx, span },
@@ -2003,7 +2005,7 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
             if self.next_trait_solver() {
                 ocx.register_obligations(instantiate_self_ty_obligations.iter().cloned());
                 let errors = ocx.try_evaluate_obligations();
-                if !errors.is_empty() {
+                if !errors.no_errors() {
                     unreachable!("unexpected autoderef error {errors:?}");
                 }
             }
@@ -2037,7 +2039,7 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
                     // Check whether the impl imposes obligations we have to worry about.
                     let impl_def_id = probe.item.container_id(self.tcx);
                     let impl_bounds =
-                        self.tcx.predicates_of(impl_def_id).instantiate(self.tcx, impl_args);
+                        self.tcx.clauses_of(impl_def_id).instantiate(self.tcx, impl_args);
                     // Convert the bounds into obligations.
                     ocx.register_obligations(traits::predicates_for_generics(
                         |idx, span| {
@@ -2049,7 +2051,7 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
                             );
                             self.cause(self.span, code)
                         },
-                        |pred| ocx.normalize(cause, self.param_env, pred),
+                        |clause| ocx.normalize(cause, self.param_env, clause),
                         self.param_env,
                         impl_bounds,
                     ));
@@ -2331,7 +2333,7 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
                     };
                     let ocx = ObligationCtxt::new(self);
                     let self_ty = ocx.register_infer_ok_obligations(ok);
-                    if !ocx.try_evaluate_obligations().is_empty() {
+                    if !ocx.try_evaluate_obligations().no_errors() {
                         debug!("failed to prove instantiate self_ty obligations");
                         return false;
                     }
@@ -2526,23 +2528,21 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
             if applicable_close_candidates.is_empty() {
                 Ok(None)
             } else {
-                let best_name = {
-                    let names = applicable_close_candidates
-                        .iter()
-                        .map(|cand| cand.name())
-                        .collect::<Vec<Symbol>>();
-                    find_best_match_for_name_with_substrings(
-                        &names,
-                        self.method_name.unwrap().name,
-                        None,
-                    )
-                }
-                .or_else(|| {
-                    applicable_close_candidates
-                        .iter()
-                        .find(|cand| self.matches_by_doc_alias(cand.def_id))
-                        .map(|cand| cand.name())
-                });
+                let best_name = applicable_close_candidates
+                    .iter()
+                    .find(|cand| self.matches_by_doc_alias(cand.def_id))
+                    .map(|cand| cand.name())
+                    .or_else(|| {
+                        let names = applicable_close_candidates
+                            .iter()
+                            .map(|cand| cand.name())
+                            .collect::<Vec<Symbol>>();
+                        find_best_match_for_name_with_substrings(
+                            &names,
+                            self.method_name.unwrap().name,
+                            None,
+                        )
+                    });
                 Ok(best_name.and_then(|best_name| {
                     applicable_close_candidates
                         .into_iter()

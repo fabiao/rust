@@ -1,13 +1,12 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
 use clippy_utils::macros::{FormatArgsStorage, find_format_arg_expr, first_node_in_macro, matching_root_macro_call};
-use clippy_utils::source::{SpanExt, snippet_with_context};
+use clippy_utils::source::{SpanExt as _, snippet_with_context};
 use clippy_utils::sugg::Sugg;
 use rustc_ast::{FormatArgsPiece, FormatOptions, FormatTrait};
 use rustc_errors::Applicability;
 use rustc_hir::{Expr, ExprKind};
-use rustc_lint::{LateContext, LateLintPass};
+use rustc_lint::{LateContext, LateLintPass, impl_lint_pass};
 use rustc_middle::ty;
-use rustc_session::impl_lint_pass;
 use rustc_span::{Span, sym};
 
 declare_clippy_lint! {

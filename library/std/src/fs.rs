@@ -37,6 +37,7 @@
         target_env = "sgx",
         target_os = "xous",
         target_os = "trusty",
+        target_os = "l4re",
     ))
 ))]
 mod tests;
@@ -184,6 +185,7 @@ pub enum TryLockError {
 ///
 /// [TOCTOU]: self#time-of-check-to-time-of-use-toctou
 #[unstable(feature = "dirfd", issue = "120426")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "FsDir")]
 pub struct Dir {
     inner: fs_imp::Dir,
 }
@@ -196,6 +198,7 @@ pub struct Dir {
 /// times, etc.
 #[stable(feature = "rust1", since = "1.0.0")]
 #[derive(Clone)]
+#[cfg_attr(not(test), rustc_diagnostic_item = "FsMetadata")]
 pub struct Metadata(fs_imp::FileAttr);
 
 /// Iterator over the entries in a directory.
@@ -213,6 +216,7 @@ pub struct Metadata(fs_imp::FileAttr);
 /// the next entry from the OS.
 #[stable(feature = "rust1", since = "1.0.0")]
 #[derive(Debug)]
+#[cfg_attr(not(test), rustc_diagnostic_item = "FsReadDir")]
 pub struct ReadDir(fs_imp::ReadDir);
 
 /// Entries returned by the [`ReadDir`] iterator.
@@ -231,6 +235,7 @@ pub struct ReadDir(fs_imp::ReadDir);
 ///
 /// [changes]: io#platform-specific-behavior
 #[stable(feature = "rust1", since = "1.0.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "FsDirEntry")]
 pub struct DirEntry(fs_imp::DirEntry);
 
 /// Options and flags which can be used to configure how a file is opened.
@@ -337,6 +342,7 @@ pub struct DirBuilder {
 /// }
 /// ```
 #[stable(feature = "fs_read_write_bytes", since = "1.26.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "fs_read")]
 pub fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
     fn inner(path: &Path) -> io::Result<Vec<u8>> {
         let mut file = File::open(path)?;
@@ -379,6 +385,7 @@ pub fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
 /// }
 /// ```
 #[stable(feature = "fs_read_write", since = "1.26.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "fs_read_to_string")]
 pub fn read_to_string<P: AsRef<Path>>(path: P) -> io::Result<String> {
     fn inner(path: &Path) -> io::Result<String> {
         let mut file = File::open(path)?;
@@ -416,6 +423,7 @@ pub fn read_to_string<P: AsRef<Path>>(path: P) -> io::Result<String> {
 /// }
 /// ```
 #[stable(feature = "fs_read_write_bytes", since = "1.26.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "fs_write")]
 pub fn write<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> io::Result<()> {
     fn inner(path: &Path, contents: &[u8]) -> io::Result<()> {
         File::create(path)?.write_all(contents)
@@ -442,7 +450,6 @@ pub fn write<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> io::Result
 /// # Examples
 ///
 /// ```no_run
-/// #![feature(fs_set_times)]
 /// use std::fs::{self, FileTimes};
 /// use std::time::SystemTime;
 ///
@@ -455,10 +462,11 @@ pub fn write<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> io::Result
 ///     Ok(())
 /// }
 /// ```
-#[unstable(feature = "fs_set_times", issue = "147455")]
+#[stable(feature = "fs_set_times", since = "1.99.0")]
 #[doc(alias = "utimens")]
 #[doc(alias = "utimes")]
 #[doc(alias = "utime")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "fs_set_times")]
 pub fn set_times<P: AsRef<Path>>(path: P, times: FileTimes) -> io::Result<()> {
     fs_imp::set_times(path.as_ref(), times.0)
 }
@@ -483,7 +491,6 @@ pub fn set_times<P: AsRef<Path>>(path: P, times: FileTimes) -> io::Result<()> {
 /// # Examples
 ///
 /// ```no_run
-/// #![feature(fs_set_times)]
 /// use std::fs::{self, FileTimes};
 /// use std::time::SystemTime;
 ///
@@ -496,10 +503,11 @@ pub fn set_times<P: AsRef<Path>>(path: P, times: FileTimes) -> io::Result<()> {
 ///     Ok(())
 /// }
 /// ```
-#[unstable(feature = "fs_set_times", issue = "147455")]
+#[stable(feature = "fs_set_times", since = "1.99.0")]
 #[doc(alias = "utimensat")]
 #[doc(alias = "lutimens")]
 #[doc(alias = "lutimes")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "fs_set_times_nofollow")]
 pub fn set_times_nofollow<P: AsRef<Path>>(path: P, times: FileTimes) -> io::Result<()> {
     fs_imp::set_times_nofollow(path.as_ref(), times.0)
 }
@@ -1498,7 +1506,7 @@ impl Read for File {
     }
     #[inline]
     fn is_read_vectored(&self) -> bool {
-        (&&*self).is_read_vectored()
+        (&self).is_read_vectored()
     }
     fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
         (&*self).read_to_end(buf)
@@ -1517,7 +1525,7 @@ impl Write for File {
     }
     #[inline]
     fn is_write_vectored(&self) -> bool {
-        (&&*self).is_write_vectored()
+        (&self).is_write_vectored()
     }
     #[inline]
     fn flush(&mut self) -> io::Result<()> {
@@ -2761,6 +2769,7 @@ impl AsInner<fs_imp::DirEntry> for DirEntry {
 /// ```
 #[doc(alias = "rm", alias = "unlink", alias = "DeleteFile")]
 #[stable(feature = "rust1", since = "1.0.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "fs_remove_file")]
 pub fn remove_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
     fs_imp::remove_file(path.as_ref())
 }
@@ -2769,7 +2778,8 @@ pub fn remove_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
 /// directory, etc.
 ///
 /// This function will traverse symbolic links to query information about the
-/// destination file.
+/// destination file. To query metadata about the path itself without following
+/// symbolic links, use [`symlink_metadata`].
 ///
 /// # Platform-specific behavior
 ///
@@ -2786,6 +2796,7 @@ pub fn remove_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
 ///
 /// * The user lacks permissions to perform `metadata` call on `path`.
 /// * `path` does not exist.
+/// * `path` is a symbolic link, but the destination file cannot be resolved.
 ///
 /// # Examples
 ///
@@ -2800,11 +2811,17 @@ pub fn remove_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
 /// ```
 #[doc(alias = "stat")]
 #[stable(feature = "rust1", since = "1.0.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "fs_metadata")]
 pub fn metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
     fs_imp::metadata(path.as_ref()).map(Metadata)
 }
 
 /// Queries the metadata about a file without following symlinks.
+///
+/// This function will return the [`Metadata`] of the exact path without
+/// traversing symbolic links to a resolved destination file. Using this function
+/// on a path that is a file or directory (not a symbolic link) will behave the
+/// same as [`metadata`].
 ///
 /// # Platform-specific behavior
 ///
@@ -2835,6 +2852,7 @@ pub fn metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
 /// ```
 #[doc(alias = "lstat")]
 #[stable(feature = "symlink_metadata", since = "1.1.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "fs_symlink_metadata")]
 pub fn symlink_metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
     fs_imp::symlink_metadata(path.as_ref()).map(Metadata)
 }
@@ -2883,6 +2901,7 @@ pub fn symlink_metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
 /// ```
 #[doc(alias = "mv", alias = "MoveFile", alias = "MoveFileEx")]
 #[stable(feature = "rust1", since = "1.0.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "fs_rename")]
 pub fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<()> {
     fs_imp::rename(from.as_ref(), to.as_ref())
 }
@@ -2946,6 +2965,7 @@ pub fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<()> 
 #[doc(alias = "CopyFile", alias = "CopyFileEx")]
 #[doc(alias = "fclonefileat", alias = "fcopyfile")]
 #[stable(feature = "rust1", since = "1.0.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "fs_copy")]
 pub fn copy<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<u64> {
     fs_imp::copy(from.as_ref(), to.as_ref())
 }
@@ -2992,6 +3012,7 @@ pub fn copy<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<u64> {
 /// ```
 #[doc(alias = "CreateHardLink", alias = "linkat")]
 #[stable(feature = "rust1", since = "1.0.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "fs_hard_link")]
 pub fn hard_link<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> io::Result<()> {
     fs_imp::hard_link(original.as_ref(), link.as_ref())
 }
@@ -3058,6 +3079,7 @@ pub fn soft_link<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> io::Re
 /// }
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "fs_read_link")]
 pub fn read_link<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
     fs_imp::read_link(path.as_ref())
 }
@@ -3101,6 +3123,7 @@ pub fn read_link<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
 #[doc(alias = "realpath")]
 #[doc(alias = "GetFinalPathNameByHandle")]
 #[stable(feature = "fs_canonicalize", since = "1.5.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "fs_canonicalize")]
 pub fn canonicalize<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
     fs_imp::canonicalize(path.as_ref())
 }
@@ -3189,6 +3212,7 @@ pub fn create_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
 /// }
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "fs_create_dir_all")]
 pub fn create_dir_all<P: AsRef<Path>>(path: P) -> io::Result<()> {
     DirBuilder::new().recursive(true).create(path.as_ref())
 }
@@ -3234,6 +3258,7 @@ pub fn create_dir_all<P: AsRef<Path>>(path: P) -> io::Result<()> {
 /// ```
 #[doc(alias = "rmdir", alias = "RemoveDirectory")]
 #[stable(feature = "rust1", since = "1.0.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "fs_remove_dir")]
 pub fn remove_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
     fs_imp::remove_dir(path.as_ref())
 }
@@ -3262,8 +3287,9 @@ pub fn remove_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
 /// not be used in security-sensitive contexts:
 /// - **Miri**: Even when emulating targets where the underlying implementation will protect against
 ///   TOCTOU races, Miri will not do so.
-/// - **QNX**, **Redox OS**, **VxWorks**: This function does not protect against TOCTOU races, as
-///   the underlying platform does not implement the required platform support to do so.
+/// - **ESP-IDF**, **Horizon**, **PS Vita**, **QNX**, **Redox OS**, **VxWorks**: This function does
+///   not protect against TOCTOU races, as the underlying platform does not implement the required
+///   platform support to do so.
 ///
 /// [TOCTOU]: self#time-of-check-to-time-of-use-toctou
 /// [changes]: io#platform-specific-behavior
@@ -3298,6 +3324,7 @@ pub fn remove_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
 /// }
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "fs_remove_dir_all")]
 pub fn remove_dir_all<P: AsRef<Path>>(path: P) -> io::Result<()> {
     fs_imp::remove_dir_all(path.as_ref())
 }
@@ -3377,6 +3404,7 @@ pub fn remove_dir_all<P: AsRef<Path>>(path: P) -> io::Result<()> {
 /// ```
 #[doc(alias = "ls", alias = "opendir", alias = "FindFirstFile", alias = "FindNextFile")]
 #[stable(feature = "rust1", since = "1.0.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "fs_read_dir")]
 pub fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<ReadDir> {
     fs_imp::read_dir(path.as_ref()).map(ReadDir)
 }
@@ -3428,27 +3456,71 @@ pub fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<ReadDir> {
 /// ```
 #[doc(alias = "chmod", alias = "SetFileAttributes")]
 #[stable(feature = "set_permissions", since = "1.1.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "fs_set_permissions")]
 pub fn set_permissions<P: AsRef<Path>>(path: P, perm: Permissions) -> io::Result<()> {
     fs_imp::set_permissions(path.as_ref(), perm.0)
 }
 
-/// Set the permissions of a file, unless it is a symlink.
+/// Changes the permissions found on a file or a directory. On certain platforms, if the file
+/// is a symlink, it will change the permissions bits on the symlink itself rather than
+/// the target (e.g. Windows, BSD, MacOS). On other platforms, this results in an error when
+/// attempting to change permissions on a symlink (e.g. Linux).
 ///
-/// Note that the non-final path elements are allowed to be symlinks.
+/// Note that non-final path elements are allowed to be symlinks.
 ///
 /// # Platform-specific behavior
 ///
-/// Currently unimplemented on Windows.
+/// This function currently corresponds to:
+/// * `open` with `O_NOFOLLOW` flag enabled + `fchmod` on WASI
+/// * `fchmodat` function with the flag `AT_SYMLINK_NOFOLLOW` enabled
+///   on Unix platforms
+/// * The flag `FILE_FLAG_OPEN_REPARSE_POINT` is enabled and then the
+///   permissions of the file is set through `SetFileInformationByHandle`
+///   on Windows.
+/// * On all other platforms, the behavior remains the same with
+/// [`fs::set_permissions`].
 ///
-/// On Unix platforms, this results in a [`FilesystemLoop`] error if the last element is a symlink.
+/// [`fs::set_permissions`]: crate::fs::set_permissions
 ///
-/// This behavior may change in the future.
+/// Note that, this [may change in the future][changes].
 ///
-/// [`FilesystemLoop`]: crate::io::ErrorKind::FilesystemLoop
-#[doc(alias = "chmod", alias = "SetFileAttributes")]
+/// [changes]: io#platform-specific-behavior
+///
+/// # Errors
+///
+/// This function will return an error in the following situations, but is not
+/// limited to just these cases:
+///
+/// * `path` does not exist.
+/// * The user lacks the permission to change attributes of the file.
+///
+/// Note: On Linux, this will result in a [`Unsupported`] error
+/// if the final element is a symlink. On BSD-based systems, the
+/// behavior can vary from symlink permission bits changing or
+/// there being no effects on symlinks
+///
+/// [`Unsupported`]: crate::io::ErrorKind::Unsupported
+///
+/// # Examples
+///
+/// ```no_run
+/// #![feature(set_permissions_nofollow)]
+/// use std::fs;
+///
+/// fn main() -> std::io::Result<()> {
+///     let mut perms = fs::symlink_metadata("foo.txt")?.permissions();
+///     perms.set_readonly(true);
+///     // This should result in an error on certain platforms
+///     // or succeed in modifying the permissions of a symlink
+///     fs::set_permissions_nofollow("foo.txt", perms)?;
+///     Ok(())
+/// }
+/// ```
+#[doc(alias = "fchmodat", alias = "SetFileInformationByHandle")]
 #[unstable(feature = "set_permissions_nofollow", issue = "141607")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "fs_set_permissions_nofollow")]
 pub fn set_permissions_nofollow<P: AsRef<Path>>(path: P, perm: Permissions) -> io::Result<()> {
-    fs_imp::set_permissions_nofollow(path.as_ref(), perm)
+    fs_imp::set_permissions_nofollow(path.as_ref(), perm.0)
 }
 
 impl DirBuilder {
@@ -3594,6 +3666,7 @@ impl AsInnerMut<fs_imp::DirBuilder> for DirBuilder {
 /// [`Path::exists`]: crate::path::Path::exists
 /// [TOCTOU]: self#time-of-check-to-time-of-use-toctou
 #[stable(feature = "fs_try_exists", since = "1.81.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "fs_exists")]
 #[inline]
 pub fn exists<P: AsRef<Path>>(path: P) -> io::Result<bool> {
     fs_imp::exists(path.as_ref())

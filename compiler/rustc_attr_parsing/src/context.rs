@@ -9,14 +9,15 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rustc_ast::{AttrStyle, MetaItemLit, Safety};
+use rustc_attr_ir::target::Target;
+use rustc_attr_ir::{AttrPath, Attribute, AttributeKind};
 use rustc_data_structures::sync::{DynSend, DynSync};
 use rustc_errors::{Diag, DiagCtxtHandle, Diagnostic, Level, MultiSpan};
 use rustc_feature::AttributeStability;
-use rustc_hir::attrs::AttributeKind;
-use rustc_hir::{AttrPath, Attribute};
+use rustc_lint_defs::builtin::UNUSED_ATTRIBUTES;
+use rustc_lint_defs::{Lint, LintId};
 use rustc_parse::parser::Recovery;
 use rustc_session::Session;
-use rustc_session::lint::{Lint, LintId};
 use rustc_span::{ErrorGuaranteed, Ident, Span, Symbol};
 
 // Glob imports to avoid big, bitrotty import lists
@@ -66,16 +67,16 @@ use crate::attributes::traits::*;
 use crate::attributes::transparency::*;
 use crate::attributes::unroll::*;
 use crate::attributes::{AttributeParser as _, AttributeSafety, Combine, Single, WithoutArgs};
+use crate::diagnostics::{
+    AttributeParseError, AttributeParseErrorReason, AttributeParseErrorSuggestions,
+    ParsedDescription, UnusedDuplicate,
+};
 use crate::parser::{
     ArgParser, MetaItemListParser, MetaItemOrLitParser, MetaItemParser, NameValueParser,
     RefPathParser,
 };
-use crate::session_diagnostics::{
-    AttributeParseError, AttributeParseErrorReason, AttributeParseErrorSuggestions,
-    ParsedDescription, UnusedDuplicate,
-};
 use crate::target_checking::AllowedTargets;
-use crate::{AttrSuggestionStyle, AttributeParser, AttributeTemplate, EmitAttribute};
+use crate::{AttributeParser, AttributeTemplate, EmitAttribute};
 
 type GroupType = LazyLock<GroupTypeInner>;
 
@@ -174,6 +175,7 @@ attribute_parsers!(
         OnUnknownParser,
         OnUnmatchedArgsParser,
         OpaqueParser,
+        RegisterToolParser,
         RustcAlignParser,
         RustcAlignStaticParser,
         RustcCguTestAttributeParser,
@@ -188,7 +190,6 @@ attribute_parsers!(
         Combine<FeatureParser>,
         Combine<ForceTargetFeatureParser>,
         Combine<LinkParser>,
-        Combine<RegisterToolParser>,
         Combine<ReprParser>,
         Combine<RustcAllowConstFnUnstableParser>,
         Combine<RustcCleanParser>,
@@ -295,6 +296,7 @@ attribute_parsers!(
         Single<WithoutArgs<RustcAllocatorParser>>,
         Single<WithoutArgs<RustcAllocatorZeroedParser>>,
         Single<WithoutArgs<RustcAllowIncoherentImplParser>>,
+        Single<WithoutArgs<RustcAllowLifetimeDependentSpecializationParser>>,
         Single<WithoutArgs<RustcAsPtrParser>>,
         Single<WithoutArgs<RustcCanonicalSymbolParser>>,
         Single<WithoutArgs<RustcCaptureAnalysisParser>>,
@@ -306,13 +308,13 @@ attribute_parsers!(
         Single<WithoutArgs<RustcDelayedBugFromInsideQueryParser>>,
         Single<WithoutArgs<RustcDenyExplicitImplParser>>,
         Single<WithoutArgs<RustcDoNotConstCheckParser>>,
+        Single<WithoutArgs<RustcDumpClausesParser>>,
         Single<WithoutArgs<RustcDumpDefParentsParser>>,
         Single<WithoutArgs<RustcDumpGenericsParser>>,
         Single<WithoutArgs<RustcDumpHiddenTypeOfOpaquesParser>>,
         Single<WithoutArgs<RustcDumpInferredOutlivesParser>>,
         Single<WithoutArgs<RustcDumpItemBoundsParser>>,
         Single<WithoutArgs<RustcDumpObjectLifetimeDefaultsParser>>,
-        Single<WithoutArgs<RustcDumpPredicatesParser>>,
         Single<WithoutArgs<RustcDumpUserArgsParser>>,
         Single<WithoutArgs<RustcDumpVariancesOfOpaquesParser>>,
         Single<WithoutArgs<RustcDumpVariancesParser>>,
@@ -340,6 +342,7 @@ attribute_parsers!(
         Single<WithoutArgs<RustcNonnullOptimizationGuaranteedParser>>,
         Single<WithoutArgs<RustcNounwindParser>>,
         Single<WithoutArgs<RustcOffloadKernelParser>>,
+        Single<WithoutArgs<RustcPanicsWhenZeroParser>>,
         Single<WithoutArgs<RustcParenSugarParser>>,
         Single<WithoutArgs<RustcPassByValueParser>>,
         Single<WithoutArgs<RustcPassIndirectlyInNonRusticAbisParser>>,
@@ -354,7 +357,6 @@ attribute_parsers!(
         Single<WithoutArgs<RustcStrictCoherenceParser>>,
         Single<WithoutArgs<RustcTestEntrypointMarkerParser>>,
         Single<WithoutArgs<RustcTrivialFieldReadsParser>>,
-        Single<WithoutArgs<RustcUnsafeSpecializationMarkerParser>>,
         Single<WithoutArgs<SplatParser>>,
         Single<WithoutArgs<ThreadLocalParser>>,
         Single<WithoutArgs<TrackCallerParser>>,
@@ -461,7 +463,7 @@ impl<'f, 'sess: 'f> SharedContext<'f, 'sess> {
 
     pub(crate) fn warn_unused_duplicate(&mut self, used_span: Span, unused_span: Span) {
         self.emit_lint(
-            rustc_session::lint::builtin::UNUSED_ATTRIBUTES,
+            UNUSED_ATTRIBUTES,
             UnusedDuplicate { this: unused_span, other: used_span, warning: false },
             unused_span,
         )
@@ -473,7 +475,7 @@ impl<'f, 'sess: 'f> SharedContext<'f, 'sess> {
         unused_span: Span,
     ) {
         self.emit_lint(
-            rustc_session::lint::builtin::UNUSED_ATTRIBUTES,
+            UNUSED_ATTRIBUTES,
             UnusedDuplicate { this: unused_span, other: used_span, warning: true },
             unused_span,
         )
@@ -774,7 +776,7 @@ pub struct SharedContext<'p, 'sess> {
     pub(crate) cx: &'p mut AttributeParser<'sess>,
     /// The span of the syntactical component this attribute was applied to
     pub(crate) target_span: Span,
-    pub(crate) target: rustc_hir::Target,
+    pub(crate) target: Target,
 
     pub(crate) emit_lint: &'p mut dyn FnMut(LintId, MultiSpan, EmitAttribute),
 
@@ -920,7 +922,7 @@ impl<'a, 'f, 'sess: 'f> AttributeDiagnosticContext<'a, 'f, 'sess> {
         reason: AttributeParseErrorReason<'_>,
     ) -> ErrorGuaranteed {
         let suggestions = if self.custom_suggestions.is_empty() {
-            AttributeParseErrorSuggestions::CreatedByTemplate(self.template_suggestions())
+            AttributeParseErrorSuggestions::CreatedByTemplate(self.suggestions())
         } else {
             AttributeParseErrorSuggestions::CreatedByParser(mem::take(&mut self.custom_suggestions))
         };
@@ -933,7 +935,6 @@ impl<'a, 'f, 'sess: 'f> AttributeDiagnosticContext<'a, 'f, 'sess> {
 
         self.emit_err(AttributeParseError {
             span,
-            attr_span: self.attr_span,
             inner_span: self.inner_span,
             template: *self.template,
             path: self.attr_path.clone(),
@@ -948,19 +949,6 @@ impl<'a, 'f, 'sess: 'f> AttributeDiagnosticContext<'a, 'f, 'sess> {
     pub(crate) fn push_suggestion(&mut self, msg: String, span: Span, code: String) -> &mut Self {
         self.custom_suggestions.push(Suggestion { msg, sp: span, code });
         self
-    }
-
-    pub(crate) fn template_suggestions(&self) -> Vec<String> {
-        let style = match self.parsed_description {
-            // If the outer and inner spans are equal, we are parsing an embedded attribute
-            ParsedDescription::Attribute if self.attr_span == self.inner_span => {
-                AttrSuggestionStyle::EmbeddedAttribute
-            }
-            ParsedDescription::Attribute => AttrSuggestionStyle::Attribute(self.attr_style),
-            ParsedDescription::Macro => AttrSuggestionStyle::Macro,
-        };
-
-        self.template.suggestions(style, self.attr_safety, &self.attr_path)
     }
 }
 
@@ -1118,7 +1106,7 @@ impl<'a, 'f, 'sess: 'f> AttributeDiagnosticContext<'a, 'f, 'sess> {
         let attr_path = self.attr_path.to_string();
         let valid_without_list = self.template.word;
         self.emit_lint(
-            rustc_session::lint::builtin::UNUSED_ATTRIBUTES,
+            UNUSED_ATTRIBUTES,
             crate::diagnostics::EmptyAttributeList {
                 attr_span: span,
                 attr_path,
@@ -1137,7 +1125,7 @@ impl<'a, 'f, 'sess: 'f> AttributeDiagnosticContext<'a, 'f, 'sess> {
         help: Option<String>,
     ) {
         let suggestions = self.suggestions();
-        let span = self.attr_span;
+        let span = self.inner_span;
         self.emit_lint(
             lint,
             crate::diagnostics::IllFormedAttributeInput::new(&suggestions, None, help.as_deref()),
@@ -1146,16 +1134,7 @@ impl<'a, 'f, 'sess: 'f> AttributeDiagnosticContext<'a, 'f, 'sess> {
     }
 
     pub(crate) fn suggestions(&self) -> Vec<String> {
-        let style = match self.parsed_description {
-            // If the outer and inner spans are equal, we are parsing an embedded attribute
-            ParsedDescription::Attribute if self.attr_span == self.inner_span => {
-                AttrSuggestionStyle::EmbeddedAttribute
-            }
-            ParsedDescription::Attribute => AttrSuggestionStyle::Attribute(self.attr_style),
-            ParsedDescription::Macro => AttrSuggestionStyle::Macro,
-        };
-
-        self.template.suggestions(style, self.attr_safety, &self.attr_path)
+        self.template.suggestions(self.parsed_description, self.attr_safety, &self.attr_path)
     }
     /// Error that a string literal was expected.
     /// You can optionally give the literal you did find (which you found not to be a string literal)

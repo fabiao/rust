@@ -254,46 +254,6 @@ pub(crate) struct FailedCopyToStdout {
 pub(crate) struct BinaryOutputToTty;
 
 #[derive(Diagnostic)]
-#[diag("could not find native static library `{$libname}`, perhaps an -L flag is missing?")]
-pub(crate) struct MissingNativeLibrary<'a> {
-    libname: &'a str,
-    #[subdiagnostic]
-    suggest_name: Option<SuggestLibraryName<'a>>,
-}
-
-impl<'a> MissingNativeLibrary<'a> {
-    pub(crate) fn new(libname: &'a str, verbatim: bool) -> Self {
-        // if it looks like the user has provided a complete filename rather just the bare lib name,
-        // then provide a note that they might want to try trimming the name
-        let suggested_name = if !verbatim {
-            if let Some(libname) = libname.strip_circumfix("lib", ".a") {
-                // this is a unix style filename so trim prefix & suffix
-                Some(libname)
-            } else if let Some(libname) = libname.strip_suffix(".lib") {
-                // this is a Windows style filename so just trim the suffix
-                Some(libname)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        Self {
-            libname,
-            suggest_name: suggested_name
-                .map(|suggested_name| SuggestLibraryName { suggested_name }),
-        }
-    }
-}
-
-#[derive(Subdiagnostic)]
-#[help("only provide the library name `{$suggested_name}`, not the full filename")]
-pub(crate) struct SuggestLibraryName<'a> {
-    suggested_name: &'a str,
-}
-
-#[derive(Diagnostic)]
 #[diag("couldn't create a temp dir: {$err}")]
 pub(crate) struct FailedCreateTempdir {
     pub err: Error,
@@ -590,8 +550,6 @@ pub(crate) struct WasmCAbi {
     "if you are sure this will not cause problems, you may use `-Cunsafe-allow-abi-mismatch={$flag_name}` to silence this error"
 )]
 pub(crate) struct IncompatibleTargetModifiers {
-    #[primary_span]
-    pub span: Span,
     pub extern_crate: Symbol,
     pub local_crate: Symbol,
     pub flag_name: String,
@@ -621,8 +579,6 @@ pub(crate) struct IncompatibleTargetModifiers {
     "if you are sure this will not cause problems, you may use `-Cunsafe-allow-abi-mismatch={$flag_name}` to silence this error"
 )]
 pub(crate) struct IncompatibleTargetModifiersLMissed {
-    #[primary_span]
-    pub span: Span,
     pub extern_crate: Symbol,
     pub local_crate: Symbol,
     pub flag_name: String,
@@ -652,8 +608,6 @@ pub(crate) struct IncompatibleTargetModifiersLMissed {
     "if you are sure this will not cause problems, you may use `-Cunsafe-allow-abi-mismatch={$flag_name}` to silence this error"
 )]
 pub(crate) struct IncompatibleTargetModifiersRMissed {
-    #[primary_span]
-    pub span: Span,
     pub extern_crate: Symbol,
     pub local_crate: Symbol,
     pub flag_name: String,
@@ -667,8 +621,6 @@ pub(crate) struct IncompatibleTargetModifiersRMissed {
     "unknown target modifier `{$flag_name}`, requested by `-Cunsafe-allow-abi-mismatch={$flag_name}`"
 )]
 pub(crate) struct UnknownTargetModifierUnsafeAllowed {
-    #[primary_span]
-    pub span: Span,
     pub flag_name: String,
 }
 
@@ -712,8 +664,6 @@ pub(crate) struct UnusedCrateDependency {
     "it is possible to disable `-Z allow-partial-mitigations={$mitigation_name}` via `-Z deny-partial-mitigations={$mitigation_name}`"
 )]
 pub(crate) struct MitigationLessStrictInDependency {
-    #[primary_span]
-    pub span: Span,
     pub mitigation_name: String,
     pub mitigation_level: String,
     pub extern_crate: Symbol,

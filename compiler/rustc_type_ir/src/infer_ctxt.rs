@@ -5,12 +5,15 @@ use derive_where::derive_where;
 #[cfg(feature = "nightly")]
 use rustc_macros::{Decodable_NoContext, Encodable_NoContext, StableHash_NoContext};
 
-use crate::fold::TypeFoldable;
+use crate::data_structures::DelayedMap;
 use crate::inherent::*;
 use crate::relate::RelateResult;
 use crate::relate::combine::PredicateEmittingRelation;
-use crate::solve::VisibleForLeakCheck;
-use crate::{self as ty, Interner, Region, TyVid};
+use crate::solve::{TyOrConstInferVar, VisibleForLeakCheck};
+use crate::{
+    self as ty, Interner, Region, TyVid, TypeFoldable, TypeFolder, TypeSuperFoldable,
+    TypeVisitableExt,
+};
 
 mod private {
     pub trait Sealed {}
@@ -359,6 +362,22 @@ impl<I: Interner> From<TypingMode<I, CantBeErased>> for TypingMode<I, MayBeErase
     }
 }
 
+/// `InferCtxtLike` is one of the two traits abstracting over the [InferCtxt][inferctxt-doc], which
+/// had to be split due to coherence reasons:
+/// - `InferCtxtLike`] contains the parts that have to live in `rustc_infer`, and thus aren't only
+///   about trait-solving. It is implemented [directly on `InferCtxt`][inferctxtlike-impl-doc],
+/// - [SolverDelegate][solverdelegate-doc] contains the parts depending on trait-solving logic, to
+///   provide functionality in `rustc_trait_selection`, and is implemented by a [simple wrapper over
+///   `InferCtxt`][inferctxt-wrapper-doc] there.
+///
+/// More information can also be found in the dedicated chapter in the dev-guide, in [this
+/// section][dev-guide].
+///
+/// [inferctxt-doc]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_infer/infer/struct.InferCtxt.html
+/// [inferctxtlike-impl-doc]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_infer/infer/struct.InferCtxt.html#impl-InferCtxtLike-for-InferCtxt%3C'tcx%3E
+/// [solverdelegate-doc]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_next_trait_solver/delegate/trait.SolverDelegate.html
+/// [inferctxt-wrapper-doc]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_trait_selection/solve/delegate/struct.SolverDelegate.html
+/// [dev-guide]: https://rustc-dev-guide.rust-lang.org/solve/sharing-crates-with-rust-analyzer.html#trait-inferctxtlike-and-trait-solverdelegate
 #[cfg_attr(feature = "nightly", rustc_diagnostic_item = "type_ir_infer_ctxt_like")]
 pub trait InferCtxtLike: Sized {
     type Interner: Interner;
@@ -371,6 +390,8 @@ pub trait InferCtxtLike: Sized {
     fn next_trait_solver(&self) -> bool {
         true
     }
+
+    fn enable_next_solver_overflow_fcw(&self) -> bool;
 
     fn disable_trait_solver_fast_paths(&self) -> bool;
 
@@ -394,6 +415,7 @@ pub trait InferCtxtLike: Sized {
     fn overwrite_solver_region_constraint(
         &self,
         constraint: crate::region_constraint::RegionConstraint<Self::Interner>,
+        span: <Self::Interner as Interner>::Span,
     );
 
     fn universe_of_ty(&self, ty: ty::TyVid) -> Option<ty::UniverseIndex>;
@@ -402,6 +424,7 @@ pub trait InferCtxtLike: Sized {
 
     fn root_ty_var(&self, var: ty::TyVid) -> ty::TyVid;
     fn sub_unification_table_root_var(&self, var: ty::TyVid) -> ty::TyVid;
+    fn is_sub_unification_table_root_var(&self, var: ty::TyVid) -> bool;
     fn root_const_var(&self, var: ty::ConstVid) -> ty::ConstVid;
 
     fn opportunistic_resolve_ty_var(&self, vid: ty::TyVid) -> <Self::Interner as Interner>::Ty;
@@ -416,7 +439,7 @@ pub trait InferCtxtLike: Sized {
     ) -> <Self::Interner as Interner>::Const;
     fn opportunistic_resolve_lt_var(&self, vid: ty::RegionVid) -> Region<Self::Interner>;
 
-    fn is_changed_arg(&self, arg: <Self::Interner as Interner>::GenericArg) -> bool;
+    fn ty_or_const_infer_var_changed(&self, var: TyOrConstInferVar) -> bool;
 
     fn next_region_infer(&self) -> Region<Self::Interner>;
     fn next_ty_infer(&self) -> <Self::Interner as Interner>::Ty;
@@ -493,6 +516,8 @@ pub trait InferCtxtLike: Sized {
 
     fn probe<T>(&self, probe: impl FnOnce() -> T) -> T;
 
+    fn commit_if_ok<T, E>(&self, f: impl FnOnce() -> Result<T, E>) -> Result<T, E>;
+
     fn sub_regions(
         &self,
         sub: Region<Self::Interner>,
@@ -512,6 +537,7 @@ pub trait InferCtxtLike: Sized {
     fn register_solver_region_constraint(
         &self,
         c: crate::region_constraint::RegionConstraint<Self::Interner>,
+        span: <Self::Interner as Interner>::Span,
     );
 
     fn register_ty_outlives(
@@ -595,5 +621,103 @@ where
         | TypingMode::PostBorrowck { .. }
         | TypingMode::PostAnalysis => infcx.cx().features().feature_bound_holds_in_crate(symbol),
         TypingMode::Codegen => true,
+    }
+}
+
+/// Resolves ty, region, and const vars to their inferred values or their root vars.
+pub fn eager_resolve_vars<Infcx: InferCtxtLike, T: TypeFoldable<Infcx::Interner>>(
+    infcx: &Infcx,
+    value: T,
+) -> T {
+    if value.has_infer() {
+        let mut folder = EagerResolver::new(infcx);
+        value.fold_with(&mut folder)
+    } else {
+        value
+    }
+}
+
+struct EagerResolver<'a, D, I = <D as InferCtxtLike>::Interner>
+where
+    D: InferCtxtLike<Interner = I>,
+    I: Interner,
+{
+    delegate: &'a D,
+    /// We're able to use a cache here as the folder does not have any
+    /// mutable state.
+    cache: DelayedMap<I::Ty, I::Ty>,
+}
+
+impl<'a, Infcx: InferCtxtLike> EagerResolver<'a, Infcx> {
+    fn new(delegate: &'a Infcx) -> Self {
+        EagerResolver { delegate, cache: Default::default() }
+    }
+}
+
+impl<Infcx: InferCtxtLike<Interner = I>, I: Interner> TypeFolder<I> for EagerResolver<'_, Infcx> {
+    fn cx(&self) -> I {
+        self.delegate.cx()
+    }
+
+    fn fold_ty(&mut self, t: I::Ty) -> I::Ty {
+        match t.kind() {
+            ty::Infer(ty::TyVar(vid)) => {
+                let resolved = self.delegate.opportunistic_resolve_ty_var(vid);
+                if t != resolved && resolved.has_infer() {
+                    resolved.fold_with(self)
+                } else {
+                    resolved
+                }
+            }
+            ty::Infer(ty::IntVar(vid)) => self.delegate.opportunistic_resolve_int_var(vid),
+            ty::Infer(ty::FloatVar(vid)) => self.delegate.opportunistic_resolve_float_var(vid),
+            _ => {
+                if t.has_infer() {
+                    if let Some(&ty) = self.cache.get(&t) {
+                        return ty;
+                    }
+                    let res = t.super_fold_with(self);
+                    assert!(self.cache.insert(t, res));
+                    res
+                } else {
+                    t
+                }
+            }
+        }
+    }
+
+    fn fold_region(&mut self, r: Region<I>) -> Region<I> {
+        match r.kind() {
+            ty::ReVar(vid) => self.delegate.opportunistic_resolve_lt_var(vid),
+            _ => r,
+        }
+    }
+
+    fn fold_const(&mut self, c: I::Const) -> I::Const {
+        match c.kind() {
+            ty::ConstKind::Infer(ty::InferConst::Var(vid)) => {
+                let resolved = self.delegate.opportunistic_resolve_ct_var(vid);
+                if c != resolved && resolved.has_infer() {
+                    resolved.fold_with(self)
+                } else {
+                    resolved
+                }
+            }
+            _ => {
+                if c.has_infer() {
+                    c.super_fold_with(self)
+                } else {
+                    c
+                }
+            }
+        }
+    }
+
+    fn fold_predicate(&mut self, p: I::Predicate) -> I::Predicate {
+        if p.has_infer() { p.super_fold_with(self) } else { p }
+    }
+
+    fn fold_clauses(&mut self, c: I::Clauses) -> I::Clauses {
+        if c.has_infer() { c.super_fold_with(self) } else { c }
     }
 }

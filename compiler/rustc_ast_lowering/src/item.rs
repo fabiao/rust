@@ -26,7 +26,7 @@ use super::{
     FnDeclKind, GenericArgsMode, ImplTraitContext, ImplTraitPosition, LoweringContext, ParamMode,
     RelaxedBoundForbiddenReason, RelaxedBoundPolicy,
 };
-use crate::diagnostics::ConstComptimeFn;
+use crate::diagnostics::{ConstComptimeFn, ResolvingRestrictionKind, RestrictionAncestorOnly};
 
 pub(super) struct ItemLowerer<'a, 'hir> {
     pub(super) tcx: TyCtxt<'hir>,
@@ -155,7 +155,10 @@ impl<'hir> LoweringContext<'_, 'hir> {
         hir::attrs::EiiImpl {
             span: self.lower_span(*span),
             inner_span: self.lower_span(*inner_span),
-            impl_marked_unsafe: self.lower_safety(*impl_safety, hir::Safety::Safe).is_unsafe(),
+            impl_unsafe_span: match *impl_safety {
+                Safety::Unsafe(span) => Some(self.lower_span(span)),
+                Safety::Safe(_) | Safety::Default => None,
+            },
             is_default: *is_default,
             resolution,
         }
@@ -167,15 +170,13 @@ impl<'hir> LoweringContext<'_, 'hir> {
         i: &ItemKind,
     ) -> Vec<hir::Attribute> {
         match i {
-            ItemKind::Fn(Fn { eii_impls, .. }) | ItemKind::Static(StaticItem { eii_impls, .. })
-                if eii_impls.is_empty() =>
-            {
-                Vec::new()
-            }
-            ItemKind::Fn(Fn { eii_impls, .. }) | ItemKind::Static(StaticItem { eii_impls, .. }) => {
-                vec![hir::Attribute::Parsed(AttributeKind::EiiImpls(
-                    eii_impls.iter().map(|i| self.lower_eii_impl(i)).collect(),
-                ))]
+            ItemKind::Fn(Fn { eii_impl: None, .. })
+            | ItemKind::Static(StaticItem { eii_impl: None, .. }) => Vec::new(),
+            ItemKind::Fn(Fn { eii_impl: Some(eii_impl), .. })
+            | ItemKind::Static(StaticItem { eii_impl: Some(eii_impl), .. }) => {
+                vec![hir::Attribute::Parsed(AttributeKind::EiiImpl(Box::new(
+                    self.lower_eii_impl(eii_impl),
+                )))]
             }
             ItemKind::MacroDef(name, MacroDef { eii_declaration: Some(target), .. }) => self
                 .lower_eii_decl(id, *name, target)
@@ -223,7 +224,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
             kind,
             vis_span,
             span: self.lower_span(i.span),
-            eii: find_attr!(attrs, EiiImpls(..) | EiiDeclaration(..)),
+            eii: find_attr!(attrs, EiiImpl(..) | EiiDeclaration(..)),
         };
         self.arena.alloc(item)
     }
@@ -256,7 +257,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
                 mutability: m,
                 expr: e,
                 define_opaque,
-                eii_impls: _,
+                eii_impl: _,
             }) => {
                 let ident = self.lower_ident(*ident);
                 let ty = self
@@ -317,13 +318,13 @@ impl<'hir> LoweringContext<'_, 'hir> {
                     // `impl Future<Output = T>` here because lower_body
                     // only cares about the input argument patterns in the function
                     // declaration (decl), not the return types.
-                    let coroutine_kind = header.coroutine_kind;
+                    let coroutine_marker = header.coroutine_marker;
                     let body_id = this.lower_maybe_coroutine_body(
                         *fn_sig_span,
                         span,
                         hir_id,
                         decl,
-                        coroutine_kind,
+                        coroutine_marker,
                         body.as_deref(),
                         attrs,
                         contract.as_deref(),
@@ -331,7 +332,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
 
                     let itctx = ImplTraitContext::Universal;
                     let (generics, decl) = this.lower_generics(generics, itctx, |this| {
-                        this.lower_fn_decl(decl, id, *fn_sig_span, FnDeclKind::Fn, coroutine_kind)
+                        this.lower_fn_decl(decl, id, *fn_sig_span, FnDeclKind::Fn, coroutine_marker)
                     });
                     let sig = hir::FnSig {
                         decl,
@@ -497,7 +498,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
                 items,
             }) => {
                 let constness = self.lower_constness(attrs, *constness);
-                let impl_restriction = self.lower_impl_restriction(impl_restriction);
+                let impl_restriction = self.lower_impl_restriction(impl_restriction, hir_id);
                 let ident = self.lower_ident(*ident);
                 let (generics, (safety, items, bounds)) = self.lower_generics(
                     generics,
@@ -693,7 +694,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
                             kind,
                             vis_span,
                             span: this.lower_span(use_tree.span()),
-                            eii: find_attr!(attrs, EiiImpls(..) | EiiDeclaration(..)),
+                            eii: find_attr!(attrs, EiiImpl(..) | EiiDeclaration(..)),
                         };
                         hir::OwnerNode::Item(this.arena.alloc(item))
                     });
@@ -760,7 +761,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
                 expr: _,
                 safety,
                 define_opaque,
-                eii_impls: _,
+                eii_impl: _,
             }) => {
                 let ty = self
                     .lower_ty_alloc(ty, ImplTraitContext::Disallowed(ImplTraitPosition::StaticTy));
@@ -894,7 +895,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
                 None => Ident::new(sym::integer(index), self.lower_span(f.span)),
             },
             vis_span: self.lower_span(f.vis.span),
-            mut_restriction: self.lower_mut_restriction(f.mut_restriction()),
+            mut_restriction: self.lower_mut_restriction(f.mut_restriction(), hir_id),
             default: f
                 .default_value()
                 .map(|v| self.lower_anon_const_to_anon_const(v, v.value.span)),
@@ -963,7 +964,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
                     sig,
                     i.id,
                     FnDeclKind::Trait,
-                    sig.header.coroutine_kind,
+                    sig.header.coroutine_marker,
                     attrs,
                 );
                 if define_opaque.is_some() {
@@ -993,7 +994,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
                     i.span,
                     hir_id,
                     &sig.decl,
-                    sig.header.coroutine_kind,
+                    sig.header.coroutine_marker,
                     Some(body),
                     attrs,
                     contract.as_deref(),
@@ -1003,7 +1004,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
                     sig,
                     i.id,
                     FnDeclKind::Trait,
-                    sig.header.coroutine_kind,
+                    sig.header.coroutine_marker,
                     attrs,
                 );
                 self.lower_define_opaque(hir_id, &define_opaque);
@@ -1209,7 +1210,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
                     i.span,
                     hir_id,
                     &sig.decl,
-                    sig.header.coroutine_kind,
+                    sig.header.coroutine_marker,
                     body.as_deref(),
                     attrs,
                     contract.as_deref(),
@@ -1219,7 +1220,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
                     sig,
                     i.id,
                     if is_in_trait_impl { FnDeclKind::Impl } else { FnDeclKind::Inherent },
-                    sig.header.coroutine_kind,
+                    sig.header.coroutine_marker,
                     attrs,
                 );
                 self.lower_define_opaque(hir_id, &define_opaque);
@@ -1403,7 +1404,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
         span: Span,
         fn_id: hir::HirId,
         decl: &FnDecl,
-        coroutine_kind: Option<CoroutineKind>,
+        coroutine_marker: Option<CoroutineMarker>,
         body: Option<&Block>,
         attrs: &'hir [hir::Attribute],
         contract: Option<&FnContract>,
@@ -1435,7 +1436,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
                 }
             });
         };
-        let Some(coroutine_kind) = coroutine_kind else {
+        let Some(coroutine_marker) = coroutine_marker else {
             // Typical case: not a coroutine.
             return self.lower_fn_body_block(decl, body, contract);
         };
@@ -1446,7 +1447,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
                 |this| this.lower_block_expr(body),
                 fn_decl_span,
                 body.span,
-                coroutine_kind,
+                coroutine_marker,
                 hir::CoroutineSource::Fn,
             );
 
@@ -1468,7 +1469,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
         lower_body: impl FnOnce(&mut LoweringContext<'_, 'hir>) -> hir::Expr<'hir>,
         fn_decl_span: Span,
         body_span: Span,
-        coroutine_kind: CoroutineKind,
+        coroutine_marker: CoroutineMarker,
         coroutine_source: hir::CoroutineSource,
     ) -> (&'hir [hir::Param<'hir>], hir::Expr<'hir>) {
         let mut parameters: Vec<hir::Param<'_>> = Vec::new();
@@ -1628,12 +1629,12 @@ impl<'hir> LoweringContext<'_, 'hir> {
 
             this.expr_block(body)
         };
-        let desugaring_kind = match coroutine_kind {
-            CoroutineKind::Async { .. } => hir::CoroutineDesugaring::Async,
-            CoroutineKind::Gen { .. } => hir::CoroutineDesugaring::Gen,
-            CoroutineKind::AsyncGen { .. } => hir::CoroutineDesugaring::AsyncGen,
+        let desugaring_kind = match coroutine_marker.kind {
+            CoroutineKind::Async => hir::CoroutineDesugaring::Async,
+            CoroutineKind::Gen => hir::CoroutineDesugaring::Gen,
+            CoroutineKind::AsyncGen => hir::CoroutineDesugaring::AsyncGen,
         };
-        let closure_id = coroutine_kind.closure_id();
+        let closure_id = coroutine_marker.closure_id;
 
         let coroutine_expr = self.make_desugared_coroutine_expr(
             // The default capture mode here is by-ref. Later on during upvar analysis,
@@ -1665,13 +1666,13 @@ impl<'hir> LoweringContext<'_, 'hir> {
         sig: &FnSig,
         id: NodeId,
         kind: FnDeclKind,
-        coroutine_kind: Option<CoroutineKind>,
+        coroutine_marker: Option<CoroutineMarker>,
         attrs: &[hir::Attribute],
     ) -> (&'hir hir::Generics<'hir>, hir::FnSig<'hir>) {
         let header = self.lower_fn_header(sig.header, hir::Safety::Safe, attrs);
         let itctx = ImplTraitContext::Universal;
         let (generics, decl) = self.lower_generics(generics, itctx, |this| {
-            this.lower_fn_decl(&sig.decl, id, sig.span, kind, coroutine_kind)
+            this.lower_fn_decl(&sig.decl, id, sig.span, kind, coroutine_marker)
         });
         (generics, hir::FnSig { header, decl, span: self.lower_span(sig.span) })
     }
@@ -1682,8 +1683,10 @@ impl<'hir> LoweringContext<'_, 'hir> {
         default_safety: hir::Safety,
         attrs: &[hir::Attribute],
     ) -> hir::FnHeader {
-        let asyncness = if let Some(CoroutineKind::Async { span, .. }) = h.coroutine_kind {
-            hir::IsAsync::Async(self.lower_span(span))
+        let asyncness = if let Some(coroutine_marker) = h.coroutine_marker
+            && let CoroutineKind::Async = coroutine_marker.kind
+        {
+            hir::IsAsync::Async(self.lower_span(coroutine_marker.span))
         } else {
             hir::IsAsync::NotAsync
         };
@@ -1796,26 +1799,46 @@ impl<'hir> LoweringContext<'_, 'hir> {
         }
     }
 
-    fn lower_restriction_kind(&mut self, kind: &RestrictionKind) -> hir::RestrictionKind<'hir> {
-        match kind {
+    fn lower_restriction_kind(
+        &mut self,
+        restriction_kind: &RestrictionKind,
+        hir_id: HirId,
+        resolving_kind: ResolvingRestrictionKind,
+    ) -> hir::RestrictionKind<'hir> {
+        match restriction_kind {
             RestrictionKind::Unrestricted => hir::RestrictionKind::Unrestricted,
             RestrictionKind::Restricted { path, id, shorthand: _ } => {
                 let res = self.get_partial_res(*id);
+                let parent_module = self.tcx.parent_module(hir_id);
                 if let Some(did) = res.and_then(|res| res.expect_full_res().opt_def_id()) {
-                    hir::RestrictionKind::Restricted(self.arena.alloc(hir::Path {
-                        res: did,
-                        segments: self.arena.alloc_from_iter(path.segments.iter().map(|segment| {
-                            self.lower_path_segment(
-                                path.span,
-                                segment,
-                                ParamMode::Explicit,
-                                GenericArgsMode::Err,
-                                ImplTraitContext::Disallowed(ImplTraitPosition::Path),
-                                None,
-                            )
-                        })),
-                        span: self.lower_span(path.span),
-                    }))
+                    if !self.tcx.is_descendant_of(parent_module, did) {
+                        // If the restriction path is not an ancestor of the item,
+                        // emit an error and recover by lowering the restriction to `Unrestricted`.
+                        self.dcx()
+                            .create_err(RestrictionAncestorOnly {
+                                span: path.span,
+                                kind: resolving_kind,
+                            })
+                            .emit();
+                        hir::RestrictionKind::Unrestricted
+                    } else {
+                        hir::RestrictionKind::Restricted(self.arena.alloc(hir::Path {
+                            res: did,
+                            segments: self.arena.alloc_from_iter(path.segments.iter().map(
+                                |segment| {
+                                    self.lower_path_segment(
+                                        path.span,
+                                        segment,
+                                        ParamMode::Explicit,
+                                        GenericArgsMode::Err,
+                                        ImplTraitContext::Disallowed(ImplTraitPosition::Path),
+                                        None,
+                                    )
+                                },
+                            )),
+                            span: self.lower_span(path.span),
+                        }))
+                    }
                 } else {
                     self.dcx().span_delayed_bug(path.span, "should have errored in resolve");
                     hir::RestrictionKind::Unrestricted
@@ -1827,16 +1850,18 @@ impl<'hir> LoweringContext<'_, 'hir> {
     pub(super) fn lower_impl_restriction(
         &mut self,
         r: &ImplRestriction,
+        hir_id: HirId,
     ) -> &'hir hir::ImplRestriction<'hir> {
-        let kind = self.lower_restriction_kind(&r.kind);
+        let kind = self.lower_restriction_kind(&r.kind, hir_id, ResolvingRestrictionKind::Impl);
         self.arena.alloc(hir::ImplRestriction { kind, span: self.lower_span(r.span) })
     }
 
     pub(super) fn lower_mut_restriction(
         &mut self,
         r: &MutRestriction,
+        hir_id: HirId,
     ) -> &'hir hir::MutRestriction<'hir> {
-        let kind = self.lower_restriction_kind(&r.kind);
+        let kind = self.lower_restriction_kind(&r.kind, hir_id, ResolvingRestrictionKind::Mut);
         self.arena.alloc(hir::MutRestriction { kind, span: self.lower_span(r.span) })
     }
 
