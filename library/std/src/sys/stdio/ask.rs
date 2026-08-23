@@ -59,7 +59,7 @@ impl io::Write for Stderr {
 fn write_log(buf: &[u8]) -> io::Result<usize> {
     match core::str::from_utf8(buf) {
         Ok(s) => {
-            ask_abi::log(s);
+            ask_sys::log(s);
             Ok(buf.len())
         }
         Err(e) => {
@@ -68,7 +68,7 @@ fn write_log(buf: &[u8]) -> io::Result<usize> {
                 return Err(io::const_error!(io::ErrorKind::InvalidData, "stdio: invalid UTF-8"));
             }
             // Safety: `valid` bytes were just reported valid by `from_utf8`.
-            ask_abi::log(unsafe { core::str::from_utf8_unchecked(&buf[..valid]) });
+            ask_sys::log(unsafe { core::str::from_utf8_unchecked(&buf[..valid]) });
             Ok(valid)
         }
     }

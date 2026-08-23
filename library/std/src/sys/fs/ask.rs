@@ -1,5 +1,5 @@
 //! `std::fs` PAL for ask: a blocking `File` bridging onto `askfs`'s
-//! `FS_OP_*` wire protocol (`ask_abi::fs`) over a `SyncChannel`
+//! `FS_OP_*` wire protocol (`ask_io::fs`) over a `SyncChannel`
 //! (`sys::pal::ask::channel`, re-exported as `sys::channel`). One fresh
 //! channel per `File::open` — `askfs`
 //! itself allows only one open handle per accepted session
@@ -28,7 +28,7 @@ use crate::sys::unsupported;
 /// `askme::view::View::decode_startup`.
 fn mount_binding(slot: usize) -> io::Result<(u32, [u8; ask_abi::view::ROOT_TABLE_LEN], u8, u8)> {
     let mut bytes = [0u8; ask_abi::view::LEN];
-    ask_abi::get_startup_view(&mut bytes).map_err(crate::sys::map_ask_error)?;
+    ask_sys::get_startup_view(&mut bytes).map_err(crate::sys::map_ask_error)?;
     let offset = slot * ask_abi::view::BINDING_LEN;
     let bound = *bytes.get(offset + 5).ok_or_else(unsupported_err)?;
     if bound == 0 {
@@ -86,19 +86,19 @@ fn resolve_fs_path(path: &Path) -> io::Result<(u32, heapless_path::PathBuf)> {
 }
 
 /// Tiny fixed path builder — avoids `alloc` in the hot open path while still
-/// fitting `ask_abi::fs::OPEN_PATH_MAX`.
+/// fitting `ask_io::fs::OPEN_PATH_MAX`.
 mod heapless_path {
     use super::*;
 
     pub struct PathBuf {
-        buf: [u8; ask_abi::fs::OPEN_PATH_MAX],
+        buf: [u8; ask_io::fs::OPEN_PATH_MAX],
         len: usize,
     }
 
     impl PathBuf {
         pub fn new() -> Self {
             Self {
-                buf: [0; ask_abi::fs::OPEN_PATH_MAX],
+                buf: [0; ask_io::fs::OPEN_PATH_MAX],
                 len: 0,
             }
         }
@@ -108,7 +108,7 @@ mod heapless_path {
                 .len
                 .checked_add(bytes.len())
                 .ok_or_else(unsupported_err)?;
-            if end > ask_abi::fs::OPEN_PATH_MAX {
+            if end > ask_io::fs::OPEN_PATH_MAX {
                 return Err(unsupported_err());
             }
             self.buf[self.len..end].copy_from_slice(bytes);
@@ -249,16 +249,16 @@ impl OpenOptions {
     fn wire_flags(&self) -> u32 {
         let mut flags = 0;
         if self.create || self.create_new {
-            flags |= ask_abi::fs::OPEN_CREATE;
+            flags |= ask_io::fs::OPEN_CREATE;
         }
         if self.truncate {
-            flags |= ask_abi::fs::OPEN_TRUNCATE;
+            flags |= ask_io::fs::OPEN_TRUNCATE;
         }
         if self.append {
-            flags |= ask_abi::fs::OPEN_APPEND;
+            flags |= ask_io::fs::OPEN_APPEND;
         }
         if self.create_new {
-            flags |= ask_abi::fs::OPEN_EXCL;
+            flags |= ask_io::fs::OPEN_EXCL;
         }
         flags
     }
@@ -296,17 +296,17 @@ impl File {
         let mut channel = SyncChannel::create(provider_pid as u64, 1)
             .map_err(|_| io::const_error!(io::ErrorKind::NotFound, "fs provider unreachable"))?;
 
-        let mut request = [0u8; 4 + ask_abi::fs::OPEN_PATH_MAX];
+        let mut request = [0u8; 4 + ask_io::fs::OPEN_PATH_MAX];
         let payload =
-            ask_abi::fs::encode_fs_open_request(&mut request, opts.wire_flags(), relative.as_bytes())
+            ask_io::fs::encode_fs_open_request(&mut request, opts.wire_flags(), relative.as_bytes())
                 .ok_or_else(unsupported_err)?;
-        let completion = channel.call(ask_abi::fs::OP_OPEN, payload)?;
+        let completion = channel.call(ask_io::fs::OP_OPEN, payload)?;
         if completion.result < 0 {
             return Err(io::const_error!(io::ErrorKind::NotFound, "fs: open failed"));
         }
         let (handle, size) =
-            ask_abi::fs::decode_fs_open_reply(completion.payload()).ok_or_else(unsupported_err)?;
-        if handle == ask_abi::fs::HANDLE_INVALID {
+            ask_io::fs::decode_fs_open_reply(completion.payload()).ok_or_else(unsupported_err)?;
+        if handle == ask_io::fs::HANDLE_INVALID {
             return Err(io::const_error!(io::ErrorKind::NotFound, "fs: open failed"));
         }
 
@@ -337,8 +337,8 @@ impl File {
     pub fn truncate(&self, size: u64) -> io::Result<()> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mut request = [0u8; 12];
-        let payload = ask_abi::fs::encode_fs_ftruncate_request(&mut request, self.handle, size);
-        let completion = inner.channel.call(ask_abi::fs::OP_FTRUNCATE, payload)?;
+        let payload = ask_io::fs::encode_fs_ftruncate_request(&mut request, self.handle, size);
+        let completion = inner.channel.call(ask_io::fs::OP_FTRUNCATE, payload)?;
         map_fs_result(completion.result)?;
         inner.size = size;
         if inner.position > size {
@@ -349,15 +349,15 @@ impl File {
 
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let want = buf.len().min(ask_abi::fs::WRITE_DATA_MAX + 12);
+        let want = buf.len().min(ask_io::fs::WRITE_DATA_MAX + 12);
         let mut request = [0u8; 16];
-        let payload = ask_abi::fs::encode_fs_read_request(
+        let payload = ask_io::fs::encode_fs_read_request(
             &mut request,
             self.handle,
             inner.position,
             want as u32,
         );
-        let completion = inner.channel.call(ask_abi::fs::OP_READ, payload)?;
+        let completion = inner.channel.call(ask_io::fs::OP_READ, payload)?;
         if completion.result < 0 {
             return Err(io::const_error!(io::ErrorKind::Other, "askfs: read failed"));
         }
@@ -382,21 +382,21 @@ impl File {
 
     pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let n = buf.len().min(ask_abi::fs::WRITE_DATA_MAX);
+        let n = buf.len().min(ask_io::fs::WRITE_DATA_MAX);
         // `askfs` always lands an append-mode write at the tree's live EOF,
         // ignoring the declared offset — declaring `size` here (not
         // `position`) matches that server behavior, mirroring
         // `askio::fs::File`'s own append handling.
         let offset = if self.append { inner.size } else { inner.position };
-        let mut request = [0u8; 12 + ask_abi::fs::WRITE_DATA_MAX];
+        let mut request = [0u8; 12 + ask_io::fs::WRITE_DATA_MAX];
         let payload =
-            ask_abi::fs::encode_fs_write_request(&mut request, self.handle, offset, &buf[..n])
+            ask_io::fs::encode_fs_write_request(&mut request, self.handle, offset, &buf[..n])
                 .ok_or_else(unsupported_err)?;
-        let completion = inner.channel.call(ask_abi::fs::OP_WRITE, payload)?;
+        let completion = inner.channel.call(ask_io::fs::OP_WRITE, payload)?;
         if completion.result < 0 {
             return Err(io::const_error!(io::ErrorKind::Other, "askfs: write failed"));
         }
-        let written = ask_abi::fs::decode_fs_handle(completion.payload())
+        let written = ask_io::fs::decode_fs_handle(completion.payload())
             .ok_or_else(unsupported_err)? as usize;
         let written = written.min(n);
         inner.position = offset + written as u64;
@@ -487,9 +487,9 @@ impl File {
 impl Drop for File {
     fn drop(&mut self) {
         let mut request = [0u8; 4];
-        let payload = ask_abi::fs::encode_fs_handle(&mut request, self.handle);
+        let payload = ask_io::fs::encode_fs_handle(&mut request, self.handle);
         let inner = self.inner.get_mut().unwrap_or_else(|e| e.into_inner());
-        let _ = inner.channel.call(ask_abi::fs::OP_CLOSE, payload);
+        let _ = inner.channel.call(ask_io::fs::OP_CLOSE, payload);
     }
 }
 

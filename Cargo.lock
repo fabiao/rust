@@ -7158,6 +7158,10 @@ name = "askabi"
 version = "0.1.0"
 
 [[patch.unused]]
+name = "askchannel-abi"
+version = "0.1.0"
+
+[[patch.unused]]
 name = "askclient"
 version = "0.1.0"
 
@@ -7182,6 +7186,10 @@ name = "askipc"
 version = "0.1.0"
 
 [[patch.unused]]
+name = "askme"
+version = "0.1.0"
+
+[[patch.unused]]
 name = "askposix"
 version = "0.1.0"
 
@@ -7191,6 +7199,14 @@ version = "0.1.0"
 
 [[patch.unused]]
 name = "askposix-memory"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "askpty"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "asksys"
 version = "0.1.0"
 
 [[patch.unused]]
@@ -7230,10 +7246,6 @@ name = "iced"
 version = "0.14.0"
 
 [[patch.unused]]
-name = "askme"
-version = "0.1.0"
-
-[[patch.unused]]
 name = "libcosmic"
 version = "1.0.0"
 
@@ -7244,10 +7256,6 @@ version = "1.2.2"
 [[patch.unused]]
 name = "polling"
 version = "3.11.0"
-
-[[patch.unused]]
-name = "pty"
-version = "0.1.0"
 
 [[patch.unused]]
 name = "smithay"

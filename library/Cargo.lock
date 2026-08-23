@@ -35,13 +35,37 @@ name = "alloctests"
 version = "0.0.0"
 dependencies = [
  "rand",
- "rand_xorshift",
+ "rand_xorshift 0.4.0",
 ]
 
 [[package]]
 name = "askabi"
 version = "0.1.0"
 dependencies = [
+ "askchannel-abi",
+ "rustc-std-workspace-core",
+]
+
+[[package]]
+name = "askchannel-abi"
+version = "0.1.0"
+dependencies = [
+ "rustc-std-workspace-core",
+]
+
+[[package]]
+name = "askio"
+version = "0.1.0"
+dependencies = [
+ "askchannel-abi",
+ "rustc-std-workspace-core",
+]
+
+[[package]]
+name = "asksys"
+version = "0.1.0"
+dependencies = [
+ "askabi",
  "rustc-std-workspace-core",
 ]
 
@@ -80,7 +104,7 @@ name = "coretests"
 version = "0.0.0"
 dependencies = [
  "rand",
- "rand_xorshift",
+ "rand_xorshift 0.4.0",
 ]
 
 [[package]]
@@ -103,9 +127,9 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "fortanix-sgx-abi"
-version = "0.6.1"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5efc85edd5b83e8394f4371dd0da6859dff63dd387dab8568fece6af4cde6f84"
+checksum = "3e467ce7e6e27c53d5ea1c98b4717621a2baf4ddb15d139ae3b642f7fd3a1677"
 dependencies = [
  "rustc-std-workspace-core",
 ]
@@ -202,6 +226,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "object"
+version = "0.40.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd229a0361b9d0d4396176e02d65897f487eebeab7caa6d443855ee152ca0b9c"
+dependencies = [
+ "memchr",
+ "rustc-std-workspace-alloc",
+ "rustc-std-workspace-core",
+]
+
+[[package]]
 name = "panic_abort"
 version = "0.0.0"
 dependencies = [
@@ -261,7 +296,7 @@ version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6db2770f06117d490610c7488547d543617b21bfa07796d7a12f6f1bd53850d1"
 dependencies = [
- "rand_core",
+ "rand_core 0.9.3",
 ]
 
 [[package]]
@@ -271,12 +306,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "99d9a13982dcf210057a8a78572b2217b667c3beacbf3a0d8b454f6f82837d38"
 
 [[package]]
+name = "rand_core"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
+
+[[package]]
 name = "rand_xorshift"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "513962919efc330f829edb2535844d1b912b0fbe2ca165d613e4e8788bb05a5a"
 dependencies = [
- "rand_core",
+ "rand_core 0.9.3",
+]
+
+[[package]]
+name = "rand_xorshift"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60aa6af80be32871323012e02e6e65f8a7cc7890931ae421d217ad8fe0df2ccf"
+dependencies = [
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -332,6 +382,9 @@ dependencies = [
  "addr2line",
  "alloc",
  "askabi",
+ "askchannel-abi",
+ "askio",
+ "asksys",
  "cfg-if",
  "core",
  "dlmalloc",
@@ -341,13 +394,14 @@ dependencies = [
  "libc",
  "miniz_oxide",
  "moto-rt",
- "object",
+ "object 0.39.1",
+ "object 0.40.0",
  "panic_abort",
  "panic_unwind",
  "r-efi",
  "r-efi-alloc",
  "rand",
- "rand_xorshift",
+ "rand_xorshift 0.5.0",
  "rustc-demangle",
  "std_detect",
  "unwind",
@@ -408,9 +462,9 @@ dependencies = [
 
 [[package]]
 name = "vex-sdk"
-version = "0.27.1"
+version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "79e5fe15afde1305478b35e2cb717fff59f485428534cf49cfdbfa4723379bf6"
+checksum = "b95fb7c2b31cb4a3e80b86ea47fc2abf21f8065dfd7d603657c44fb56d21b22d"
 dependencies = [
  "rustc-std-workspace-core",
 ]
@@ -438,9 +492,9 @@ dependencies = [
 
 [[package]]
 name = "wasip3"
-version = "0.6.0+wasi-0.3.0-rc-2026-03-15"
+version = "0.7.1+wasi-0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed83456dd6a0b8581998c0365e4651fa2997e5093b49243b7f35391afaa7a3d9"
+checksum = "75e9ed91ee5a995b6fe16c89d4511a8c12eb76967be20b57557618e02e781bcc"
 dependencies = [
  "rustc-std-workspace-alloc",
  "rustc-std-workspace-core",
@@ -486,11 +540,11 @@ name = "askhid"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "askio"
+name = "askipc"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "askipc"
+name = "askme"
 version = "0.1.0"
 
 [[patch.unused]]
@@ -503,6 +557,10 @@ version = "0.1.0"
 
 [[patch.unused]]
 name = "askposix-memory"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "askpty"
 version = "0.1.0"
 
 [[patch.unused]]
@@ -542,10 +600,6 @@ name = "iced"
 version = "0.14.0"
 
 [[patch.unused]]
-name = "askme"
-version = "0.1.0"
-
-[[patch.unused]]
 name = "libcosmic"
 version = "1.0.0"
 
@@ -556,10 +610,6 @@ version = "1.2.2"
 [[patch.unused]]
 name = "polling"
 version = "3.11.0"
-
-[[patch.unused]]
-name = "pty"
-version = "0.1.0"
 
 [[patch.unused]]
 name = "smithay"

@@ -1,12 +1,12 @@
 //! `SyncChannel`: a blocking, executor-free client over the same SQ/CQ wire
-//! format `askme::channel::Channel` uses (`ask_abi::channel`) — std has no
+//! format `askme::channel::Channel` uses (`ask_channel`) — std has no
 //! `askme` dependency and no async executor, so this reimplements the
-//! submit/complete/pop logic directly against raw `ask_abi::syscall` calls,
+//! submit/complete/pop logic directly against `ask_sys` calls,
 //! spin-parking on the caller's own completion instead of awaiting a
 //! `Future`. Referenced as `sys::pal::ask::channel::SyncChannel` by
 //! `sys/fs/ask.rs` and `sys/net/connection/ask.rs`.
 
-use ask_abi::channel::{
+use ask_channel::{
     CQ_CAPACITY, CQ_ENTRIES_OFFSET, CQ_HEADER_OFFSET, CQ_PAYLOAD_OFFSET, Cqe, LAYOUT_LEN,
     MAX_MSG_LEN, Ring, RingHeader, SQ_CAPACITY, SQ_ENTRIES_OFFSET, SQ_HEADER_OFFSET,
     SQ_PAYLOAD_OFFSET, SharedBufferHeader, Sqe,
@@ -42,7 +42,7 @@ impl Completion {
 
 /// A bidirectional shared-memory channel with a synchronous, spin-park wait
 /// for completions — the std-PAL counterpart to `askme::channel::Channel`,
-/// built directly on `ask_abi::syscall` since std cannot depend on `askme`'s
+/// built directly on `ask_sys` since std cannot depend on `askme`'s
 /// `Future`/executor machinery.
 pub struct SyncChannel {
     base: *mut u8,
@@ -64,7 +64,7 @@ impl SyncChannel {
     /// Establish a channel with `peer_pid` and initialize the ring layout —
     /// the requester side, matching `askme::channel::Channel::create`.
     pub fn create(peer_pid: u64, pages: u64) -> io::Result<Self> {
-        let virt = ask_abi::channel_create(peer_pid, pages).map_err(super::map_ask_error)?;
+        let virt = ask_sys::channel_create(peer_pid, pages).map_err(super::map_ask_error)?;
         let mut ch = Self::attach(virt, peer_pid, pages);
         ch.init();
         Ok(ch)
@@ -74,7 +74,7 @@ impl SyncChannel {
         let base = core::ptr::with_exposed_provenance_mut::<u8>(virt as usize);
         // Safety: offsets are fixed compile-time constants within this
         // channel's own mapped region; both sides compute the identical
-        // layout (`ask_abi::channel`'s shared constants), and `LAYOUT_LEN`
+        // layout (`ask_channel`'s shared constants), and `LAYOUT_LEN`
         // fits the pages the caller requested.
         let sq_header = unsafe { base.add(SQ_HEADER_OFFSET) as *mut RingHeader };
         let sq_entries = unsafe { base.add(SQ_ENTRIES_OFFSET) as *mut Sqe };
@@ -127,7 +127,7 @@ impl SyncChannel {
     /// Push a message onto this channel's SQ and wake the peer, returning
     /// the `user_data` correlating the eventual completion.
     pub fn submit(&mut self, opcode: u32, payload: &[u8]) -> io::Result<u64> {
-        let msg_len = ask_abi::channel::HEADER_LEN + payload.len();
+        let msg_len = ask_channel::HEADER_LEN + payload.len();
         if msg_len > MAX_MSG_LEN {
             return Err(unsupported_err());
         }
@@ -145,7 +145,7 @@ impl SyncChannel {
         self.sq
             .try_push(Sqe::new(seq, opcode, offset as u32, msg_len as u32))
             .map_err(|_| unsupported_err())?;
-        ask_abi::wake(self.peer_pid).map_err(super::map_ask_error)?;
+        ask_sys::wake(self.peer_pid).map_err(super::map_ask_error)?;
         Ok(seq)
     }
 
@@ -227,7 +227,7 @@ impl SyncChannel {
                 // caller's own answer forever.
                 continue;
             }
-            ask_abi::park_timeout(POLL_INTERVAL_MS);
+            ask_sys::park_timeout(POLL_INTERVAL_MS);
         }
     }
 
@@ -250,7 +250,7 @@ impl SyncChannel {
         let Some(timeout) = timeout else {
             return self.wait_for_completion(user_data);
         };
-        let deadline_ms = ask_abi::get_monotonic_ms().saturating_add(timeout.as_millis() as u64);
+        let deadline_ms = ask_sys::get_monotonic_ms().saturating_add(timeout.as_millis() as u64);
         loop {
             if let Some(completion) = self.try_pop_completion()? {
                 if completion.user_data == user_data {
@@ -258,11 +258,11 @@ impl SyncChannel {
                 }
                 continue;
             }
-            let remaining = deadline_ms.saturating_sub(ask_abi::get_monotonic_ms());
+            let remaining = deadline_ms.saturating_sub(ask_sys::get_monotonic_ms());
             if remaining == 0 {
                 return Err(io::const_error!(io::ErrorKind::TimedOut, "ask channel wait timed out"));
             }
-            ask_abi::park_timeout(remaining.min(POLL_INTERVAL_MS));
+            ask_sys::park_timeout(remaining.min(POLL_INTERVAL_MS));
         }
     }
 
@@ -290,7 +290,7 @@ impl Drop for SyncChannel {
     fn drop(&mut self) {
         // Safety: unmaps only pages this process mapped itself via
         // `channel_create`.
-        let _ = ask_abi::revoke(self.base.expose_provenance() as u64, self.pages * 4096);
+        let _ = ask_sys::revoke(self.base.expose_provenance() as u64, self.pages * 4096);
     }
 }
 

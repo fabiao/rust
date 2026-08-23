@@ -28,7 +28,7 @@ pub fn unsupported_err() -> io::Error {
 }
 
 pub fn abort_internal() -> ! {
-    ask_abi::exit(u64::MAX)
+    ask_sys::exit(u64::MAX)
 }
 
 // SAFETY: must be called only once during runtime initialization.
@@ -60,5 +60,5 @@ extern "sysv64" fn _start() -> ! {
     // (docs/02-kernel-abi.md) — every ask process starts with an empty
     // argv, the same posture Motor OS's `motor_start` takes.
     let result = unsafe { main(0, core::ptr::null(), 0) };
-    ask_abi::exit(result as u32 as u64)
+    ask_sys::exit(result as u32 as u64)
 }

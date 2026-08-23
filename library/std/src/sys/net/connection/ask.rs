@@ -1,5 +1,5 @@
 //! `std::net` PAL for ask: blocking `TcpStream`/`TcpListener`/`UdpSocket`
-//! bridging onto `netstack`'s `NET_OP_*` wire protocol (`ask_abi::net`) over
+//! bridging onto `netstack`'s `NET_OP_*` wire protocol (`ask_io::net`) over
 //! one process-wide `SyncChannel` — `netstack` accepts exactly one client
 //! channel for its entire process lifetime (docs/rust-toolchain.md), so
 //! every socket handle in this process multiplexes over the same connection
@@ -24,7 +24,7 @@ static NET_CHANNEL: OnceLock<Mutex<SyncChannel>> = OnceLock::new();
 /// binding, applied to `ask_abi::view`'s separate net-provider block.
 fn net_provider_pid() -> io::Result<u32> {
     let mut bytes = [0u8; ask_abi::view::LEN];
-    ask_abi::get_startup_view(&mut bytes).map_err(map_ask_error)?;
+    ask_sys::get_startup_view(&mut bytes).map_err(map_ask_error)?;
     let offset = ask_abi::view::NET_PROVIDER_OFFSET;
     let present = *bytes.get(offset + 4).ok_or_else(unsupported_err)?;
     if present == 0 {
@@ -41,20 +41,20 @@ fn net_provider_pid() -> io::Result<u32> {
 fn channel() -> io::Result<MutexGuard<'static, SyncChannel>> {
     let cell = NET_CHANNEL.get_or_try_init(|| {
         let provider_pid = net_provider_pid()?;
-        SyncChannel::create(provider_pid as u64, ask_abi::net::CHANNEL_PAGES)
+        SyncChannel::create(provider_pid as u64, ask_io::net::CHANNEL_PAGES)
             .map(Mutex::new)
             .map_err(|_| io::const_error!(io::ErrorKind::NotConnected, "netstack unreachable"))
     })?;
     Ok(cell.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
-fn to_net_endpoint(addr: SocketAddr) -> io::Result<ask_abi::net::NetEndpoint> {
+fn to_net_endpoint(addr: SocketAddr) -> io::Result<ask_io::net::NetEndpoint> {
     match addr {
         SocketAddr::V4(v4) => {
             let mut address = [0u8; 16];
             address[..4].copy_from_slice(&v4.ip().octets());
-            Ok(ask_abi::net::NetEndpoint {
-                family: ask_abi::net::AF_IPV4,
+            Ok(ask_io::net::NetEndpoint {
+                family: ask_io::net::AF_IPV4,
                 port: v4.port(),
                 address,
             })
@@ -63,8 +63,8 @@ fn to_net_endpoint(addr: SocketAddr) -> io::Result<ask_abi::net::NetEndpoint> {
     }
 }
 
-fn from_net_endpoint(endpoint: ask_abi::net::NetEndpoint) -> io::Result<SocketAddr> {
-    if endpoint.family != ask_abi::net::AF_IPV4 {
+fn from_net_endpoint(endpoint: ask_io::net::NetEndpoint) -> io::Result<SocketAddr> {
+    if endpoint.family != ask_io::net::AF_IPV4 {
         return Err(unsupported_err());
     }
     let octets: [u8; 4] = endpoint
@@ -106,18 +106,18 @@ fn socket_call(
 
 fn open_socket(protocol: u8) -> io::Result<u32> {
     let mut request = [0u8; 2];
-    let payload = ask_abi::net::encode_net_socket_request(&mut request, ask_abi::net::AF_IPV4, protocol);
-    let completion = socket_call(ask_abi::net::OP_SOCKET, payload)?;
+    let payload = ask_io::net::encode_net_socket_request(&mut request, ask_io::net::AF_IPV4, protocol);
+    let completion = socket_call(ask_io::net::OP_SOCKET, payload)?;
     if completion.result < 0 {
         return Err(io::const_error!(io::ErrorKind::Other, "netstack: socket failed"));
     }
-    ask_abi::net::decode_net_handle(completion.payload()).ok_or_else(unsupported_err)
+    ask_io::net::decode_net_handle(completion.payload()).ok_or_else(unsupported_err)
 }
 
 fn close_handle(handle: u32) {
     let mut request = [0u8; 4];
-    let payload = ask_abi::net::encode_net_handle(&mut request, handle);
-    let _ = socket_call(ask_abi::net::OP_CLOSE, payload);
+    let payload = ask_io::net::encode_net_handle(&mut request, handle);
+    let _ = socket_call(ask_io::net::OP_CLOSE, payload);
 }
 
 #[derive(Debug)]
@@ -134,13 +134,13 @@ impl TcpStream {
     }
 
     pub fn connect_timeout(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
-        let handle = open_socket(ask_abi::net::PROTO_TCP)?;
+        let handle = open_socket(ask_io::net::PROTO_TCP)?;
         let endpoint = to_net_endpoint(*addr)?;
         let mut request = [0u8; 23];
-        let payload = ask_abi::net::encode_net_endpoint_request(&mut request, handle, endpoint);
+        let payload = ask_io::net::encode_net_endpoint_request(&mut request, handle, endpoint);
         let timeout = if timeout == Duration::MAX { None } else { Some(timeout) };
         let mut guard = channel()?;
-        let completion = call_with_timeout(&mut guard, ask_abi::net::OP_CONNECT, payload, timeout)?;
+        let completion = call_with_timeout(&mut guard, ask_io::net::OP_CONNECT, payload, timeout)?;
         drop(guard);
         if completion.result < 0 {
             close_handle(handle);
@@ -178,18 +178,18 @@ impl TcpStream {
 
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
         let timeout = *self.read_timeout.lock().unwrap_or_else(|e| e.into_inner());
-        let want = (buf.len() as u32).min(ask_abi::net::DATA_LEN);
-        let buffer = ask_abi::net::NetBuffer::new(0, want).ok_or_else(unsupported_err)?;
+        let want = (buf.len() as u32).min(ask_io::net::DATA_LEN);
+        let buffer = ask_io::net::NetBuffer::new(0, want).ok_or_else(unsupported_err)?;
         let mut request = [0u8; 16];
-        let payload = ask_abi::net::encode_net_io_request(&mut request, self.handle, buffer, 0);
+        let payload = ask_io::net::encode_net_io_request(&mut request, self.handle, buffer, 0);
         let mut guard = channel()?;
-        let completion = call_with_timeout(&mut guard, ask_abi::net::OP_RECV, payload, timeout)?;
+        let completion = call_with_timeout(&mut guard, ask_io::net::OP_RECV, payload, timeout)?;
         if completion.result < 0 {
             return Err(io::const_error!(io::ErrorKind::Other, "netstack: recv failed"));
         }
         let n = (completion.result as usize).min(buf.len());
         let data = guard
-            .shared_region_mut(ask_abi::net::DATA_OFFSET as usize, n)
+            .shared_region_mut(ask_io::net::DATA_OFFSET as usize, n)
             .ok_or_else(unsupported_err)?;
         buf[..n].copy_from_slice(data);
         Ok(n)
@@ -209,18 +209,18 @@ impl TcpStream {
 
     pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
         let timeout = *self.write_timeout.lock().unwrap_or_else(|e| e.into_inner());
-        let n = (buf.len() as u32).min(ask_abi::net::DATA_LEN) as usize;
+        let n = (buf.len() as u32).min(ask_io::net::DATA_LEN) as usize;
         let mut guard = channel()?;
         {
             let data = guard
-                .shared_region_mut(ask_abi::net::DATA_OFFSET as usize, n)
+                .shared_region_mut(ask_io::net::DATA_OFFSET as usize, n)
                 .ok_or_else(unsupported_err)?;
             data.copy_from_slice(&buf[..n]);
         }
-        let buffer = ask_abi::net::NetBuffer::new(0, n as u32).ok_or_else(unsupported_err)?;
+        let buffer = ask_io::net::NetBuffer::new(0, n as u32).ok_or_else(unsupported_err)?;
         let mut request = [0u8; 16];
-        let payload = ask_abi::net::encode_net_io_request(&mut request, self.handle, buffer, 0);
-        let completion = call_with_timeout(&mut guard, ask_abi::net::OP_SEND, payload, timeout)?;
+        let payload = ask_io::net::encode_net_io_request(&mut request, self.handle, buffer, 0);
+        let completion = call_with_timeout(&mut guard, ask_io::net::OP_SEND, payload, timeout)?;
         if completion.result < 0 {
             return Err(io::const_error!(io::ErrorKind::Other, "netstack: send failed"));
         }
@@ -245,14 +245,14 @@ impl TcpStream {
 
     pub fn shutdown(&self, shutdown: Shutdown) -> io::Result<()> {
         let direction = match shutdown {
-            Shutdown::Read => ask_abi::net::SHUTDOWN_READ,
-            Shutdown::Write => ask_abi::net::SHUTDOWN_WRITE,
-            Shutdown::Both => ask_abi::net::SHUTDOWN_BOTH,
+            Shutdown::Read => ask_io::net::SHUTDOWN_READ,
+            Shutdown::Write => ask_io::net::SHUTDOWN_WRITE,
+            Shutdown::Both => ask_io::net::SHUTDOWN_BOTH,
         };
         let mut request = [0u8; 8];
         let payload =
-            ask_abi::net::encode_net_handle_value(&mut request, self.handle, direction as u32);
-        let completion = socket_call(ask_abi::net::OP_SHUTDOWN, payload)?;
+            ask_io::net::encode_net_handle_value(&mut request, self.handle, direction as u32);
+        let completion = socket_call(ask_io::net::OP_SHUTDOWN, payload)?;
         if completion.result < 0 {
             return Err(io::const_error!(io::ErrorKind::Other, "netstack: shutdown failed"));
         }
@@ -319,14 +319,14 @@ pub struct TcpListener {
 impl TcpListener {
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<TcpListener> {
         let addr = first_addr(addr)?;
-        let handle = open_socket(ask_abi::net::PROTO_TCP)?;
+        let handle = open_socket(ask_io::net::PROTO_TCP)?;
         let endpoint = to_net_endpoint(addr)?;
         let mut request = [0u8; 23];
-        let payload = ask_abi::net::encode_net_endpoint_request(&mut request, handle, endpoint);
+        let payload = ask_io::net::encode_net_endpoint_request(&mut request, handle, endpoint);
         // `netstack` dispatches `NET_OP_BIND` and `NET_OP_LISTEN` through the
         // same handler (`serve_tcp_listen`), which binds and starts
         // listening in one step — a single `OP_LISTEN` call is both.
-        let listen_completion = socket_call(ask_abi::net::OP_LISTEN, payload)?;
+        let listen_completion = socket_call(ask_io::net::OP_LISTEN, payload)?;
         if listen_completion.result < 0 {
             close_handle(handle);
             return Err(io::const_error!(io::ErrorKind::AddrInUse, "netstack: listen failed"));
@@ -340,13 +340,13 @@ impl TcpListener {
 
     pub fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
         let mut request = [0u8; 4];
-        let payload = ask_abi::net::encode_net_handle(&mut request, self.handle);
-        let completion = socket_call(ask_abi::net::OP_ACCEPT, payload)?;
+        let payload = ask_io::net::encode_net_handle(&mut request, self.handle);
+        let completion = socket_call(ask_io::net::OP_ACCEPT, payload)?;
         if completion.result < 0 {
             return Err(io::const_error!(io::ErrorKind::Other, "netstack: accept failed"));
         }
         let (new_handle, endpoint) =
-            ask_abi::net::decode_net_endpoint_request(completion.payload()).ok_or_else(unsupported_err)?;
+            ask_io::net::decode_net_endpoint_request(completion.payload()).ok_or_else(unsupported_err)?;
         let peer = from_net_endpoint(endpoint)?;
         Ok((
             TcpStream {
@@ -406,11 +406,11 @@ pub struct UdpSocket {
 impl UdpSocket {
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<UdpSocket> {
         let addr = first_addr(addr)?;
-        let handle = open_socket(ask_abi::net::PROTO_UDP)?;
+        let handle = open_socket(ask_io::net::PROTO_UDP)?;
         let endpoint = to_net_endpoint(addr)?;
         let mut request = [0u8; 23];
-        let payload = ask_abi::net::encode_net_endpoint_request(&mut request, handle, endpoint);
-        let completion = socket_call(ask_abi::net::OP_BIND, payload)?;
+        let payload = ask_io::net::encode_net_endpoint_request(&mut request, handle, endpoint);
+        let completion = socket_call(ask_io::net::OP_BIND, payload)?;
         if completion.result < 0 {
             close_handle(handle);
             return Err(io::const_error!(io::ErrorKind::AddrInUse, "netstack: bind failed"));
@@ -437,12 +437,12 @@ impl UdpSocket {
 
     pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         let timeout = *self.read_timeout.lock().unwrap_or_else(|e| e.into_inner());
-        let want = (buf.len() as u32).min(ask_abi::net::DATA_LEN);
-        let buffer = ask_abi::net::NetBuffer::new(0, want).ok_or_else(unsupported_err)?;
+        let want = (buf.len() as u32).min(ask_io::net::DATA_LEN);
+        let buffer = ask_io::net::NetBuffer::new(0, want).ok_or_else(unsupported_err)?;
         let mut request = [0u8; 16];
-        let payload = ask_abi::net::encode_net_io_request(&mut request, self.handle, buffer, 0);
+        let payload = ask_io::net::encode_net_io_request(&mut request, self.handle, buffer, 0);
         let mut guard = channel()?;
-        let completion = call_with_timeout(&mut guard, ask_abi::net::OP_RECV_FROM, payload, timeout)?;
+        let completion = call_with_timeout(&mut guard, ask_io::net::OP_RECV_FROM, payload, timeout)?;
         if completion.result < 0 {
             return Err(io::const_error!(io::ErrorKind::Other, "netstack: recv_from failed"));
         }
@@ -450,12 +450,12 @@ impl UdpSocket {
         // `NetEndpoint` (`netstack`'s `try_udp_recv_from` reply), not a
         // handle-prefixed endpoint request — the byte count travels in
         // `completion.result` instead, matching every other I/O op here.
-        let from = ask_abi::net::decode_net_endpoint(completion.payload())
+        let from = ask_io::net::decode_net_endpoint(completion.payload())
             .ok_or_else(unsupported_err)?;
         let from = from_net_endpoint(from)?;
         let n = (completion.result as usize).min(buf.len());
         let data = guard
-            .shared_region_mut(ask_abi::net::DATA_OFFSET as usize, n)
+            .shared_region_mut(ask_io::net::DATA_OFFSET as usize, n)
             .ok_or_else(unsupported_err)?;
         buf[..n].copy_from_slice(data);
         Ok((n, from))
@@ -467,20 +467,20 @@ impl UdpSocket {
 
     pub fn send_to(&self, buf: &[u8], addr: &SocketAddr) -> io::Result<usize> {
         let timeout = *self.write_timeout.lock().unwrap_or_else(|e| e.into_inner());
-        let n = (buf.len() as u32).min(ask_abi::net::DATA_LEN) as usize;
+        let n = (buf.len() as u32).min(ask_io::net::DATA_LEN) as usize;
         let endpoint = to_net_endpoint(*addr)?;
         let mut guard = channel()?;
         {
             let data = guard
-                .shared_region_mut(ask_abi::net::DATA_OFFSET as usize, n)
+                .shared_region_mut(ask_io::net::DATA_OFFSET as usize, n)
                 .ok_or_else(unsupported_err)?;
             data.copy_from_slice(&buf[..n]);
         }
-        let buffer = ask_abi::net::NetBuffer::new(0, n as u32).ok_or_else(unsupported_err)?;
+        let buffer = ask_io::net::NetBuffer::new(0, n as u32).ok_or_else(unsupported_err)?;
         let mut request = [0u8; 35];
         let payload =
-            ask_abi::net::encode_net_datagram_request(&mut request, self.handle, buffer, 0, endpoint);
-        let completion = call_with_timeout(&mut guard, ask_abi::net::OP_SEND_TO, payload, timeout)?;
+            ask_io::net::encode_net_datagram_request(&mut request, self.handle, buffer, 0, endpoint);
+        let completion = call_with_timeout(&mut guard, ask_io::net::OP_SEND_TO, payload, timeout)?;
         if completion.result < 0 {
             return Err(io::const_error!(io::ErrorKind::Other, "netstack: send_to failed"));
         }
@@ -575,18 +575,18 @@ impl UdpSocket {
 
     pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         let timeout = *self.read_timeout.lock().unwrap_or_else(|e| e.into_inner());
-        let want = (buf.len() as u32).min(ask_abi::net::DATA_LEN);
-        let buffer = ask_abi::net::NetBuffer::new(0, want).ok_or_else(unsupported_err)?;
+        let want = (buf.len() as u32).min(ask_io::net::DATA_LEN);
+        let buffer = ask_io::net::NetBuffer::new(0, want).ok_or_else(unsupported_err)?;
         let mut request = [0u8; 16];
-        let payload = ask_abi::net::encode_net_io_request(&mut request, self.handle, buffer, 0);
+        let payload = ask_io::net::encode_net_io_request(&mut request, self.handle, buffer, 0);
         let mut guard = channel()?;
-        let completion = call_with_timeout(&mut guard, ask_abi::net::OP_RECV, payload, timeout)?;
+        let completion = call_with_timeout(&mut guard, ask_io::net::OP_RECV, payload, timeout)?;
         if completion.result < 0 {
             return Err(io::const_error!(io::ErrorKind::Other, "netstack: recv failed"));
         }
         let n = (completion.result as usize).min(buf.len());
         let data = guard
-            .shared_region_mut(ask_abi::net::DATA_OFFSET as usize, n)
+            .shared_region_mut(ask_io::net::DATA_OFFSET as usize, n)
             .ok_or_else(unsupported_err)?;
         buf[..n].copy_from_slice(data);
         Ok(n)
@@ -598,18 +598,18 @@ impl UdpSocket {
 
     pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
         let timeout = *self.write_timeout.lock().unwrap_or_else(|e| e.into_inner());
-        let n = (buf.len() as u32).min(ask_abi::net::DATA_LEN) as usize;
+        let n = (buf.len() as u32).min(ask_io::net::DATA_LEN) as usize;
         let mut guard = channel()?;
         {
             let data = guard
-                .shared_region_mut(ask_abi::net::DATA_OFFSET as usize, n)
+                .shared_region_mut(ask_io::net::DATA_OFFSET as usize, n)
                 .ok_or_else(unsupported_err)?;
             data.copy_from_slice(&buf[..n]);
         }
-        let buffer = ask_abi::net::NetBuffer::new(0, n as u32).ok_or_else(unsupported_err)?;
+        let buffer = ask_io::net::NetBuffer::new(0, n as u32).ok_or_else(unsupported_err)?;
         let mut request = [0u8; 16];
-        let payload = ask_abi::net::encode_net_io_request(&mut request, self.handle, buffer, 0);
-        let completion = call_with_timeout(&mut guard, ask_abi::net::OP_SEND, payload, timeout)?;
+        let payload = ask_io::net::encode_net_io_request(&mut request, self.handle, buffer, 0);
+        let completion = call_with_timeout(&mut guard, ask_io::net::OP_SEND, payload, timeout)?;
         if completion.result < 0 {
             return Err(io::const_error!(io::ErrorKind::Other, "netstack: send failed"));
         }
@@ -620,8 +620,8 @@ impl UdpSocket {
         let addr = first_addr(addr)?;
         let endpoint = to_net_endpoint(addr)?;
         let mut request = [0u8; 23];
-        let payload = ask_abi::net::encode_net_endpoint_request(&mut request, self.handle, endpoint);
-        let completion = socket_call(ask_abi::net::OP_CONNECT, payload)?;
+        let payload = ask_io::net::encode_net_endpoint_request(&mut request, self.handle, endpoint);
+        let completion = socket_call(ask_io::net::OP_CONNECT, payload)?;
         if completion.result < 0 {
             return Err(io::const_error!(io::ErrorKind::ConnectionRefused, "netstack: connect failed"));
         }

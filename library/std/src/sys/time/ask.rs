@@ -17,7 +17,7 @@ pub const UNIX_EPOCH: SystemTime = SystemTime(Duration::from_secs(0));
 
 impl Instant {
     pub fn now() -> Instant {
-        Instant(Duration::from_millis(ask_abi::get_monotonic_ms()))
+        Instant(Duration::from_millis(ask_sys::get_monotonic_ms()))
     }
 
     pub fn checked_sub_instant(&self, other: &Instant) -> Option<Duration> {
@@ -39,7 +39,7 @@ impl SystemTime {
     pub const MIN: SystemTime = SystemTime(Duration::ZERO);
 
     pub fn now() -> SystemTime {
-        SystemTime(Duration::from_millis(ask_abi::get_wall_time_ms()))
+        SystemTime(Duration::from_millis(ask_sys::get_wall_time_ms()))
     }
 
     pub fn sub_time(&self, other: &SystemTime) -> Result<Duration, Duration> {

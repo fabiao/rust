@@ -50,7 +50,7 @@ impl Thread {
     pub unsafe fn new(stack: usize, init: Box<ThreadInit>) -> io::Result<Thread> {
         let stack_len = align_pages(stack as u64);
         let stack_base = NEXT_STACK.fetch_add(stack_len, core::sync::atomic::Ordering::Relaxed);
-        ask_abi::map(stack_base, stack_len, true, false, ask_abi::APP_FRAME_TOKEN)
+        ask_sys::map(stack_base, stack_len, true, false, ask_abi::APP_FRAME_TOKEN)
             .map_err(map_ask_error)?;
         let stack_top = stack_base + stack_len - 8;
 
@@ -96,18 +96,18 @@ impl Thread {
             // thread's own destructors and free its TLS table directly,
             // mirroring `sys/thread/xous.rs`'s identical call.
             unsafe { crate::sys::thread_local::key::destroy_tls() };
-            ask_abi::exit(0);
+            ask_sys::exit(0);
         }
 
         let entry = (entry_shim as *const ()).expose_provenance() as u64;
-        match ask_abi::spawn_thread(entry, stack_top) {
+        match ask_sys::spawn_thread(entry, stack_top) {
             Ok(tid) => Ok(Thread {
                 tid: tid as u64,
                 stack_base,
                 stack_len,
             }),
             Err(e) => {
-                let _ = ask_abi::revoke(stack_base, stack_len);
+                let _ = ask_sys::revoke(stack_base, stack_len);
                 Err(map_ask_error(e))
             }
         }
@@ -123,13 +123,13 @@ impl Thread {
         // joined thread's own execution context is gone by the time this
         // returns, so reclaiming its stack mapping here (rather than from
         // the thread itself, which cannot unmap its own live stack) is safe.
-        let _ = ask_abi::join_thread(self.tid);
-        let _ = ask_abi::revoke(self.stack_base, self.stack_len);
+        let _ = ask_sys::join_thread(self.tid);
+        let _ = ask_sys::revoke(self.stack_base, self.stack_len);
     }
 }
 
 pub fn yield_now() {
-    ask_abi::yield_now();
+    ask_sys::yield_now();
 }
 
 pub fn sleep(duration: Duration) {
@@ -139,7 +139,7 @@ pub fn sleep(duration: Duration) {
         // An unrepresentable deadline is effectively forever. Park in the
         // largest supported chunks, still permitting explicit wakes.
         loop {
-            ask_abi::park_timeout(u64::MAX);
+            ask_sys::park_timeout(u64::MAX);
         }
     };
 
@@ -151,6 +151,6 @@ pub fn sleep(duration: Duration) {
             .as_millis()
             .saturating_add(u128::from(remaining.subsec_nanos() % 1_000_000 != 0))
             .min(u128::from(u64::MAX)) as u64;
-        ask_abi::park_timeout(millis.max(1));
+        ask_sys::park_timeout(millis.max(1));
     }
 }
