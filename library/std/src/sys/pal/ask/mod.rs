@@ -8,6 +8,7 @@
 #![allow(missing_docs, nonstandard_style)]
 
 pub mod channel;
+pub mod futex;
 
 use crate::io;
 
