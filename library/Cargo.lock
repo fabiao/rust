@@ -542,7 +542,7 @@ name = "iced"
 version = "0.14.0"
 
 [[patch.unused]]
-name = "libask"
+name = "askme"
 version = "0.1.0"
 
 [[patch.unused]]

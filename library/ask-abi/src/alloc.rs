@@ -2,7 +2,7 @@
 //! growable bump allocator over `Map`-backed pages. Bring-up stand-in —
 //! `dealloc` is a no-op (never reclaims) until a real allocator design
 //! replaces it; that's an accepted first-slice limitation, not a hidden one.
-//! Not part of the superproject's canonical `ask-abi/` (kernel/libask side):
+//! Not part of the superproject's canonical `ask-abi/` (kernel/askme side):
 //! this module exists only in the fork's vendored copy, std-PAL-only.
 
 use core::alloc::Layout;
@@ -10,12 +10,12 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::map;
 
-/// Fixed virtual base for the std PAL heap — distinct from `libask::heap`'s
-/// `HEAP_BASE` (`0x0000_3000_...`) so a mixed binary linking both `libask`
-/// and std would never collide; std binaries don't link `libask`, so this
+/// Fixed virtual base for the std PAL heap — distinct from `askme::heap`'s
+/// `HEAP_BASE` (`0x0000_3000_...`) so a mixed binary linking both `askme`
+/// and std would never collide; std binaries don't link `askme`, so this
 /// is precautionary, not load-bearing today.
 const HEAP_BASE: u64 = 0x0000_3800_0000_0000;
-/// Growth step, matching `libask::heap`'s fixed budget.
+/// Growth step, matching `askme::heap`'s fixed budget.
 const CHUNK_LEN: u64 = 64 * 4096;
 
 struct BumpState {

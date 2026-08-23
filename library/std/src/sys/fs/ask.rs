@@ -24,8 +24,8 @@ use crate::sys::time::SystemTime;
 use crate::sys::unsupported;
 
 /// Decode a path mount's provider pid and optional source root from the
-/// startup-view blob — a trimmed, `libask`-free equivalent of
-/// `libask::view::View::decode_startup`.
+/// startup-view blob — a trimmed, `askme`-free equivalent of
+/// `askme::view::View::decode_startup`.
 fn mount_binding(slot: usize) -> io::Result<(u32, [u8; ask_abi::view::ROOT_TABLE_LEN], u8, u8)> {
     let mut bytes = [0u8; ask_abi::view::LEN];
     ask_abi::get_startup_view(&mut bytes).map_err(crate::sys::map_ask_error)?;

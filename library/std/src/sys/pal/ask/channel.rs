@@ -1,6 +1,6 @@
 //! `SyncChannel`: a blocking, executor-free client over the same SQ/CQ wire
-//! format `libask::channel::Channel` uses (`ask_abi::channel`) — std has no
-//! `libask` dependency and no async executor, so this reimplements the
+//! format `askme::channel::Channel` uses (`ask_abi::channel`) — std has no
+//! `askme` dependency and no async executor, so this reimplements the
 //! submit/complete/pop logic directly against raw `ask_abi::syscall` calls,
 //! spin-parking on the caller's own completion instead of awaiting a
 //! `Future`. Referenced as `sys::pal::ask::channel::SyncChannel` by
@@ -41,8 +41,8 @@ impl Completion {
 }
 
 /// A bidirectional shared-memory channel with a synchronous, spin-park wait
-/// for completions — the std-PAL counterpart to `libask::channel::Channel`,
-/// built directly on `ask_abi::syscall` since std cannot depend on `libask`'s
+/// for completions — the std-PAL counterpart to `askme::channel::Channel`,
+/// built directly on `ask_abi::syscall` since std cannot depend on `askme`'s
 /// `Future`/executor machinery.
 pub struct SyncChannel {
     base: *mut u8,
@@ -62,7 +62,7 @@ unsafe impl Send for SyncChannel {}
 
 impl SyncChannel {
     /// Establish a channel with `peer_pid` and initialize the ring layout —
-    /// the requester side, matching `libask::channel::Channel::create`.
+    /// the requester side, matching `askme::channel::Channel::create`.
     pub fn create(peer_pid: u64, pages: u64) -> io::Result<Self> {
         let virt = ask_abi::channel_create(peer_pid, pages).map_err(super::map_ask_error)?;
         let mut ch = Self::attach(virt, peer_pid, pages);
@@ -95,7 +95,7 @@ impl SyncChannel {
 
     /// Only the creator initializes the ring headers, before the peer's
     /// `ChannelAccept` can observe the memory — mirrors
-    /// `libask::channel::Channel::init`.
+    /// `askme::channel::Channel::init`.
     fn init(&mut self) {
         // Safety: called only from `create`, before the peer attaches —
         // exclusive access to the whole region at this point.

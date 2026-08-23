@@ -20,7 +20,7 @@ use crate::time::Duration;
 static NET_CHANNEL: OnceLock<Mutex<SyncChannel>> = OnceLock::new();
 
 /// Decode the `net:` provider's pid out of the raw startup-view blob — the
-/// same trimmed, `libask`-free approach `sys/fs/ask.rs` uses for its `/out`
+/// same trimmed, `askme`-free approach `sys/fs/ask.rs` uses for its `/out`
 /// binding, applied to `ask_abi::view`'s separate net-provider block.
 fn net_provider_pid() -> io::Result<u32> {
     let mut bytes = [0u8; ask_abi::view::LEN];

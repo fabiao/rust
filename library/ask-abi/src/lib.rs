@@ -1,12 +1,12 @@
 //! Raw syscall ABI (docs/02-kernel-abi.md): id in `rax`, args in
 //! `rdi`/`rsi`/`rdx`/`r10`/`r8`/`r9`, result in `rax`. The dependency-free
-//! surface both `libask` and the std PAL (`sys/ask`) build on.
+//! surface both `askme` and the std PAL (`sys/ask`) build on.
 //! Details: docs/src/ask-abi/src/lib.md.
 #![no_std]
 
 /// std-PAL-only addition (`sys/alloc/ask.rs`'s backing allocator) — not
 /// present in the superproject's canonical `ask-abi/` crate, which the
-/// kernel and `libask` (already `linked_list_allocator`-backed) also
+/// kernel and `askme` (already `linked_list_allocator`-backed) also
 /// depend on and which this module has no place in.
 pub mod alloc;
 
@@ -124,7 +124,7 @@ unsafe fn syscall4(id: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
 }
 
 /// `Log(ptr, len)`: print a UTF-8 string, clamped to `LOG_MAX`. Prefer
-/// `libask`'s `logln!` (or the std PAL's stdout) over calling this directly.
+/// `askme`'s `logln!` (or the std PAL's stdout) over calling this directly.
 pub fn log(msg: &str) {
     // Clamp on a char boundary — slicing a multi-byte char in half would
     // itself panic.
@@ -148,8 +148,8 @@ pub fn exit(code: u64) -> ! {
 }
 
 /// `SpawnRaw(block_ptr, block_len)`: spawn from a binary capability block.
-/// Untyped here — the `CapabilityBlock` struct is `libask`'s; use
-/// `libask::syscall::spawn_raw` instead of calling this directly.
+/// Untyped here — the `CapabilityBlock` struct is `askme`'s; use
+/// `askme::syscall::spawn_raw` instead of calling this directly.
 /// # Safety
 /// `[block_ptr, block_ptr+block_len)` must be a valid, live capability
 /// block the kernel can read synchronously during the call.
@@ -287,7 +287,7 @@ pub fn get_parent_pid() -> usize {
 }
 
 /// `GetPid()`: this process's own pid, straight from Ring 0 on every call.
-/// `libask::syscall::get_pid` memoizes this; a std PAL caches it its own way.
+/// `askme::syscall::get_pid` memoizes this; a std PAL caches it its own way.
 pub fn get_pid_uncached() -> usize {
     // Safety: `GetPid` takes no pointer arguments and cannot fail.
     unsafe { syscall2(SYS_GET_PID, 0, 0) as usize }
