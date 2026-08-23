@@ -81,9 +81,8 @@ moto-rt = { version = "0.16", features = ['rustc-dep-of-std'], public = true }
 ask_abi = { package = "askabi", path = "../../../../../core/libs/askabi/source", features = [
     "rustc-dep-of-std",
 ], public = true }
-ask_channel = { package = "askchannel-abi", path = "../../../../../core/libs/askchannel-abi/source", features = [
+ask_ipc = { package = "askipc", path = "../../../../../core/libs/askipc/source", features = [
     "rustc-dep-of-std",
-    "userspace",
 ], public = true }
 ask_io = { package = "askio", path = "../../../../../core/libs/askio/source", features = [
     "rustc-dep-of-std",

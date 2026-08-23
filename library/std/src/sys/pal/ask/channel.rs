@@ -1,12 +1,12 @@
 //! `SyncChannel`: a blocking, executor-free client over the same SQ/CQ wire
-//! format `askme::channel::Channel` uses (`ask_channel`) — std has no
+//! format `askme::channel::Channel` uses (`ask_ipc`) — std has no
 //! `askme` dependency and no async executor, so this reimplements the
 //! submit/complete/pop logic directly against `ask_sys` calls,
 //! spin-parking on the caller's own completion instead of awaiting a
 //! `Future`. Referenced as `sys::pal::ask::channel::SyncChannel` by
 //! `sys/fs/ask.rs` and `sys/net/connection/ask.rs`.
 
-use ask_channel::{
+use ask_ipc::channel::{
     CQ_CAPACITY, CQ_ENTRIES_OFFSET, CQ_HEADER_OFFSET, CQ_PAYLOAD_OFFSET, Cqe, LAYOUT_LEN,
     MAX_MSG_LEN, Ring, RingHeader, SQ_CAPACITY, SQ_ENTRIES_OFFSET, SQ_HEADER_OFFSET,
     SQ_PAYLOAD_OFFSET, SharedBufferHeader, Sqe,
@@ -74,7 +74,7 @@ impl SyncChannel {
         let base = core::ptr::with_exposed_provenance_mut::<u8>(virt as usize);
         // Safety: offsets are fixed compile-time constants within this
         // channel's own mapped region; both sides compute the identical
-        // layout (`ask_channel`'s shared constants), and `LAYOUT_LEN`
+        // layout (`ask_ipc::channel`'s shared constants), and `LAYOUT_LEN`
         // fits the pages the caller requested.
         let sq_header = unsafe { base.add(SQ_HEADER_OFFSET) as *mut RingHeader };
         let sq_entries = unsafe { base.add(SQ_ENTRIES_OFFSET) as *mut Sqe };
@@ -127,7 +127,7 @@ impl SyncChannel {
     /// Push a message onto this channel's SQ and wake the peer, returning
     /// the `user_data` correlating the eventual completion.
     pub fn submit(&mut self, opcode: u32, payload: &[u8]) -> io::Result<u64> {
-        let msg_len = ask_channel::HEADER_LEN + payload.len();
+        let msg_len = ask_ipc::channel::HEADER_LEN + payload.len();
         if msg_len > MAX_MSG_LEN {
             return Err(unsupported_err());
         }

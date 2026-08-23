@@ -42,14 +42,6 @@ dependencies = [
 name = "askabi"
 version = "0.1.0"
 dependencies = [
- "askchannel-abi",
- "rustc-std-workspace-core",
-]
-
-[[package]]
-name = "askchannel-abi"
-version = "0.1.0"
-dependencies = [
  "rustc-std-workspace-core",
 ]
 
@@ -57,7 +49,16 @@ dependencies = [
 name = "askio"
 version = "0.1.0"
 dependencies = [
- "askchannel-abi",
+ "askabi",
+ "rustc-std-workspace-core",
+]
+
+[[package]]
+name = "askipc"
+version = "0.1.0"
+dependencies = [
+ "askabi",
+ "asksys",
  "rustc-std-workspace-core",
 ]
 
@@ -382,8 +383,8 @@ dependencies = [
  "addr2line",
  "alloc",
  "askabi",
- "askchannel-abi",
  "askio",
+ "askipc",
  "asksys",
  "cfg-if",
  "core",
@@ -537,10 +538,6 @@ version = "0.1.0"
 
 [[patch.unused]]
 name = "askhid"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "askipc"
 version = "0.1.0"
 
 [[patch.unused]]

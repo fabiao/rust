@@ -7158,10 +7158,6 @@ name = "askabi"
 version = "0.1.0"
 
 [[patch.unused]]
-name = "askchannel-abi"
-version = "0.1.0"
-
-[[patch.unused]]
 name = "askclient"
 version = "0.1.0"
 
