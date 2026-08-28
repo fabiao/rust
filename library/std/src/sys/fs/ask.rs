@@ -159,42 +159,98 @@ impl FileType {
         !self.is_dir
     }
 
+    /// `askfs` exposes no symlink type bit in `FsStat.mode`, and `OP_SYMLINK`
+    /// targets are resolved provider-side, so no path reaches this PAL as a
+    /// link (docs/vfs-layout.md).
     pub fn is_symlink(&self) -> bool {
         false
     }
 }
 
-/// `askfs` reports only a file size in `FS_OP_OPEN`'s reply — no
-/// permissions/timestamps/type byte exist on the wire yet
-/// (docs/vfs-layout.md). Every open target is reported as a regular,
-/// writable file; `askfs` has no directory-open path for `std::fs::File` to
-/// observe as `FileType::is_dir()` in the first place.
+/// A path-addressed `FS_OP_STAT` reply, or the size-only projection an open
+/// `File` can answer from `FS_OP_OPEN`. `askfs` carries no creation
+/// timestamp, so `created()` stays unsupported while `modified()`/`accessed()`
+/// resolve whenever the attributes came from `stat` (docs/vfs-layout.md).
 #[derive(Clone)]
 pub struct FileAttr {
     size: u64,
+    mode: u32,
+    is_dir: bool,
+    /// `None` for the open-handle projection, which has no timestamps on the
+    /// wire; `Some` once `FS_OP_STAT` supplied them.
+    times: Option<FileStatTimes>,
+}
+
+#[derive(Copy, Clone)]
+struct FileStatTimes {
+    accessed_sec: i64,
+    modified_sec: i64,
+}
+
+/// `FsStat.mode`'s owner-write bit. `askfs` masks the POSIX permission bits
+/// server-side, so readonly is decided by the same bit `FS_OP_FCHMOD` sets.
+const MODE_OWNER_WRITE: u32 = 0o200;
+
+/// Permission bits requested for a `DirBuilder`-created directory: owner
+/// read/write/execute plus group and other read/execute, matching the POSIX
+/// `0777 & ~umask` default shells expect. `askfs` applies its own mask.
+const DEFAULT_DIR_MODE: u32 = 0o755;
+
+/// `FsStat` timestamps are signed seconds from the Unix epoch; `SystemTime`
+/// is an unsigned offset from it, so a pre-epoch stamp subtracts instead.
+fn system_time_from_secs(secs: i64) -> SystemTime {
+    let magnitude = crate::time::Duration::from_secs(secs.unsigned_abs());
+    let shifted = if secs < 0 {
+        crate::sys::time::UNIX_EPOCH.checked_sub_duration(&magnitude)
+    } else {
+        crate::sys::time::UNIX_EPOCH.checked_add_duration(&magnitude)
+    };
+    shifted.unwrap_or(crate::sys::time::UNIX_EPOCH)
 }
 
 impl FileAttr {
+    fn from_stat(stat: ask_io::fs::FsStat) -> FileAttr {
+        FileAttr {
+            size: stat.size,
+            mode: stat.mode,
+            is_dir: stat.mode & ask_io::fs::MODE_DIR != 0,
+            times: Some(FileStatTimes {
+                accessed_sec: stat.atime_sec,
+                modified_sec: stat.mtime_sec,
+            }),
+        }
+    }
+
     pub fn size(&self) -> u64 {
         self.size
     }
 
     pub fn perm(&self) -> FilePermissions {
-        FilePermissions { readonly: false }
+        FilePermissions {
+            readonly: self.mode & MODE_OWNER_WRITE == 0,
+        }
     }
 
     pub fn file_type(&self) -> FileType {
-        FileType { is_dir: false }
+        FileType {
+            is_dir: self.is_dir,
+        }
     }
 
     pub fn modified(&self) -> io::Result<SystemTime> {
-        unsupported()
+        self.times
+            .map(|t| system_time_from_secs(t.modified_sec))
+            .ok_or_else(unsupported_err)
     }
 
     pub fn accessed(&self) -> io::Result<SystemTime> {
-        unsupported()
+        self.times
+            .map(|t| system_time_from_secs(t.accessed_sec))
+            .ok_or_else(unsupported_err)
     }
 
+    /// `askfs` stores a change time, not a creation time, so no value here
+    /// would satisfy `std`'s "created" contract.
     pub fn created(&self) -> io::Result<SystemTime> {
         unsupported()
     }
@@ -290,6 +346,65 @@ fn map_fs_result(result: i32) -> io::Result<()> {
     if result < 0 { Err(unsupported_err()) } else { Ok(()) }
 }
 
+/// `OP_STAT`/`OP_UNLINK`-shaped requests carry bare path bytes; every one is
+/// bounded by `STAT_PATH_MAX` rather than `OPEN_PATH_MAX`.
+fn bounded_path(path: &[u8]) -> io::Result<&[u8]> {
+    if path.len() > ask_io::fs::STAT_PATH_MAX {
+        return Err(unsupported_err());
+    }
+    Ok(path)
+}
+
+/// One path-addressed round trip. `askfs`'s stateless metadata operations
+/// (`FS_OP_STAT`, `MKDIR`, `UNLINK`, `RENAME`, `READDIR`, ...) need no open
+/// handle, but each still requires its own accepted session, since a session
+/// admits one handle at a time (`MAX_OPEN_HANDLES = 1`).
+fn metadata_call<T>(
+    provider_pid: u32,
+    op: u32,
+    payload: &[u8],
+    not_found: &'static str,
+    decode: impl FnOnce(&[u8]) -> Option<T>,
+) -> io::Result<T> {
+    let mut channel = SyncChannel::create(provider_pid as u64, 1)
+        .map_err(|_| io::const_error!(io::ErrorKind::NotFound, "fs provider unreachable"))?;
+    let completion = channel.call(op, payload)?;
+    if completion.result < 0 {
+        return Err(io::Error::new(io::ErrorKind::NotFound, not_found));
+    }
+    decode(completion.payload()).ok_or_else(unsupported_err)
+}
+
+/// A metadata round trip whose reply carries no payload beyond its result.
+fn metadata_unit(
+    provider_pid: u32,
+    op: u32,
+    payload: &[u8],
+    failure: &'static str,
+) -> io::Result<()> {
+    let mut channel = SyncChannel::create(provider_pid as u64, 1)
+        .map_err(|_| io::const_error!(io::ErrorKind::NotFound, "fs provider unreachable"))?;
+    let completion = channel.call(op, payload)?;
+    if completion.result < 0 {
+        return Err(io::Error::new(io::ErrorKind::NotFound, failure));
+    }
+    Ok(())
+}
+
+/// Shared by `stat` and `lstat` — `askfs` resolves symlinks provider-side and
+/// exposes no nofollow variant, so both spellings observe the same target.
+fn stat_path(path: &Path) -> io::Result<FileAttr> {
+    let (provider_pid, relative) = resolve_fs_path(path)?;
+    let payload = bounded_path(relative.as_bytes())?;
+    metadata_call(
+        provider_pid,
+        ask_io::fs::OP_STAT,
+        payload,
+        "fs: stat failed",
+        |reply| ask_io::fs::decode_fs_stat_reply(reply).map(FileAttr::from_stat),
+    )
+}
+
 impl File {
     pub fn open(path: &Path, opts: &OpenOptions) -> io::Result<File> {
         let (provider_pid, relative) = resolve_fs_path(path)?;
@@ -321,9 +436,17 @@ impl File {
         })
     }
 
+    /// The open handle carries only the size `FS_OP_OPEN` returned; `askfs`
+    /// has no handle-addressed stat, and reopening a path-addressed
+    /// `FS_OP_STAT` session here would race the caller's own writes.
     pub fn file_attr(&self) -> io::Result<FileAttr> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(FileAttr { size: inner.size })
+        Ok(FileAttr {
+            size: inner.size,
+            mode: MODE_OWNER_WRITE,
+            is_dir: false,
+            times: None,
+        })
     }
 
     pub fn fsync(&self) -> io::Result<()> {
@@ -349,7 +472,7 @@ impl File {
 
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let want = buf.len().min(ask_io::fs::WRITE_DATA_MAX + 12);
+        let want = buf.len().min(ask_io::fs::READ_DATA_MAX);
         let mut request = [0u8; 16];
         let payload = ask_io::fs::encode_fs_read_request(
             &mut request,
@@ -507,16 +630,44 @@ impl DirBuilder {
         DirBuilder {}
     }
 
-    pub fn mkdir(&self, _path: &Path) -> io::Result<()> {
-        unsupported()
+    /// `askfs` masks the mode to its permission bits server-side; `std`'s
+    /// `DirBuilder` exposes no mode on this target, so request the usual
+    /// owner-writable directory permissions.
+    pub fn mkdir(&self, path: &Path) -> io::Result<()> {
+        let (provider_pid, relative) = resolve_fs_path(path)?;
+        let mut request = [0u8; 4 + ask_io::fs::STAT_PATH_MAX];
+        let payload = ask_io::fs::encode_fs_mkdir_request(
+            &mut request,
+            DEFAULT_DIR_MODE,
+            relative.as_bytes(),
+        )
+        .ok_or_else(unsupported_err)?;
+        metadata_unit(
+            provider_pid,
+            ask_io::fs::OP_MKDIR,
+            payload,
+            "fs: mkdir failed",
+        )
     }
 }
 
-pub struct ReadDir(!);
+/// `FS_OP_READDIR` is stateless and cursor-addressed: each call names the
+/// directory path and a 0-based index, so the iterator holds the caller's
+/// path and its next cursor rather than a server-side open handle.
+pub struct ReadDir {
+    provider_pid: u32,
+    relative: heapless_path::PathBuf,
+    /// The `/mount/...` spelling the caller passed, so `DirEntry::path()` can
+    /// return a path in the caller's own namespace rather than a
+    /// provider-relative one.
+    root: PathBuf,
+    cursor: u32,
+    exhausted: bool,
+}
 
 impl crate::fmt::Debug for ReadDir {
-    fn fmt(&self, _f: &mut crate::fmt::Formatter<'_>) -> crate::fmt::Result {
-        self.0
+    fn fmt(&self, f: &mut crate::fmt::Formatter<'_>) -> crate::fmt::Result {
+        f.debug_struct("ReadDir").field("root", &self.root).finish()
     }
 }
 
@@ -524,48 +675,168 @@ impl Iterator for ReadDir {
     type Item = io::Result<DirEntry>;
 
     fn next(&mut self) -> Option<io::Result<DirEntry>> {
-        self.0
+        if self.exhausted {
+            return None;
+        }
+        let mut request = [0u8; 4 + ask_io::fs::STAT_PATH_MAX];
+        let payload = match ask_io::fs::encode_fs_readdir_request(
+            &mut request,
+            self.cursor,
+            self.relative.as_bytes(),
+        ) {
+            Some(payload) => payload,
+            None => {
+                self.exhausted = true;
+                return Some(Err(unsupported_err()));
+            }
+        };
+
+        let mut channel = match SyncChannel::create(self.provider_pid as u64, 1) {
+            Ok(channel) => channel,
+            Err(_) => {
+                self.exhausted = true;
+                return Some(Err(io::const_error!(
+                    io::ErrorKind::NotFound,
+                    "fs provider unreachable"
+                )));
+            }
+        };
+        let completion = match channel.call(ask_io::fs::OP_READDIR, payload) {
+            Ok(completion) => completion,
+            Err(e) => {
+                self.exhausted = true;
+                return Some(Err(e));
+            }
+        };
+        // A negative result is this provider's end-of-directory signal as well
+        // as its error channel; `askfs` reports the cursor running past the
+        // last child the same way, so stop rather than surfacing an error.
+        if completion.result < 0 {
+            self.exhausted = true;
+            return None;
+        }
+        let (_, d_type, name) = match ask_io::fs::decode_fs_readdir_reply(completion.payload()) {
+            Some(entry) => entry,
+            None => {
+                self.exhausted = true;
+                return Some(Err(unsupported_err()));
+            }
+        };
+        self.cursor = self.cursor.saturating_add(1);
+
+        let name = match crate::str::from_utf8(name) {
+            Ok(name) => name,
+            Err(_) => {
+                self.exhausted = true;
+                return Some(Err(unsupported_err()));
+            }
+        };
+        Some(Ok(DirEntry {
+            path: self.root.join(name),
+            name: OsString::from(name),
+            is_dir: d_type == ask_io::fs::DT_DIR,
+        }))
     }
 }
 
-pub struct DirEntry(!);
+pub struct DirEntry {
+    path: PathBuf,
+    name: OsString,
+    is_dir: bool,
+}
 
 impl DirEntry {
     pub fn path(&self) -> PathBuf {
-        self.0
+        self.path.clone()
     }
 
     pub fn file_name(&self) -> OsString {
-        self.0
+        self.name.clone()
     }
 
+    /// `FS_OP_READDIR` carries only the entry's type byte, so a full
+    /// attribute set needs its own path-addressed `FS_OP_STAT`.
     pub fn metadata(&self) -> io::Result<FileAttr> {
-        self.0
+        stat_path(&self.path)
     }
 
     pub fn file_type(&self) -> io::Result<FileType> {
-        self.0
+        Ok(FileType {
+            is_dir: self.is_dir,
+        })
     }
 }
 
-pub fn readdir(_path: &Path) -> io::Result<ReadDir> {
-    unsupported()
+pub fn readdir(path: &Path) -> io::Result<ReadDir> {
+    let (provider_pid, relative) = resolve_fs_path(path)?;
+    Ok(ReadDir {
+        provider_pid,
+        relative,
+        root: path.to_path_buf(),
+        cursor: 0,
+        exhausted: false,
+    })
 }
 
-pub fn unlink(_path: &Path) -> io::Result<()> {
-    unsupported()
+pub fn unlink(path: &Path) -> io::Result<()> {
+    let (provider_pid, relative) = resolve_fs_path(path)?;
+    let payload = bounded_path(relative.as_bytes())?;
+    metadata_unit(
+        provider_pid,
+        ask_io::fs::OP_UNLINK,
+        payload,
+        "fs: unlink failed",
+    )
 }
 
-pub fn rename(_old: &Path, _new: &Path) -> io::Result<()> {
-    unsupported()
+pub fn rename(old: &Path, new: &Path) -> io::Result<()> {
+    let (old_provider, old_relative) = resolve_fs_path(old)?;
+    let (new_provider, new_relative) = resolve_fs_path(new)?;
+    // `FS_OP_RENAME` is one provider's own directory operation; a move across
+    // two mounts would need a copy plus unlink, which is the caller's policy
+    // to choose, not this PAL's.
+    if old_provider != new_provider {
+        return Err(io::const_error!(
+            io::ErrorKind::CrossesDevices,
+            "fs: rename across providers"
+        ));
+    }
+    let mut request = [0u8; ask_io::fs::RENAME_REQUEST_MAX];
+    let payload = ask_io::fs::encode_fs_rename_request(
+        &mut request,
+        old_relative.as_bytes(),
+        new_relative.as_bytes(),
+    )
+    .ok_or_else(unsupported_err)?;
+    metadata_unit(
+        old_provider,
+        ask_io::fs::OP_RENAME,
+        payload,
+        "fs: rename failed",
+    )
 }
 
-pub fn rmdir(_path: &Path) -> io::Result<()> {
-    unsupported()
+/// `askfs` removes an empty directory through the same `FS_OP_UNLINK` entry
+/// point it uses for files, rejecting a non-empty target provider-side.
+pub fn rmdir(path: &Path) -> io::Result<()> {
+    unlink(path)
 }
 
-pub fn remove_dir_all(_path: &Path) -> io::Result<()> {
-    unsupported()
+/// `askfs` has no recursive-remove operation, so this walks the tree with
+/// `FS_OP_READDIR` and removes depth-first. Each level's entries are read to
+/// completion before descending, since a session admits one operation at a
+/// time and holding an open cursor across the child's own removals would
+/// deadlock against that bound.
+pub fn remove_dir_all(path: &Path) -> io::Result<()> {
+    for entry in readdir(path)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            remove_dir_all(&entry.path())?;
+        } else {
+            unlink(&entry.path())?;
+        }
+    }
+    rmdir(path)
 }
 
 pub fn exists(path: &Path) -> io::Result<bool> {
@@ -590,12 +861,12 @@ pub fn link(_src: &Path, _dst: &Path) -> io::Result<()> {
     unsupported()
 }
 
-pub fn stat(_path: &Path) -> io::Result<FileAttr> {
-    unsupported()
+pub fn stat(path: &Path) -> io::Result<FileAttr> {
+    stat_path(path)
 }
 
-pub fn lstat(_path: &Path) -> io::Result<FileAttr> {
-    unsupported()
+pub fn lstat(path: &Path) -> io::Result<FileAttr> {
+    stat_path(path)
 }
 
 pub fn set_perm(_path: &Path, _perm: FilePermissions) -> io::Result<()> {

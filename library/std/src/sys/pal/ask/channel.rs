@@ -47,7 +47,7 @@ impl Completion {
 pub struct SyncChannel {
     base: *mut u8,
     pages: u64,
-    peer_pid: u64,
+    peer_pid: PeerIdentity,
     sq: Ring<Sqe, SQ_CAPACITY>,
     cq: Ring<Cqe, CQ_CAPACITY>,
     next_sq_seq: u64,
@@ -60,17 +60,37 @@ pub struct SyncChannel {
 /// inside prevent the compiler from inferring `Send` on their own.
 unsafe impl Send for SyncChannel {}
 
+/// How this endpoint names its peer when waking it. A channel opened by pid
+/// wakes that pid directly; a generation-bound lease has no pid to name, so
+/// the kernel resolves the peer from the mapping instead.
+#[derive(Copy, Clone)]
+enum PeerIdentity {
+    Pid(u64),
+    Leased,
+}
+
 impl SyncChannel {
     /// Establish a channel with `peer_pid` and initialize the ring layout —
     /// the requester side, matching `askme::channel::Channel::create`.
     pub fn create(peer_pid: u64, pages: u64) -> io::Result<Self> {
         let virt = ask_sys::channel_create(peer_pid, pages).map_err(super::map_ask_error)?;
-        let mut ch = Self::attach(virt, peer_pid, pages);
+        let mut ch = Self::attach(virt, PeerIdentity::Pid(peer_pid), pages);
         ch.init();
         Ok(ch)
     }
 
-    fn attach(virt: u64, peer_pid: u64, pages: u64) -> Self {
+    /// Establish through an opaque, generation-bound Channel capability
+    /// installed at `token` — the startup-resource form used for a
+    /// controlling terminal, matching `askme`'s `*_leased` constructors. The
+    /// kernel resolves the peer, so no pid is named here.
+    pub fn create_leased(token: u32, pages: u64) -> io::Result<Self> {
+        let virt = ask_sys::channel_create_leased(token, pages).map_err(super::map_ask_error)?;
+        let mut ch = Self::attach(virt, PeerIdentity::Leased, pages);
+        ch.init();
+        Ok(ch)
+    }
+
+    fn attach(virt: u64, peer_pid: PeerIdentity, pages: u64) -> Self {
         let base = core::ptr::with_exposed_provenance_mut::<u8>(virt as usize);
         // Safety: offsets are fixed compile-time constants within this
         // channel's own mapped region; both sides compute the identical
@@ -145,7 +165,13 @@ impl SyncChannel {
         self.sq
             .try_push(Sqe::new(seq, opcode, offset as u32, msg_len as u32))
             .map_err(|_| unsupported_err())?;
-        ask_sys::wake(self.peer_pid).map_err(super::map_ask_error)?;
+        match self.peer_pid {
+            PeerIdentity::Pid(pid) => ask_sys::wake(pid),
+            // The kernel resolves a leased channel's peer from the mapping,
+            // preserving the provider-identity opacity the lease exists for.
+            PeerIdentity::Leased => ask_sys::wake_channel_peer(self.base.addr() as u64),
+        }
+        .map_err(super::map_ask_error)?;
         Ok(seq)
     }
 

@@ -7182,6 +7182,10 @@ name = "askipc"
 version = "0.1.0"
 
 [[patch.unused]]
+name = "askmanifest"
+version = "0.1.0"
+
+[[patch.unused]]
 name = "askme"
 version = "0.1.0"
 
