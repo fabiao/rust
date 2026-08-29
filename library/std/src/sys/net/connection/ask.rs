@@ -55,6 +55,26 @@ fn to_net_endpoint(addr: SocketAddr) -> io::Result<ask_io::net::NetEndpoint> {
     }
 }
 
+fn lookup_socket_addr(endpoint: ask_io::net::NetEndpoint) -> io::Result<SocketAddr> {
+    match endpoint.family {
+        ask_io::net::AF_IPV4 => {
+            let octets: [u8; 4] = endpoint
+                .address
+                .get(..4)
+                .and_then(|bytes| bytes.try_into().ok())
+                .ok_or_else(unsupported_err)?;
+            Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(octets), endpoint.port)))
+        }
+        ask_io::net::AF_IPV6 => Ok(SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::from(endpoint.address),
+            endpoint.port,
+            0,
+            0,
+        ))),
+        _ => Err(unsupported_err()),
+    }
+}
+
 fn from_net_endpoint(endpoint: ask_io::net::NetEndpoint) -> io::Result<SocketAddr> {
     if endpoint.family != ask_io::net::AF_IPV4 {
         return Err(unsupported_err());
@@ -660,20 +680,12 @@ impl<'a> TryFrom<(&'a str, u16)> for LookupHost {
     type Error = io::Error;
 
     fn try_from((host, port): (&'a str, u16)) -> io::Result<LookupHost> {
-        if let Ok(v4) = host.parse::<Ipv4Addr>() {
-            return Ok(LookupHost {
-                addr: Some(SocketAddr::V4(SocketAddrV4::new(v4, port))),
-            });
-        }
-        if let Ok(v6) = host.parse::<Ipv6Addr>() {
-            return Ok(LookupHost {
-                addr: Some(SocketAddr::V6(SocketAddrV6::new(v6, port, 0, 0))),
-            });
-        }
-        Err(io::const_error!(
-            io::ErrorKind::InvalidInput,
-            "no DNS resolver on ask"
-        ))
+        let endpoint = ask_io::net::endpoint_from_host_port(host, port).ok_or_else(|| {
+            io::const_error!(io::ErrorKind::InvalidInput, "no DNS resolver on ask")
+        })?;
+        Ok(LookupHost {
+            addr: Some(lookup_socket_addr(endpoint)?),
+        })
     }
 }
 
