@@ -690,18 +690,110 @@ impl Drop for UdpSocket {
     }
 }
 
-/// `netstack` speaks no DNS opcode — only literal-address `ToSocketAddrs`
-/// resolution is supported (no name-resolver service exists yet).
+/// Name resolution goes to the `resolver` service over its own
+/// `APP_RESOLVER_TOKEN` lease (`ask_io::resolver`), separate from the
+/// `netstack` channel above so a process can be granted sockets without name
+/// resolution. Literals never reach the service: they are parsed here, so
+/// `connect("127.0.0.1:port")` and `connect("[::1]:port")` work in a process
+/// with no resolver lease at all.
 pub struct LookupHost {
-    addr: Option<SocketAddr>,
+    addresses: [SocketAddr; ask_io::resolver::MAX_ADDRESSES],
+    count: usize,
+    index: usize,
+}
+
+impl LookupHost {
+    fn one(addr: SocketAddr) -> LookupHost {
+        let mut addresses = [addr; ask_io::resolver::MAX_ADDRESSES];
+        addresses[0] = addr;
+        LookupHost { addresses, count: 1, index: 0 }
+    }
+
+    fn port(&self) -> u16 {
+        self.addresses.first().map_or(0, |addr| addr.port())
+    }
 }
 
 impl Iterator for LookupHost {
     type Item = SocketAddr;
 
     fn next(&mut self) -> Option<SocketAddr> {
-        self.addr.take()
+        let addr = self.addresses.get(self.index).copied().filter(|_| self.index < self.count)?;
+        self.index += 1;
+        Some(addr)
     }
+}
+
+/// The process-wide channel to `resolver`, created lazily on first name
+/// lookup. A process that only ever connects to literals never creates it.
+static RESOLVER_CHANNEL: OnceLock<Mutex<SyncChannel>> = OnceLock::new();
+
+fn resolver_channel() -> io::Result<MutexGuard<'static, SyncChannel>> {
+    ask_sys::log("resolver PAL: acquiring channel");
+    let cell = RESOLVER_CHANNEL.get_or_try_init(|| {
+        ask_sys::log("resolver PAL: creating leased channel");
+        SyncChannel::create_leased(ask_abi::APP_RESOLVER_TOKEN, ask_io::resolver::CHANNEL_PAGES)
+            .map(Mutex::new)
+            .map_err(|_| {
+                io::const_error!(io::ErrorKind::NotConnected, "no resolver lease")
+            })
+    })?;
+    ask_sys::log("resolver PAL: channel ready");
+    Ok(cell.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+fn resolver_error(result: i32) -> io::Error {
+    match result {
+        ask_io::resolver::RESULT_NOT_FOUND => {
+            io::const_error!(io::ErrorKind::NotFound, "name not found")
+        }
+        ask_io::resolver::RESULT_TIMED_OUT => {
+            io::const_error!(io::ErrorKind::TimedOut, "name lookup timed out")
+        }
+        ask_io::resolver::RESULT_DENIED => {
+            io::const_error!(io::ErrorKind::PermissionDenied, "name lookup denied")
+        }
+        ask_io::resolver::RESULT_UNAVAILABLE => {
+            io::const_error!(io::ErrorKind::NotConnected, "resolver unavailable")
+        }
+        _ => io::const_error!(io::ErrorKind::InvalidInput, "resolver rejected the name"),
+    }
+}
+
+fn resolve_name(host: &str, port: u16) -> io::Result<LookupHost> {
+    let mut request = [0u8; ask_io::resolver::REQUEST_MAX_LEN];
+    let payload = ask_io::resolver::encode_lookup_request(
+        &mut request,
+        host,
+        port,
+        ask_io::resolver::FAMILY_ANY,
+    )
+    .ok_or_else(|| io::const_error!(io::ErrorKind::InvalidInput, "invalid host name"))?;
+
+    let completion = {
+        let mut guard = resolver_channel()?;
+        guard.call(ask_io::resolver::OP_LOOKUP, payload)?
+    };
+    if completion.result < 0 {
+        return Err(resolver_error(completion.result));
+    }
+    let reply = ask_io::resolver::LookupReply::decode(completion.payload(), port)
+        .ok_or_else(|| io::const_error!(io::ErrorKind::InvalidData, "malformed resolver reply"))?;
+
+    let mut addresses = [SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port));
+        ask_io::resolver::MAX_ADDRESSES];
+    let mut count = 0;
+    for endpoint in reply {
+        let Some(slot) = addresses.get_mut(count) else {
+            break;
+        };
+        *slot = lookup_socket_addr(endpoint)?;
+        count += 1;
+    }
+    if count == 0 {
+        return Err(io::Error::NO_ADDRESSES);
+    }
+    Ok(LookupHost { addresses, count, index: 0 })
 }
 
 impl TryFrom<&str> for LookupHost {
@@ -709,12 +801,18 @@ impl TryFrom<&str> for LookupHost {
 
     fn try_from(host_port: &str) -> io::Result<LookupHost> {
         if let Ok(addr) = host_port.parse::<SocketAddr>() {
-            return Ok(LookupHost { addr: Some(addr) });
+            return Ok(LookupHost::one(addr));
         }
-        Err(io::const_error!(
-            io::ErrorKind::InvalidInput,
-            "no DNS resolver on ask"
-        ))
+        // Split off the port the same way the other platforms' PALs do: the
+        // last colon, so an unbracketed IPv6 literal cannot be mistaken for
+        // a host:port pair.
+        let (host, port) = host_port
+            .rsplit_once(':')
+            .ok_or_else(|| io::const_error!(io::ErrorKind::InvalidInput, "missing port"))?;
+        let port: u16 = port
+            .parse()
+            .map_err(|_| io::const_error!(io::ErrorKind::InvalidInput, "invalid port"))?;
+        LookupHost::try_from((host, port))
     }
 }
 
@@ -722,12 +820,10 @@ impl<'a> TryFrom<(&'a str, u16)> for LookupHost {
     type Error = io::Error;
 
     fn try_from((host, port): (&'a str, u16)) -> io::Result<LookupHost> {
-        let endpoint = ask_io::net::endpoint_from_host_port(host, port).ok_or_else(|| {
-            io::const_error!(io::ErrorKind::InvalidInput, "no DNS resolver on ask")
-        })?;
-        Ok(LookupHost {
-            addr: Some(lookup_socket_addr(endpoint)?),
-        })
+        if let Some(endpoint) = ask_io::net::endpoint_from_host_port(host, port) {
+            return Ok(LookupHost::one(lookup_socket_addr(endpoint)?));
+        }
+        resolve_name(host, port)
     }
 }
 
