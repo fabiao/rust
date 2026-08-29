@@ -76,28 +76,26 @@ pub(crate) fn writer_to_peer(peer: u32) -> io::Result<Pipe> {
 }
 
 pub(crate) fn accept_reader() -> io::Result<Pipe> {
-    let (virt, _peer, pages, _) = ask_sys::channel_accept().map_err(crate::sys::map_ask_error)?;
+    let (virt, _peer, pages, _) = ask_sys::channel_accept(ask_abi::ChannelAcceptFilter::any())
+        .map_err(crate::sys::map_ask_error)?;
     attach_reader(virt, pages)
 }
 
-/// Claim the next mailbox deposit from `peer`, revoking any older unmatched
-/// mapping so a leftover shell stdin ChannelCreate cannot bind as child stdout.
+/// Claim the next mailbox deposit from `peer`, leaving unrelated deposits
+/// parked for their own Exact or Any acceptor.
 pub(crate) fn accept_reader_from(peer: u32) -> io::Result<Pipe> {
-    loop {
-        let (virt, depositor, pages, _) =
-            ask_sys::channel_accept().map_err(crate::sys::map_ask_error)?;
-        if depositor as u32 == peer {
-            return attach_reader(virt, pages);
-        }
-        revoke_mapping(virt, pages);
-    }
+    let (virt, _depositor, pages, _) = ask_sys::channel_accept(ask_abi::ChannelAcceptFilter::exact(
+        u64::from(peer),
+    ))
+    .map_err(crate::sys::map_ask_error)?;
+    attach_reader(virt, pages)
 }
 
 /// Drop every currently pending mailbox channel. Used when this process will
 /// not adopt stdin, so an unused parent `ChannelCreate` does not occupy a slot.
 pub(crate) fn discard_unclaimed_channels() {
     loop {
-        match ask_sys::try_channel_accept() {
+        match ask_sys::try_channel_accept(ask_abi::ChannelAcceptFilter::any()) {
             Ok((virt, _, pages, _)) => revoke_mapping(virt, pages),
             Err(_) => break,
         }
