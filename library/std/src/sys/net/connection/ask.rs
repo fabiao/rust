@@ -98,6 +98,51 @@ fn socket_call(
     call_with_timeout(&mut guard, opcode, payload, None)
 }
 
+fn netstack_error(result: i32) -> io::Error {
+    match result {
+        ask_io::net::RESULT_WOULD_BLOCK => {
+            io::const_error!(io::ErrorKind::WouldBlock, "socket operation would block")
+        }
+        ask_io::net::RESULT_UNSUPPORTED => unsupported_err(),
+        ask_io::net::RESULT_INVALID => {
+            io::const_error!(io::ErrorKind::InvalidInput, "netstack rejected request")
+        }
+        _ => io::const_error!(io::ErrorKind::Other, "netstack operation failed"),
+    }
+}
+
+fn set_bool_option(
+    handle: u32,
+    option: ask_io::net::SocketOption,
+    value: bool,
+) -> io::Result<()> {
+    let mut encoded_value = [0u8; 1];
+    let encoded_value = ask_io::net::encode_net_bool_option(&mut encoded_value, value);
+    let mut request = [0u8; ask_io::net::OPTION_HEADER_LEN + 1];
+    let payload = ask_io::net::encode_net_setopt_request(
+        &mut request,
+        handle,
+        option,
+        encoded_value,
+    )
+    .ok_or_else(unsupported_err)?;
+    let completion = socket_call(ask_io::net::OP_SETOPT, payload)?;
+    if completion.result < 0 {
+        return Err(netstack_error(completion.result));
+    }
+    Ok(())
+}
+
+fn get_bool_option(handle: u32, option: ask_io::net::SocketOption) -> io::Result<bool> {
+    let mut request = [0u8; ask_io::net::OPTION_HEADER_LEN];
+    let payload = ask_io::net::encode_net_getopt_request(&mut request, handle, option);
+    let completion = socket_call(ask_io::net::OP_GETOPT, payload)?;
+    if completion.result < 0 {
+        return Err(netstack_error(completion.result));
+    }
+    ask_io::net::decode_net_bool_option(completion.payload()).ok_or_else(unsupported_err)
+}
+
 fn open_socket(protocol: u8, family: u8) -> io::Result<u32> {
     if family != ask_io::net::AF_IPV4 && family != ask_io::net::AF_IPV6 {
         return Err(unsupported_err());
@@ -182,7 +227,7 @@ impl TcpStream {
         let mut guard = channel()?;
         let completion = call_with_timeout(&mut guard, ask_io::net::OP_RECV, payload, timeout)?;
         if completion.result < 0 {
-            return Err(io::const_error!(io::ErrorKind::Other, "netstack: recv failed"));
+            return Err(netstack_error(completion.result));
         }
         let n = (completion.result as usize).min(buf.len());
         let data = guard
@@ -219,7 +264,7 @@ impl TcpStream {
         let payload = ask_io::net::encode_net_io_request(&mut request, self.handle, buffer, 0);
         let completion = call_with_timeout(&mut guard, ask_io::net::OP_SEND, payload, timeout)?;
         if completion.result < 0 {
-            return Err(io::const_error!(io::ErrorKind::Other, "netstack: send failed"));
+            return Err(netstack_error(completion.result));
         }
         Ok(completion.result as usize)
     }
@@ -276,12 +321,12 @@ impl TcpStream {
         unsupported()
     }
 
-    pub fn set_nodelay(&self, _nodelay: bool) -> io::Result<()> {
-        Ok(())
+    pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
+        set_bool_option(self.handle, ask_io::net::SocketOption::NoDelay, nodelay)
     }
 
     pub fn nodelay(&self) -> io::Result<bool> {
-        Ok(true)
+        get_bool_option(self.handle, ask_io::net::SocketOption::NoDelay)
     }
 
     pub fn set_ttl(&self, _ttl: u32) -> io::Result<()> {
@@ -296,8 +341,12 @@ impl TcpStream {
         Ok(None)
     }
 
-    pub fn set_nonblocking(&self, _nonblocking: bool) -> io::Result<()> {
-        unsupported()
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        set_bool_option(
+            self.handle,
+            ask_io::net::SocketOption::Nonblocking,
+            nonblocking,
+        )
     }
 }
 
@@ -340,7 +389,7 @@ impl TcpListener {
         let payload = ask_io::net::encode_net_handle(&mut request, self.handle);
         let completion = socket_call(ask_io::net::OP_ACCEPT, payload)?;
         if completion.result < 0 {
-            return Err(io::const_error!(io::ErrorKind::Other, "netstack: accept failed"));
+            return Err(netstack_error(completion.result));
         }
         let (new_handle, endpoint) =
             ask_io::net::decode_net_endpoint_request(completion.payload()).ok_or_else(unsupported_err)?;
@@ -380,8 +429,12 @@ impl TcpListener {
         Ok(None)
     }
 
-    pub fn set_nonblocking(&self, _nonblocking: bool) -> io::Result<()> {
-        unsupported()
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        set_bool_option(
+            self.handle,
+            ask_io::net::SocketOption::Nonblocking,
+            nonblocking,
+        )
     }
 }
 
@@ -441,7 +494,7 @@ impl UdpSocket {
         let mut guard = channel()?;
         let completion = call_with_timeout(&mut guard, ask_io::net::OP_RECV_FROM, payload, timeout)?;
         if completion.result < 0 {
-            return Err(io::const_error!(io::ErrorKind::Other, "netstack: recv_from failed"));
+            return Err(netstack_error(completion.result));
         }
         // `OP_RECV_FROM`'s completion payload is the raw 19-byte sender
         // `NetEndpoint` (`netstack`'s `try_udp_recv_from` reply), not a
@@ -479,7 +532,7 @@ impl UdpSocket {
             ask_io::net::encode_net_datagram_request(&mut request, self.handle, buffer, 0, endpoint);
         let completion = call_with_timeout(&mut guard, ask_io::net::OP_SEND_TO, payload, timeout)?;
         if completion.result < 0 {
-            return Err(io::const_error!(io::ErrorKind::Other, "netstack: send_to failed"));
+            return Err(netstack_error(completion.result));
         }
         Ok(completion.result as usize)
     }
@@ -566,8 +619,12 @@ impl UdpSocket {
         Ok(None)
     }
 
-    pub fn set_nonblocking(&self, _nonblocking: bool) -> io::Result<()> {
-        unsupported()
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        set_bool_option(
+            self.handle,
+            ask_io::net::SocketOption::Nonblocking,
+            nonblocking,
+        )
     }
 
     pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
@@ -579,7 +636,7 @@ impl UdpSocket {
         let mut guard = channel()?;
         let completion = call_with_timeout(&mut guard, ask_io::net::OP_RECV, payload, timeout)?;
         if completion.result < 0 {
-            return Err(io::const_error!(io::ErrorKind::Other, "netstack: recv failed"));
+            return Err(netstack_error(completion.result));
         }
         let n = (completion.result as usize).min(buf.len());
         let data = guard
@@ -608,7 +665,7 @@ impl UdpSocket {
         let payload = ask_io::net::encode_net_io_request(&mut request, self.handle, buffer, 0);
         let completion = call_with_timeout(&mut guard, ask_io::net::OP_SEND, payload, timeout)?;
         if completion.result < 0 {
-            return Err(io::const_error!(io::ErrorKind::Other, "netstack: send failed"));
+            return Err(netstack_error(completion.result));
         }
         Ok(completion.result as usize)
     }
