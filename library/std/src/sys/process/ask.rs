@@ -312,12 +312,12 @@ fn attach_parent_stdio(
         None
     };
     let stdout_pipe = if matches!(stdout, Stdio::MakePipe) {
-        Some(crate::sys::pipe::accept_reader()?)
+        Some(crate::sys::pipe::accept_reader_from(child)?)
     } else {
         None
     };
     let stderr_pipe = if matches!(stderr, Stdio::MakePipe) {
-        Some(crate::sys::pipe::accept_reader()?)
+        Some(crate::sys::pipe::accept_reader_from(child)?)
     } else {
         None
     };

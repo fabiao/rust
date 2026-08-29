@@ -35,14 +35,27 @@ enum TerminalState {
 /// Adopt Command-redirected stdio pipes before user `main`. Parent and child
 /// agree on create/accept order: stdout, then stderr, then stdin accept.
 pub fn adopt_command_stdio() {
+    if env::getenv(OsStr::new("ASK_STDIN_PIPE")).is_none() {
+        pipe::discard_unclaimed_channels();
+    }
     if let Some(pid) = env_u32("ASK_STDOUT_TO_PID") {
-        if let Ok(pipe) = pipe::writer_to_peer(pid) {
-            *STDOUT_PIPE.lock().unwrap_or_else(|e| e.into_inner()) = Some(pipe);
+        match pipe::writer_to_peer(pid) {
+            Ok(pipe) => {
+                *STDOUT_PIPE.lock().unwrap_or_else(|e| e.into_inner()) = Some(pipe);
+            }
+            Err(_) => {
+                ask_sys::log("stdio: stdout pipe create failed");
+            }
         }
     }
     if let Some(pid) = env_u32("ASK_STDERR_TO_PID") {
-        if let Ok(pipe) = pipe::writer_to_peer(pid) {
-            *STDERR_PIPE.lock().unwrap_or_else(|e| e.into_inner()) = Some(pipe);
+        match pipe::writer_to_peer(pid) {
+            Ok(pipe) => {
+                *STDERR_PIPE.lock().unwrap_or_else(|e| e.into_inner()) = Some(pipe);
+            }
+            Err(_) => {
+                ask_sys::log("stdio: stderr pipe create failed");
+            }
         }
     }
     if env::getenv(OsStr::new("ASK_STDIN_PIPE")).is_some() {
