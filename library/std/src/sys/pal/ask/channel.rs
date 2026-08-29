@@ -9,7 +9,7 @@
 use ask_ipc::channel::{
     CQ_CAPACITY, CQ_ENTRIES_OFFSET, CQ_HEADER_OFFSET, CQ_PAYLOAD_OFFSET, Cqe, LAYOUT_LEN,
     MAX_MSG_LEN, Ring, RingHeader, SQ_CAPACITY, SQ_ENTRIES_OFFSET, SQ_HEADER_OFFSET,
-    SQ_PAYLOAD_OFFSET, SharedBufferHeader, Sqe,
+    SQ_PAYLOAD_OFFSET, STATE_OFFSET, SharedBufferHeader, Sqe,
 };
 
 use crate::io;
@@ -113,15 +113,16 @@ impl SyncChannel {
         }
     }
 
-    /// Only the creator initializes the ring headers, before the peer's
-    /// `ChannelAccept` can observe the memory — mirrors
-    /// `askme::channel::Channel::init`.
+    /// Only the creator initializes the rings and endpoint state before the
+    /// peer's `ChannelAccept` can observe the memory.
     fn init(&mut self) {
         // Safety: called only from `create`, before the peer attaches —
         // exclusive access to the whole region at this point.
         unsafe {
             (self.base.add(SQ_HEADER_OFFSET) as *mut RingHeader).write(RingHeader::new());
             (self.base.add(CQ_HEADER_OFFSET) as *mut RingHeader).write(RingHeader::new());
+            (self.base.add(STATE_OFFSET) as *mut core::sync::atomic::AtomicU32)
+                .write(core::sync::atomic::AtomicU32::new(0));
         }
     }
 

@@ -6,8 +6,8 @@
 //! (`MAX_OPEN_HANDLES = 1`), so multiplexing several files over one channel
 //! isn't possible even in principle.
 //!
-//! The process's `/exe`/`/in`/`/out` bindings arrive once at spawn time in
-//! the 64-byte startup view (`GetSpawnBlob(SPAWN_BLOB_VIEW,..)`,
+//! The process's namespace bindings arrive once at spawn time in the
+//! fixed startup view (`GetSpawnBlob(SPAWN_BLOB_VIEW,..)`,
 //! `ask_abi::view`); this module decodes mount provider pids and optional
 //! source roots so paths like `/out/marker.txt` or `/in/asset.txt` map to
 //! provider-relative opens (`profiles/…/out/marker.txt`, `apptest/in/asset.txt`).
@@ -23,66 +23,26 @@ use crate::sys::pal::unsupported_err;
 use crate::sys::time::SystemTime;
 use crate::sys::unsupported;
 
-/// Decode a path mount's provider pid and optional source root from the
-/// startup-view blob — a trimmed, `askme`-free equivalent of
-/// `askme::view::View::decode_startup`.
-fn mount_binding(slot: usize) -> io::Result<(u32, [u8; ask_abi::view::ROOT_TABLE_LEN], u8, u8)> {
+fn startup_view() -> io::Result<ask_io::view::View> {
     let mut bytes = [0u8; ask_abi::view::LEN];
     ask_sys::get_startup_view(&mut bytes).map_err(crate::sys::map_ask_error)?;
-    let offset = slot * ask_abi::view::BINDING_LEN;
-    let bound = *bytes.get(offset + 5).ok_or_else(unsupported_err)?;
-    if bound == 0 {
-        return Err(unsupported_err());
-    }
-    let pid = bytes
-        .get(offset..offset + 4)
-        .and_then(|b| b.try_into().ok())
-        .map(u32::from_le_bytes)
-        .ok_or_else(unsupported_err)?;
-    let root_off = *bytes.get(offset + 6).ok_or_else(unsupported_err)?;
-    let root_len = *bytes.get(offset + 7).ok_or_else(unsupported_err)?;
-    let mut root_table = [0u8; ask_abi::view::ROOT_TABLE_LEN];
-    let table = bytes
-        .get(
-            ask_abi::view::ROOT_TABLE_OFFSET
-                ..ask_abi::view::ROOT_TABLE_OFFSET + ask_abi::view::ROOT_TABLE_LEN,
-        )
-        .ok_or_else(unsupported_err)?;
-    root_table.copy_from_slice(table);
-    Ok((pid, root_table, root_off, root_len))
+    ask_io::view::View::decode_startup(&bytes).map_err(|_| unsupported_err())
 }
 
-/// Map `/exe|in|out/...` to `(provider_pid, provider-relative path bytes)`.
+/// Map a bound process path to `(provider_pid, provider-relative path bytes)`.
 fn resolve_fs_path(path: &Path) -> io::Result<(u32, heapless_path::PathBuf)> {
     let path = path.to_str().ok_or_else(unsupported_err)?;
-    let relative = path.strip_prefix('/').ok_or_else(unsupported_err)?;
-    let (mount, rest) = relative.split_once('/').ok_or_else(unsupported_err)?;
-    if rest.is_empty()
-        || rest
-            .split('/')
-            .any(|part| part.is_empty() || part == "." || part == "..")
-    {
-        return Err(unsupported_err());
-    }
-    let slot = match mount {
-        "exe" => 0usize,
-        "in" => 1,
-        "out" => 2,
-        _ => return Err(unsupported_err()),
-    };
-    let (pid, root_table, root_off, root_len) = mount_binding(slot)?;
+    let view = startup_view()?;
+    let resolved = view
+        .resolve(path, ask_io::view::Operation::Read)
+        .map_err(|_| unsupported_err())?;
+    let mut encoded = [0u8; ask_io::fs::OPEN_PATH_MAX];
+    let relative = resolved
+        .encode_path(&mut encoded)
+        .map_err(|_| unsupported_err())?;
     let mut out = heapless_path::PathBuf::new();
-    if root_len != 0 {
-        let start = root_off as usize;
-        let end = start
-            .checked_add(root_len as usize)
-            .ok_or_else(unsupported_err)?;
-        let root = root_table.get(start..end).ok_or_else(unsupported_err)?;
-        out.push(root)?;
-        out.push(b"/")?;
-    }
-    out.push(rest.as_bytes())?;
-    Ok((pid, out))
+    out.push(relative.as_bytes())?;
+    Ok((resolved.provider_pid, out))
 }
 
 /// Tiny fixed path builder — avoids `alloc` in the hot open path while still

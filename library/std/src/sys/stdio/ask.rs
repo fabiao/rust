@@ -9,9 +9,12 @@
 //! output, and `stdin` reports end-of-file rather than failing, matching what
 //! a process with no controlling terminal sees elsewhere.
 
+use crate::ffi::OsStr;
 use crate::io;
 use crate::sync::Mutex;
 use crate::sys::channel::SyncChannel;
+use crate::sys::env;
+use crate::sys::pipe::{self, Pipe};
 
 pub const STDIN_BUF_SIZE: usize = crate::sys::io::DEFAULT_BUF_SIZE;
 
@@ -19,11 +22,43 @@ pub const STDIN_BUF_SIZE: usize = crate::sys::io::DEFAULT_BUF_SIZE;
 /// attempt has established there is no terminal lease, so a terminal-less
 /// process pays one failed `ChannelCreate` rather than one per write.
 static TERMINAL: Mutex<TerminalState> = Mutex::new(TerminalState::Unattached);
+static STDIN_PIPE: Mutex<Option<Pipe>> = Mutex::new(None);
+static STDOUT_PIPE: Mutex<Option<Pipe>> = Mutex::new(None);
+static STDERR_PIPE: Mutex<Option<Pipe>> = Mutex::new(None);
 
 enum TerminalState {
     Unattached,
     Absent,
     Attached(SyncChannel),
+}
+
+/// Adopt Command-redirected stdio pipes before user `main`. Parent and child
+/// agree on create/accept order: stdout, then stderr, then stdin accept.
+pub fn adopt_command_stdio() {
+    if let Some(pid) = env_u32("ASK_STDOUT_TO_PID") {
+        if let Ok(pipe) = pipe::writer_to_peer(pid) {
+            *STDOUT_PIPE.lock().unwrap_or_else(|e| e.into_inner()) = Some(pipe);
+        }
+    }
+    if let Some(pid) = env_u32("ASK_STDERR_TO_PID") {
+        if let Ok(pipe) = pipe::writer_to_peer(pid) {
+            *STDERR_PIPE.lock().unwrap_or_else(|e| e.into_inner()) = Some(pipe);
+        }
+    }
+    if env::getenv(OsStr::new("ASK_STDIN_PIPE")).is_some() {
+        if let Ok(pipe) = pipe::accept_reader() {
+            *STDIN_PIPE.lock().unwrap_or_else(|e| e.into_inner()) = Some(pipe);
+        }
+    }
+}
+
+fn env_u32(key: &str) -> Option<u32> {
+    env::getenv(OsStr::new(key))?.to_str()?.parse().ok()
+}
+
+/// True once this process has adopted a controlling-terminal Channel lease.
+pub fn has_controlling_terminal() -> bool {
+    with_terminal(|_| Ok(())).is_some()
 }
 
 /// Run `f` against the controlling terminal, attaching it on first use.
@@ -59,6 +94,9 @@ impl io::Read for Stdin {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
+        }
+        if let Some(pipe) = STDIN_PIPE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            return pipe.read(buf);
         }
         // No controlling terminal is end-of-file, not an error — the same
         // thing a process reading a closed stdin observes.
@@ -102,7 +140,7 @@ impl Stdout {
 
 impl io::Write for Stdout {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        write_stream(buf)
+        write_named_stream(&STDOUT_PIPE, buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -118,12 +156,21 @@ impl Stderr {
 
 impl io::Write for Stderr {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        write_stream(buf)
+        write_named_stream(&STDERR_PIPE, buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+/// Write to a Command-redirected pipe when present, otherwise the terminal
+/// or serial log.
+fn write_named_stream(pipe: &Mutex<Option<Pipe>>, buf: &[u8]) -> io::Result<usize> {
+    if let Some(pipe) = pipe.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        return pipe.write(buf);
+    }
+    write_stream(buf)
 }
 
 /// Write to the controlling terminal when this process has one, falling back

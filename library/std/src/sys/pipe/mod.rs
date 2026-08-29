@@ -13,6 +13,11 @@ cfg_select! {
         mod motor;
         pub use motor::{Pipe, pipe};
     }
+    target_os = "ask" => {
+        mod ask;
+        pub use ask::{Pipe, pipe};
+        pub(crate) use ask::{accept_reader, writer_to_peer};
+    }
     _ => {
         mod unsupported;
         pub use unsupported::{Pipe, pipe};

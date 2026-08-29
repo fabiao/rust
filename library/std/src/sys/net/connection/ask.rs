@@ -6,7 +6,9 @@
 //! rather than opening one channel per socket, unlike `sys/fs/ask.rs`.
 
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
-use crate::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, ToSocketAddrs};
+use crate::net::{
+    Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs,
+};
 use crate::sync::{Mutex, MutexGuard, OnceLock};
 use crate::sys::channel::SyncChannel;
 use crate::sys::map_ask_error;
@@ -19,23 +21,13 @@ use crate::time::Duration;
 /// this process — see the module doc comment.
 static NET_CHANNEL: OnceLock<Mutex<SyncChannel>> = OnceLock::new();
 
-/// Decode the `net:` provider's pid out of the raw startup-view blob — the
-/// same trimmed, `askme`-free approach `sys/fs/ask.rs` uses for its `/out`
-/// binding, applied to `ask_abi::view`'s separate net-provider block.
 fn net_provider_pid() -> io::Result<u32> {
     let mut bytes = [0u8; ask_abi::view::LEN];
     ask_sys::get_startup_view(&mut bytes).map_err(map_ask_error)?;
-    let offset = ask_abi::view::NET_PROVIDER_OFFSET;
-    let present = *bytes.get(offset + 4).ok_or_else(unsupported_err)?;
-    if present == 0 {
-        return Err(unsupported_err());
-    }
-    let pid = bytes
-        .get(offset..offset + 4)
-        .and_then(|b| b.try_into().ok())
-        .map(u32::from_le_bytes)
-        .ok_or_else(unsupported_err)?;
-    Ok(pid)
+    ask_io::view::View::decode_startup(&bytes)
+        .ok()
+        .and_then(|view| view.net_provider())
+        .ok_or_else(unsupported_err)
 }
 
 fn channel() -> io::Result<MutexGuard<'static, SyncChannel>> {
@@ -653,8 +645,14 @@ impl Iterator for LookupHost {
 impl TryFrom<&str> for LookupHost {
     type Error = io::Error;
 
-    fn try_from(host: &str) -> io::Result<LookupHost> {
-        LookupHost::try_from((host, 0))
+    fn try_from(host_port: &str) -> io::Result<LookupHost> {
+        if let Ok(addr) = host_port.parse::<SocketAddr>() {
+            return Ok(LookupHost { addr: Some(addr) });
+        }
+        Err(io::const_error!(
+            io::ErrorKind::InvalidInput,
+            "no DNS resolver on ask"
+        ))
     }
 }
 
@@ -662,12 +660,20 @@ impl<'a> TryFrom<(&'a str, u16)> for LookupHost {
     type Error = io::Error;
 
     fn try_from((host, port): (&'a str, u16)) -> io::Result<LookupHost> {
-        let ip: Ipv4Addr = host
-            .parse()
-            .map_err(|_| io::const_error!(io::ErrorKind::InvalidInput, "no DNS resolver on ask"))?;
-        Ok(LookupHost {
-            addr: Some(SocketAddr::V4(SocketAddrV4::new(ip, port))),
-        })
+        if let Ok(v4) = host.parse::<Ipv4Addr>() {
+            return Ok(LookupHost {
+                addr: Some(SocketAddr::V4(SocketAddrV4::new(v4, port))),
+            });
+        }
+        if let Ok(v6) = host.parse::<Ipv6Addr>() {
+            return Ok(LookupHost {
+                addr: Some(SocketAddr::V6(SocketAddrV6::new(v6, port, 0, 0))),
+            });
+        }
+        Err(io::const_error!(
+            io::ErrorKind::InvalidInput,
+            "no DNS resolver on ask"
+        ))
     }
 }
 

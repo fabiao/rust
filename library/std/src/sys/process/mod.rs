@@ -15,6 +15,10 @@ cfg_select! {
         mod motor;
         use motor as imp;
     }
+    target_os = "ask" => {
+        mod ask;
+        use ask as imp;
+    }
     _ => {
         mod unsupported;
         use unsupported as imp;
@@ -49,7 +53,8 @@ pub use imp::{
         ))
     ),
     target_os = "windows",
-    target_os = "motor"
+    target_os = "motor",
+    target_os = "ask"
 ))]
 pub fn output(cmd: &mut Command) -> crate::io::Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
     let (mut process, mut pipes) = cmd.spawn(Stdio::MakePipe, false)?;
@@ -87,6 +92,7 @@ pub fn output(cmd: &mut Command) -> crate::io::Result<(ExitStatus, Vec<u8>, Vec<
         ))
     ),
     target_os = "windows",
-    target_os = "motor"
+    target_os = "motor",
+    target_os = "ask"
 )))]
 pub use imp::output;

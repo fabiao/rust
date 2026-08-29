@@ -32,7 +32,9 @@ pub fn abort_internal() -> ! {
 }
 
 // SAFETY: must be called only once during runtime initialization.
-pub unsafe fn init(_argc: isize, _argv: *const *const u8, _sigpipe: u8) {}
+pub unsafe fn init(_argc: isize, _argv: *const *const u8, _sigpipe: u8) {
+    crate::sys::stdio::adopt_command_stdio();
+}
 
 // SAFETY: must be called only once during runtime cleanup.
 // NOTE: this is not guaranteed to run, for example when the program aborts.
@@ -56,9 +58,9 @@ extern "sysv64" fn _start() -> ! {
     // gets the same call from `sys::thread::ask::Thread::new`'s own
     // trampoline, its equivalent earliest point.
     crate::sys::thread_local::key::init_this_thread();
-    // `SpawnRaw`'s binary capability block carries no argument list
-    // (docs/02-kernel-abi.md) — every ask process starts with an empty
-    // argv, the same posture Motor OS's `motor_start` takes.
+    // Argv and the environment live in the spawn capability block and are
+    // read through `GetSpawnBlob` by `sys::args` / `sys::env`. The CRT
+    // argc/argv pair stays empty, matching Motor OS's `motor_start`.
     let result = unsafe { main(0, core::ptr::null(), 0) };
     ask_sys::exit(result as u32 as u64)
 }

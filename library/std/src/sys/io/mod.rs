@@ -20,6 +20,10 @@ mod is_terminal {
             mod motor;
             pub use motor::*;
         }
+        target_os = "ask" => {
+            mod ask;
+            pub use ask::*;
+        }
         _ => {
             mod unsupported;
             pub use unsupported::*;
