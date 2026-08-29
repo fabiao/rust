@@ -11,7 +11,6 @@ use crate::net::{
 };
 use crate::sync::{Mutex, MutexGuard, OnceLock};
 use crate::sys::channel::SyncChannel;
-use crate::sys::map_ask_error;
 use crate::sys::pal::unsupported_err;
 use crate::sys::unsupported;
 use crate::time::Duration;
@@ -21,19 +20,9 @@ use crate::time::Duration;
 /// this process — see the module doc comment.
 static NET_CHANNEL: OnceLock<Mutex<SyncChannel>> = OnceLock::new();
 
-fn net_provider_pid() -> io::Result<u32> {
-    let mut bytes = [0u8; ask_abi::view::LEN];
-    ask_sys::get_startup_view(&mut bytes).map_err(map_ask_error)?;
-    ask_io::view::View::decode_startup(&bytes)
-        .ok()
-        .and_then(|view| view.net_provider())
-        .ok_or_else(unsupported_err)
-}
-
 fn channel() -> io::Result<MutexGuard<'static, SyncChannel>> {
     let cell = NET_CHANNEL.get_or_try_init(|| {
-        let provider_pid = net_provider_pid()?;
-        SyncChannel::create(provider_pid as u64, ask_io::net::CHANNEL_PAGES)
+        SyncChannel::create_leased(ask_abi::APP_NET_TOKEN, ask_io::net::CHANNEL_PAGES)
             .map(Mutex::new)
             .map_err(|_| io::const_error!(io::ErrorKind::NotConnected, "netstack unreachable"))
     })?;
@@ -51,7 +40,11 @@ fn to_net_endpoint(addr: SocketAddr) -> io::Result<ask_io::net::NetEndpoint> {
                 address,
             })
         }
-        SocketAddr::V6(_) => Err(unsupported_err()),
+        SocketAddr::V6(v6) => Ok(ask_io::net::NetEndpoint {
+            family: ask_io::net::AF_IPV6,
+            port: v6.port(),
+            address: v6.ip().octets(),
+        }),
     }
 }
 
@@ -76,18 +69,7 @@ fn lookup_socket_addr(endpoint: ask_io::net::NetEndpoint) -> io::Result<SocketAd
 }
 
 fn from_net_endpoint(endpoint: ask_io::net::NetEndpoint) -> io::Result<SocketAddr> {
-    if endpoint.family != ask_io::net::AF_IPV4 {
-        return Err(unsupported_err());
-    }
-    let octets: [u8; 4] = endpoint
-        .address
-        .get(..4)
-        .and_then(|b| b.try_into().ok())
-        .ok_or_else(unsupported_err)?;
-    Ok(SocketAddr::V4(SocketAddrV4::new(
-        Ipv4Addr::from(octets),
-        endpoint.port,
-    )))
+    lookup_socket_addr(endpoint)
 }
 
 fn first_addr<A: ToSocketAddrs>(addr: A) -> io::Result<SocketAddr> {
@@ -116,9 +98,12 @@ fn socket_call(
     call_with_timeout(&mut guard, opcode, payload, None)
 }
 
-fn open_socket(protocol: u8) -> io::Result<u32> {
+fn open_socket(protocol: u8, family: u8) -> io::Result<u32> {
+    if family != ask_io::net::AF_IPV4 && family != ask_io::net::AF_IPV6 {
+        return Err(unsupported_err());
+    }
     let mut request = [0u8; 2];
-    let payload = ask_io::net::encode_net_socket_request(&mut request, ask_io::net::AF_IPV4, protocol);
+    let payload = ask_io::net::encode_net_socket_request(&mut request, family, protocol);
     let completion = socket_call(ask_io::net::OP_SOCKET, payload)?;
     if completion.result < 0 {
         return Err(io::const_error!(io::ErrorKind::Other, "netstack: socket failed"));
@@ -146,8 +131,8 @@ impl TcpStream {
     }
 
     pub fn connect_timeout(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
-        let handle = open_socket(ask_io::net::PROTO_TCP)?;
         let endpoint = to_net_endpoint(*addr)?;
+        let handle = open_socket(ask_io::net::PROTO_TCP, endpoint.family)?;
         let mut request = [0u8; 23];
         let payload = ask_io::net::encode_net_endpoint_request(&mut request, handle, endpoint);
         let timeout = if timeout == Duration::MAX { None } else { Some(timeout) };
@@ -331,8 +316,8 @@ pub struct TcpListener {
 impl TcpListener {
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<TcpListener> {
         let addr = first_addr(addr)?;
-        let handle = open_socket(ask_io::net::PROTO_TCP)?;
         let endpoint = to_net_endpoint(addr)?;
+        let handle = open_socket(ask_io::net::PROTO_TCP, endpoint.family)?;
         let mut request = [0u8; 23];
         let payload = ask_io::net::encode_net_endpoint_request(&mut request, handle, endpoint);
         // `netstack` dispatches `NET_OP_BIND` and `NET_OP_LISTEN` through the
@@ -418,8 +403,8 @@ pub struct UdpSocket {
 impl UdpSocket {
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<UdpSocket> {
         let addr = first_addr(addr)?;
-        let handle = open_socket(ask_io::net::PROTO_UDP)?;
         let endpoint = to_net_endpoint(addr)?;
+        let handle = open_socket(ask_io::net::PROTO_UDP, endpoint.family)?;
         let mut request = [0u8; 23];
         let payload = ask_io::net::encode_net_endpoint_request(&mut request, handle, endpoint);
         let completion = socket_call(ask_io::net::OP_BIND, payload)?;
