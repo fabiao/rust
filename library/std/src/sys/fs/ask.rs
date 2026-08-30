@@ -8,7 +8,7 @@
 //!
 //! The process's namespace bindings arrive once at spawn time in the
 //! fixed startup view (`GetSpawnBlob(SPAWN_BLOB_VIEW,..)`,
-//! `ask_abi::view`); this module decodes mount provider pids and optional
+//! `ask_abi::view`); this module decodes mount capability tokens and optional
 //! source roots so paths like `/out/marker.txt` or `/in/asset.txt` map to
 //! provider-relative opens (`profiles/…/out/marker.txt`, `apptest/in/asset.txt`).
 
@@ -29,7 +29,7 @@ fn startup_view() -> io::Result<ask_io::view::View> {
     ask_io::view::View::decode_startup(&bytes).map_err(|_| unsupported_err())
 }
 
-/// Map a bound process path to `(provider_pid, provider-relative path bytes)`.
+/// Map a bound process path to `(provider_token, provider-relative path bytes)`.
 fn resolve_fs_path(path: &Path) -> io::Result<(u32, heapless_path::PathBuf)> {
     let path = path.to_str().ok_or_else(unsupported_err)?;
     let view = startup_view()?;
@@ -42,7 +42,7 @@ fn resolve_fs_path(path: &Path) -> io::Result<(u32, heapless_path::PathBuf)> {
         .map_err(|_| unsupported_err())?;
     let mut out = heapless_path::PathBuf::new();
     out.push(relative.as_bytes())?;
-    Ok((resolved.provider_pid, out))
+    Ok((resolved.provider_token, out))
 }
 
 /// Tiny fixed path builder — avoids `alloc` in the hot open path while still
@@ -320,13 +320,13 @@ fn bounded_path(path: &[u8]) -> io::Result<&[u8]> {
 /// handle, but each still requires its own accepted session, since a session
 /// admits one handle at a time (`MAX_OPEN_HANDLES = 1`).
 fn metadata_call<T>(
-    provider_pid: u32,
+    provider_token: u32,
     op: u32,
     payload: &[u8],
     not_found: &'static str,
     decode: impl FnOnce(&[u8]) -> Option<T>,
 ) -> io::Result<T> {
-    let mut channel = SyncChannel::create(provider_pid as u64, 1)
+    let mut channel = SyncChannel::create_leased(provider_token, 1)
         .map_err(|_| io::const_error!(io::ErrorKind::NotFound, "fs provider unreachable"))?;
     let completion = channel.call(op, payload)?;
     if completion.result < 0 {
@@ -337,12 +337,12 @@ fn metadata_call<T>(
 
 /// A metadata round trip whose reply carries no payload beyond its result.
 fn metadata_unit(
-    provider_pid: u32,
+    provider_token: u32,
     op: u32,
     payload: &[u8],
     failure: &'static str,
 ) -> io::Result<()> {
-    let mut channel = SyncChannel::create(provider_pid as u64, 1)
+    let mut channel = SyncChannel::create_leased(provider_token, 1)
         .map_err(|_| io::const_error!(io::ErrorKind::NotFound, "fs provider unreachable"))?;
     let completion = channel.call(op, payload)?;
     if completion.result < 0 {
@@ -354,10 +354,10 @@ fn metadata_unit(
 /// Shared by `stat` and `lstat` — `askfs` resolves symlinks provider-side and
 /// exposes no nofollow variant, so both spellings observe the same target.
 fn stat_path(path: &Path) -> io::Result<FileAttr> {
-    let (provider_pid, relative) = resolve_fs_path(path)?;
+    let (provider_token, relative) = resolve_fs_path(path)?;
     let payload = bounded_path(relative.as_bytes())?;
     metadata_call(
-        provider_pid,
+        provider_token,
         ask_io::fs::OP_STAT,
         payload,
         "fs: stat failed",
@@ -367,8 +367,8 @@ fn stat_path(path: &Path) -> io::Result<FileAttr> {
 
 impl File {
     pub fn open(path: &Path, opts: &OpenOptions) -> io::Result<File> {
-        let (provider_pid, relative) = resolve_fs_path(path)?;
-        let mut channel = SyncChannel::create(provider_pid as u64, 1)
+        let (provider_token, relative) = resolve_fs_path(path)?;
+        let mut channel = SyncChannel::create_leased(provider_token, 1)
             .map_err(|_| io::const_error!(io::ErrorKind::NotFound, "fs provider unreachable"))?;
 
         let mut request = [0u8; 4 + ask_io::fs::OPEN_PATH_MAX];
@@ -594,7 +594,7 @@ impl DirBuilder {
     /// `DirBuilder` exposes no mode on this target, so request the usual
     /// owner-writable directory permissions.
     pub fn mkdir(&self, path: &Path) -> io::Result<()> {
-        let (provider_pid, relative) = resolve_fs_path(path)?;
+        let (provider_token, relative) = resolve_fs_path(path)?;
         let mut request = [0u8; 4 + ask_io::fs::STAT_PATH_MAX];
         let payload = ask_io::fs::encode_fs_mkdir_request(
             &mut request,
@@ -603,7 +603,7 @@ impl DirBuilder {
         )
         .ok_or_else(unsupported_err)?;
         metadata_unit(
-            provider_pid,
+            provider_token,
             ask_io::fs::OP_MKDIR,
             payload,
             "fs: mkdir failed",
@@ -615,7 +615,7 @@ impl DirBuilder {
 /// directory path and a 0-based index, so the iterator holds the caller's
 /// path and its next cursor rather than a server-side open handle.
 pub struct ReadDir {
-    provider_pid: u32,
+    provider_token: u32,
     relative: heapless_path::PathBuf,
     /// The `/mount/...` spelling the caller passed, so `DirEntry::path()` can
     /// return a path in the caller's own namespace rather than a
@@ -651,7 +651,7 @@ impl Iterator for ReadDir {
             }
         };
 
-        let mut channel = match SyncChannel::create(self.provider_pid as u64, 1) {
+        let mut channel = match SyncChannel::create_leased(self.provider_token, 1) {
             Ok(channel) => channel,
             Err(_) => {
                 self.exhausted = true;
@@ -728,9 +728,9 @@ impl DirEntry {
 }
 
 pub fn readdir(path: &Path) -> io::Result<ReadDir> {
-    let (provider_pid, relative) = resolve_fs_path(path)?;
+    let (provider_token, relative) = resolve_fs_path(path)?;
     Ok(ReadDir {
-        provider_pid,
+        provider_token,
         relative,
         root: path.to_path_buf(),
         cursor: 0,
@@ -739,10 +739,10 @@ pub fn readdir(path: &Path) -> io::Result<ReadDir> {
 }
 
 pub fn unlink(path: &Path) -> io::Result<()> {
-    let (provider_pid, relative) = resolve_fs_path(path)?;
+    let (provider_token, relative) = resolve_fs_path(path)?;
     let payload = bounded_path(relative.as_bytes())?;
     metadata_unit(
-        provider_pid,
+        provider_token,
         ask_io::fs::OP_UNLINK,
         payload,
         "fs: unlink failed",
