@@ -2,7 +2,8 @@
 //!
 //! `Command::new` takes an installed package identity, not a filesystem path.
 //! Motor OS's `motor.rs` is the file-shape donor; ASK rewrites spawn around
-//! `OP_LAUNCH` because `std` cannot depend on `askme`.
+//! `OP_LAUNCH` and an inherited `APP_LAUNCHER_TOKEN` because `std` cannot
+//! depend on `askme`.
 
 use super::CommandEnvs;
 use super::env::{CommandEnv, CommandResolvedEnvs};
@@ -14,7 +15,7 @@ use crate::sync::{Mutex, OnceLock};
 use crate::sys::channel::SyncChannel;
 use crate::sys::fs::File;
 use crate::sys::pipe::Pipe;
-use crate::sys::{env, pal};
+use crate::sys::pal;
 use crate::{fmt, io};
 
 pub type EnvKey = OsString;
@@ -229,28 +230,9 @@ fn append_stdio_env(
     Ok(())
 }
 
-fn launcher_pid() -> io::Result<u32> {
-    if let Some(pid) = parse_env_pid("ASK_LAUNCHER_PID") {
-        return Ok(pid);
-    }
-    if let Some(pid) = parse_env_pid("ASKHELL_LAUNCHER_PID") {
-        return Ok(pid);
-    }
-    Err(io::const_error!(
-        io::ErrorKind::NotFound,
-        "ASK_LAUNCHER_PID is not in the process environment"
-    ))
-}
-
-fn parse_env_pid(key: &str) -> Option<u32> {
-    let value = env::getenv(OsStr::new(key))?;
-    value.to_str()?.parse().ok()
-}
-
 fn launcher() -> io::Result<crate::sync::MutexGuard<'static, SyncChannel>> {
     let cell = LAUNCHER.get_or_try_init(|| {
-        let pid = launcher_pid()?;
-        SyncChannel::create(u64::from(pid), ask_io::process::CHANNEL_PAGES)
+        SyncChannel::create_leased(ask_abi::APP_LAUNCHER_TOKEN, ask_io::process::CHANNEL_PAGES)
             .map(Mutex::new)
             .map_err(|_| {
                 io::const_error!(io::ErrorKind::NotConnected, "launcher channel rejected")
