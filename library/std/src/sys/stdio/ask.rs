@@ -38,8 +38,8 @@ pub fn adopt_command_stdio() {
     if env::getenv(OsStr::new("ASK_STDIN_PIPE")).is_none() {
         pipe::discard_unclaimed_channels();
     }
-    if let Some(pid) = env_u32("ASK_STDOUT_TO_PID") {
-        match pipe::writer_to_peer(pid) {
+    if env::getenv(OsStr::new("ASK_STDOUT_PIPE")).is_some() {
+        match pipe::writer_to_endpoint(ask_abi::app_stdio_endpoint::PARENT) {
             Ok(pipe) => {
                 *STDOUT_PIPE.lock().unwrap_or_else(|e| e.into_inner()) = Some(pipe);
             }
@@ -48,8 +48,8 @@ pub fn adopt_command_stdio() {
             }
         }
     }
-    if let Some(pid) = env_u32("ASK_STDERR_TO_PID") {
-        match pipe::writer_to_peer(pid) {
+    if env::getenv(OsStr::new("ASK_STDERR_PIPE")).is_some() {
+        match pipe::writer_to_endpoint(ask_abi::app_stdio_endpoint::PARENT) {
             Ok(pipe) => {
                 *STDERR_PIPE.lock().unwrap_or_else(|e| e.into_inner()) = Some(pipe);
             }
@@ -63,10 +63,6 @@ pub fn adopt_command_stdio() {
             *STDIN_PIPE.lock().unwrap_or_else(|e| e.into_inner()) = Some(pipe);
         }
     }
-}
-
-fn env_u32(key: &str) -> Option<u32> {
-    env::getenv(OsStr::new(key))?.to_str()?.parse().ok()
 }
 
 /// True once this process has adopted a controlling-terminal Channel lease.

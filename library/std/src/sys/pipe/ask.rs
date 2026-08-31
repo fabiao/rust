@@ -67,8 +67,8 @@ pub fn pipe() -> io::Result<(Pipe, Pipe)> {
     ))
 }
 
-pub(crate) fn writer_to_peer(peer: u32) -> io::Result<Pipe> {
-    let channel = ask_ipc::sync::SyncChannel::connect(peer, ask_io::pipe::CHANNEL_PAGES)
+pub(crate) fn writer_to_endpoint(token: u32) -> io::Result<Pipe> {
+    let channel = ask_ipc::sync::SyncChannel::create_leased(token, ask_io::pipe::CHANNEL_PAGES)
         .map_err(map_ipc_error)?;
     Ok(Pipe {
         inner: Arc::new(Mutex::new(Inner::Writer { channel, eof_sent: false })),

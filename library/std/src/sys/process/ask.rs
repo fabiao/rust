@@ -150,9 +150,9 @@ impl Command {
         append_stdio_env(&mut env_pairs, &stdin, &stdout, &stderr)?;
         let env = pack_env_pairs(&env_pairs)?;
 
-        let pid = launch(name, &argv, &env)?;
-        let pipes = attach_parent_stdio(pid, &stdin, &stdout, &stderr)?;
-        Ok((Process { pid, status: None }, pipes))
+        let launched = launch(name, &argv, &env)?;
+        let pipes = attach_parent_stdio(launched, &stdin, &stdout, &stderr)?;
+        Ok((Process { pid: launched.pid, status: None }, pipes))
     }
 }
 
@@ -217,15 +217,14 @@ fn append_stdio_env(
     stdout: &Stdio,
     stderr: &Stdio,
 ) -> io::Result<()> {
-    let self_pid = OsString::from(getpid().to_string());
     if matches!(stdin, Stdio::MakePipe) {
         push_env(pairs, "ASK_STDIN_PIPE", OsString::from("1"));
     }
     if matches!(stdout, Stdio::MakePipe) {
-        push_env(pairs, "ASK_STDOUT_TO_PID", self_pid.clone());
+        push_env(pairs, "ASK_STDOUT_PIPE", OsString::from("1"));
     }
     if matches!(stderr, Stdio::MakePipe) {
-        push_env(pairs, "ASK_STDERR_TO_PID", self_pid);
+        push_env(pairs, "ASK_STDERR_PIPE", OsString::from("1"));
     }
     Ok(())
 }
@@ -241,7 +240,7 @@ fn launcher() -> io::Result<crate::sync::MutexGuard<'static, SyncChannel>> {
     Ok(cell.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
-fn launch(name: &[u8], argv: &[u8], env: &[u8]) -> io::Result<u32> {
+fn launch(name: &[u8], argv: &[u8], env: &[u8]) -> io::Result<ask_io::process::LaunchReply> {
     let total = name
         .len()
         .checked_add(argv.len())
@@ -269,6 +268,7 @@ fn launch(name: &[u8], argv: &[u8], env: &[u8]) -> io::Result<u32> {
         env: ask_io::process::Buffer::new(env_offset as u32, env.len() as u32)
             .ok_or_else(pal::unsupported_err)?,
         flags: ask_io::process::FLAG_FOREGROUND,
+        stdout_peer_pid: 0,
     };
     let mut payload = [0; ask_io::process::LAUNCH_REQUEST_LEN];
     let completion = guard.call(
@@ -279,27 +279,27 @@ fn launch(name: &[u8], argv: &[u8], env: &[u8]) -> io::Result<u32> {
     if completion.result != ask_io::process::RESULT_OK {
         return Err(map_process_result(completion.result));
     }
-    ask_io::process::decode_process_id(completion.payload()).ok_or_else(pal::unsupported_err)
+    ask_io::process::decode_launch_reply(completion.payload()).ok_or_else(pal::unsupported_err)
 }
 
 fn attach_parent_stdio(
-    child: u32,
+    child: ask_io::process::LaunchReply,
     stdin: &Stdio,
     stdout: &Stdio,
     stderr: &Stdio,
 ) -> io::Result<StdioPipes> {
     let stdin_pipe = if matches!(stdin, Stdio::MakePipe) {
-        Some(crate::sys::pipe::writer_to_peer(child)?)
+        Some(crate::sys::pipe::writer_to_endpoint(child.endpoint_token)?)
     } else {
         None
     };
     let stdout_pipe = if matches!(stdout, Stdio::MakePipe) {
-        Some(crate::sys::pipe::accept_reader_from(child)?)
+        Some(crate::sys::pipe::accept_reader_from(child.pid)?)
     } else {
         None
     };
     let stderr_pipe = if matches!(stderr, Stdio::MakePipe) {
-        Some(crate::sys::pipe::accept_reader_from(child)?)
+        Some(crate::sys::pipe::accept_reader_from(child.pid)?)
     } else {
         None
     };
