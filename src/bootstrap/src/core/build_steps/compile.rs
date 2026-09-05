@@ -2839,6 +2839,15 @@ pub fn stream_cargo(
                 if builder.config.json_output {
                     // Forward JSON to stdout.
                     println!("{line}");
+                } else if let CargoMessage::CompilerArtifact { package_id, .. } = &msg {
+                    // `--message-format=json-render-diagnostics` (required so real
+                    // diagnostics below still render as text) delivers Cargo's own
+                    // per-crate "Compiling <pkg>" status as structured JSON instead
+                    // of printing it — `cb` below only uses it for bookkeeping, so
+                    // without this a piped/non-interactive caller (e.g. a captured
+                    // build log) sees just this step's one coarse banner instead of
+                    // per-crate progress.
+                    println!("   Compiling {}", friendly_package_id(package_id));
                 }
                 cb(msg)
             }
@@ -2859,6 +2868,22 @@ pub fn stream_cargo(
     status.success()
 }
 
+/// Cargo's `package_id` in a `compiler-artifact` message is a SourceId spec
+/// (`<kind>+<url>#[name@]version`, e.g. `registry+https://…#proc-macro2@1.0.106`
+/// or `path+file:///…/rustc_macros#0.0.0` — a path/git source omits the name
+/// when it matches the source's last path segment). Recover a plain
+/// "name version" for `stream_cargo`'s printed line, matching what a normal
+/// `cargo build` (human message format) would have shown.
+fn friendly_package_id(package_id: &str) -> String {
+    let after_hash = package_id.rsplit('#').next().unwrap_or(package_id);
+    if let Some((name, version)) = after_hash.split_once('@') {
+        return format!("{name} {version}");
+    }
+    let before_hash = &package_id[..package_id.len() - after_hash.len()];
+    let name = before_hash.trim_end_matches('#').rsplit(['/', '\\']).next().unwrap_or(before_hash);
+    format!("{name} {after_hash}")
+}
+
 #[derive(Deserialize)]
 pub struct CargoTarget<'a> {
     crate_types: Vec<Cow<'a, str>>,
@@ -2867,7 +2892,11 @@ pub struct CargoTarget<'a> {
 #[derive(Deserialize)]
 #[serde(tag = "reason", rename_all = "kebab-case")]
 pub enum CargoMessage<'a> {
-    CompilerArtifact { filenames: Vec<Cow<'a, str>>, target: CargoTarget<'a> },
+    CompilerArtifact {
+        package_id: Cow<'a, str>,
+        filenames: Vec<Cow<'a, str>>,
+        target: CargoTarget<'a>,
+    },
     BuildScriptExecuted,
     BuildFinished,
 }
