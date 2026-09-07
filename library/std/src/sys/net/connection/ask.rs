@@ -732,11 +732,23 @@ fn resolver_channel() -> io::Result<MutexGuard<'static, SyncChannel>> {
     ask_sys::log("resolver PAL: acquiring channel");
     let cell = RESOLVER_CHANNEL.get_or_try_init(|| {
         ask_sys::log("resolver PAL: creating leased channel");
-        SyncChannel::create_leased(ask_abi::APP_RESOLVER_TOKEN, ask_io::resolver::CHANNEL_PAGES)
-            .map(Mutex::new)
-            .map_err(|_| {
-                io::const_error!(io::ErrorKind::NotConnected, "no resolver lease")
-            })
+        match SyncChannel::create_leased(
+            ask_abi::APP_RESOLVER_TOKEN,
+            ask_io::resolver::CHANNEL_PAGES,
+        ) {
+            Ok(channel) => Ok(Mutex::new(channel)),
+            Err(error) => {
+                eprintln!(
+                    "resolver PAL: lease creation failed token={} pages={} error={error:?}",
+                    ask_abi::APP_RESOLVER_TOKEN,
+                    ask_io::resolver::CHANNEL_PAGES,
+                );
+                Err(io::const_error!(
+                    io::ErrorKind::NotConnected,
+                    "no resolver lease"
+                ))
+            }
+        }
     })?;
     ask_sys::log("resolver PAL: channel ready");
     Ok(cell.lock().unwrap_or_else(|e| e.into_inner()))
