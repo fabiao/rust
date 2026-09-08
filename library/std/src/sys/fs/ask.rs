@@ -119,16 +119,14 @@ impl FileType {
         !self.is_dir
     }
 
-    /// `askfs` exposes no symlink type bit in `FsStat.mode`, and `OP_SYMLINK`
-    /// targets are resolved provider-side, so no path reaches this PAL as a
-    /// link (docs/vfs-layout.md).
+    /// Symlink targets are currently resolved provider-side before this PAL.
     pub fn is_symlink(&self) -> bool {
         false
     }
 }
 
-/// A path-addressed `FS_OP_STAT` reply, or the size-only projection an open
-/// `File` can answer from `FS_OP_OPEN`. `askfs` carries no creation
+/// Path-addressed metadata, or the size-only projection an open `File` can
+/// answer from `FS_OP_OPEN`. `askfs` carries no creation
 /// timestamp, so `created()` stays unsupported while `modified()`/`accessed()`
 /// resolve whenever the attributes came from `stat` (docs/vfs-layout.md).
 #[derive(Clone)]
@@ -137,7 +135,7 @@ pub struct FileAttr {
     mode: u32,
     is_dir: bool,
     /// `None` for the open-handle projection, which has no timestamps on the
-    /// wire; `Some` once `FS_OP_STAT` supplied them.
+    /// wire; `Some` once a metadata query supplied them.
     times: Option<FileStatTimes>,
 }
 
@@ -147,7 +145,7 @@ struct FileStatTimes {
     modified_sec: i64,
 }
 
-/// `FsStat.mode`'s owner-write bit. `askfs` masks the POSIX permission bits
+/// The native metadata mode's owner-write bit.
 /// server-side, so readonly is decided by the same bit `FS_OP_FCHMOD` sets.
 const MODE_OWNER_WRITE: u32 = 0o200;
 
@@ -156,7 +154,7 @@ const MODE_OWNER_WRITE: u32 = 0o200;
 /// `0777 & ~umask` default shells expect. `askfs` applies its own mask.
 const DEFAULT_DIR_MODE: u32 = 0o755;
 
-/// `FsStat` timestamps are signed seconds from the Unix epoch; `SystemTime`
+/// Native timestamps are signed nanoseconds from the Unix epoch; `SystemTime`
 /// is an unsigned offset from it, so a pre-epoch stamp subtracts instead.
 fn system_time_from_secs(secs: i64) -> SystemTime {
     let magnitude = crate::time::Duration::from_secs(secs.unsigned_abs());
@@ -169,14 +167,14 @@ fn system_time_from_secs(secs: i64) -> SystemTime {
 }
 
 impl FileAttr {
-    fn from_stat(stat: ask_io::fs::FsStat) -> FileAttr {
+    fn from_metadata(metadata: ask_io::fs::Metadata) -> FileAttr {
         FileAttr {
-            size: stat.size,
-            mode: stat.mode,
-            is_dir: stat.mode & ask_io::fs::MODE_DIR != 0,
+            size: metadata.size,
+            mode: metadata.mode,
+            is_dir: metadata.kind == ask_io::fs::NodeKind::Directory as u8,
             times: Some(FileStatTimes {
-                accessed_sec: stat.atime_sec,
-                modified_sec: stat.mtime_sec,
+                accessed_sec: metadata.atime_ns / 1_000_000_000,
+                modified_sec: metadata.mtime_ns / 1_000_000_000,
             }),
         }
     }
@@ -289,13 +287,8 @@ struct Inner {
     size: u64,
 }
 
-/// A single open file: its own `SyncChannel` to `askfs` (one handle per
-/// session — see the module doc comment). `std::fs::File`'s trait contract
-/// takes every operation through `&self` (it's `Sync`-shared via `Arc` in
-/// some callers), so the channel and cursor live behind a `Mutex` — this PAL
-/// still only ever drives one wire round trip at a time per `File`, matching
-/// `askfs`'s own one-handle-per-session posture, but a real lock (not a
-/// `!Sync` cell) keeps two threads sharing an `Arc<File>` from racing.
+/// A single open file with its own `SyncChannel` and handle. The mutex
+/// serializes wire operations and cursor updates when callers share the file.
 pub struct File {
     inner: Mutex<Inner>,
     handle: u32,
@@ -306,7 +299,7 @@ fn map_fs_result(result: i32) -> io::Result<()> {
     if result < 0 { Err(unsupported_err()) } else { Ok(()) }
 }
 
-/// `OP_STAT`/`OP_UNLINK`-shaped requests carry bare path bytes; every one is
+/// Metadata/`OP_UNLINK`-shaped requests carry bare path bytes; every one is
 /// bounded by `STAT_PATH_MAX` rather than `OPEN_PATH_MAX`.
 fn bounded_path(path: &[u8]) -> io::Result<&[u8]> {
     if path.len() > ask_io::fs::STAT_PATH_MAX {
@@ -316,9 +309,9 @@ fn bounded_path(path: &[u8]) -> io::Result<&[u8]> {
 }
 
 /// One path-addressed round trip. `askfs`'s stateless metadata operations
-/// (`FS_OP_STAT`, `MKDIR`, `UNLINK`, `RENAME`, `READDIR`, ...) need no open
-/// handle, but each still requires its own accepted session, since a session
-/// admits one handle at a time (`MAX_OPEN_HANDLES = 1`).
+/// (metadata, `MKDIR`, `UNLINK`, `RENAME`, directory enumeration, ...) need no open
+/// handle, but each still requires an accepted session because the provider
+/// serves only one client Channel at a time.
 fn metadata_call<T>(
     provider_token: u32,
     op: u32,
@@ -358,10 +351,10 @@ fn stat_path(path: &Path) -> io::Result<FileAttr> {
     let payload = bounded_path(relative.as_bytes())?;
     metadata_call(
         provider_token,
-        ask_io::fs::OP_STAT,
+        ask_io::fs::OP_METADATA,
         payload,
         "fs: stat failed",
-        |reply| ask_io::fs::decode_fs_stat_reply(reply).map(FileAttr::from_stat),
+        |reply| ask_io::fs::decode_fs_metadata(reply).map(FileAttr::from_metadata),
     )
 }
 
@@ -398,7 +391,7 @@ impl File {
 
     /// The open handle carries only the size `FS_OP_OPEN` returned; `askfs`
     /// has no handle-addressed stat, and reopening a path-addressed
-    /// `FS_OP_STAT` session here would race the caller's own writes.
+    /// metadata session here would race the caller's own writes.
     pub fn file_attr(&self) -> io::Result<FileAttr> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         Ok(FileAttr {
@@ -611,9 +604,7 @@ impl DirBuilder {
     }
 }
 
-/// `FS_OP_READDIR` is stateless and cursor-addressed: each call names the
-/// directory path and a 0-based index, so the iterator holds the caller's
-/// path and its next cursor rather than a server-side open handle.
+/// Directory enumeration is stateless and opaque-cookie-addressed.
 pub struct ReadDir {
     provider_token: u32,
     relative: heapless_path::PathBuf,
@@ -621,7 +612,7 @@ pub struct ReadDir {
     /// return a path in the caller's own namespace rather than a
     /// provider-relative one.
     root: PathBuf,
-    cursor: u32,
+    cookie: ask_io::fs::DirCookie,
     exhausted: bool,
 }
 
@@ -638,10 +629,10 @@ impl Iterator for ReadDir {
         if self.exhausted {
             return None;
         }
-        let mut request = [0u8; 4 + ask_io::fs::STAT_PATH_MAX];
-        let payload = match ask_io::fs::encode_fs_readdir_request(
+        let mut request = [0u8; 16 + ask_io::fs::STAT_PATH_MAX];
+        let payload = match ask_io::fs::encode_fs_directory_request(
             &mut request,
-            self.cursor,
+            self.cookie,
             self.relative.as_bytes(),
         ) {
             Some(payload) => payload,
@@ -661,28 +652,34 @@ impl Iterator for ReadDir {
                 )));
             }
         };
-        let completion = match channel.call(ask_io::fs::OP_READDIR, payload) {
+        let completion = match channel.call(ask_io::fs::OP_READ_DIRECTORY, payload) {
             Ok(completion) => completion,
             Err(e) => {
                 self.exhausted = true;
                 return Some(Err(e));
             }
         };
-        // A negative result is this provider's end-of-directory signal as well
-        // as its error channel; `askfs` reports the cursor running past the
-        // last child the same way, so stop rather than surfacing an error.
-        if completion.result < 0 {
+        if completion.result == ask_io::fs::READDIR_RESULT_EOF {
             self.exhausted = true;
             return None;
         }
-        let (_, d_type, name) = match ask_io::fs::decode_fs_readdir_reply(completion.payload()) {
-            Some(entry) => entry,
-            None => {
-                self.exhausted = true;
-                return Some(Err(unsupported_err()));
-            }
-        };
-        self.cursor = self.cursor.saturating_add(1);
+        if completion.result != 0 {
+            self.exhausted = true;
+            return Some(Err(io::const_error!(io::ErrorKind::Other, "fs: readdir failed")));
+        }
+        let (next, _, kind, name) =
+            match ask_io::fs::decode_fs_directory_reply(completion.payload()) {
+                Some(entry) => entry,
+                None => {
+                    self.exhausted = true;
+                    return Some(Err(unsupported_err()));
+                }
+            };
+        if next.generation == 0 || next == self.cookie {
+            self.exhausted = true;
+            return Some(Err(unsupported_err()));
+        }
+        self.cookie = next;
 
         let name = match crate::str::from_utf8(name) {
             Ok(name) => name,
@@ -694,7 +691,7 @@ impl Iterator for ReadDir {
         Some(Ok(DirEntry {
             path: self.root.join(name),
             name: OsString::from(name),
-            is_dir: d_type == ask_io::fs::DT_DIR,
+            is_dir: kind == ask_io::fs::NodeKind::Directory as u8,
         }))
     }
 }
@@ -714,8 +711,7 @@ impl DirEntry {
         self.name.clone()
     }
 
-    /// `FS_OP_READDIR` carries only the entry's type byte, so a full
-    /// attribute set needs its own path-addressed `FS_OP_STAT`.
+    /// A full attribute set requires its own path-addressed metadata query.
     pub fn metadata(&self) -> io::Result<FileAttr> {
         stat_path(&self.path)
     }
@@ -733,7 +729,7 @@ pub fn readdir(path: &Path) -> io::Result<ReadDir> {
         provider_token,
         relative,
         root: path.to_path_buf(),
-        cursor: 0,
+        cookie: ask_io::fs::DirCookie::default(),
         exhausted: false,
     })
 }
@@ -783,10 +779,9 @@ pub fn rmdir(path: &Path) -> io::Result<()> {
 }
 
 /// `askfs` has no recursive-remove operation, so this walks the tree with
-/// `FS_OP_READDIR` and removes depth-first. Each level's entries are read to
-/// completion before descending, since a session admits one operation at a
-/// time and holding an open cursor across the child's own removals would
-/// deadlock against that bound.
+/// opaque-cookie directory enumeration and removes depth-first. Each level's
+/// entries are read to completion before descending so mutation cannot stale
+/// a cookie still needed by that level.
 pub fn remove_dir_all(path: &Path) -> io::Result<()> {
     for entry in readdir(path)? {
         let entry = entry?;
