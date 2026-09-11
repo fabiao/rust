@@ -88,3 +88,10 @@ rustc-std-workspace-std = { path = 'rustc-std-workspace-std' }
 
 # See comments in `library/windows-sys/Cargo.toml` for why this is patched
 windows-sys = { path = 'windows-sys' }
+
+# ASK's std PAL consumes these packages by path below. Their own manifests
+# retain ordinary version dependencies so non-Rust-tree consumers resolve
+# through ASK's explicit registry overlay; scope the two transitive redirects
+# to this workspace rather than inheriting the superproject's full catalog.
+askabi = { path = '../../../../core/libs/askabi/source' }
+asksys = { path = '../../../../core/libs/asksys/source' }
