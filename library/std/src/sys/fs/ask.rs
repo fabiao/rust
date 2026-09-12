@@ -146,7 +146,7 @@ struct FileStatTimes {
 }
 
 /// The native metadata mode's owner-write bit.
-/// server-side, so readonly is decided by the same bit `FS_OP_FCHMOD` sets.
+/// server-side, so readonly is decided by the same bit `OP_CHMOD` sets.
 const MODE_OWNER_WRITE: u32 = 0o200;
 
 /// Permission bits requested for a `DirBuilder`-created directory: owner
