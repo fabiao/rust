@@ -344,11 +344,17 @@ fn metadata_unit(
     Ok(())
 }
 
-/// Shared by `stat` and `lstat` — `askfs` resolves symlinks provider-side and
-/// exposes no nofollow variant, so both spellings observe the same target.
-fn stat_path(path: &Path) -> io::Result<FileAttr> {
+/// Shared path query; the provider performs final-symlink traversal according
+/// to the request flag in the same namespace operation as metadata lookup.
+fn stat_path(path: &Path, nofollow: bool) -> io::Result<FileAttr> {
     let (provider_token, relative) = resolve_fs_path(path)?;
-    let payload = bounded_path(relative.as_bytes())?;
+    let mut request = [0u8; ask_io::fs::FS_METADATA_PATH_REQUEST_MAX];
+    let payload = ask_io::fs::encode_fs_metadata_path_request(
+        &mut request,
+        bounded_path(relative.as_bytes())?,
+        nofollow,
+    )
+    .ok_or_else(unsupported_err)?;
     metadata_call(
         provider_token,
         ask_io::fs::OP_METADATA,
@@ -389,17 +395,17 @@ impl File {
         })
     }
 
-    /// The open handle carries only the size `FS_OP_OPEN` returned; `askfs`
-    /// has no handle-addressed stat, and reopening a path-addressed
-    /// metadata session here would race the caller's own writes.
+    /// Query the provider object retained by this open description, avoiding
+    /// both a path race and stale client-side size/timestamp projections.
     pub fn file_attr(&self) -> io::Result<FileAttr> {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(FileAttr {
-            size: inner.size,
-            mode: MODE_OWNER_WRITE,
-            is_dir: false,
-            times: None,
-        })
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut request = [0u8; ask_io::fs::FS_METADATA_HANDLE_REQUEST_LEN];
+        let payload = ask_io::fs::encode_fs_metadata_handle_request(&mut request, self.handle);
+        let completion = inner.channel.call(ask_io::fs::OP_METADATA, payload)?;
+        map_fs_result(completion.result)?;
+        ask_io::fs::decode_fs_metadata(completion.payload())
+            .map(FileAttr::from_metadata)
+            .ok_or_else(unsupported_err)
     }
 
     pub fn fsync(&self) -> io::Result<()> {
@@ -713,7 +719,7 @@ impl DirEntry {
 
     /// A full attribute set requires its own path-addressed metadata query.
     pub fn metadata(&self) -> io::Result<FileAttr> {
-        stat_path(&self.path)
+        stat_path(&self.path, true)
     }
 
     pub fn file_type(&self) -> io::Result<FileType> {
@@ -817,11 +823,11 @@ pub fn link(_src: &Path, _dst: &Path) -> io::Result<()> {
 }
 
 pub fn stat(path: &Path) -> io::Result<FileAttr> {
-    stat_path(path)
+    stat_path(path, false)
 }
 
 pub fn lstat(path: &Path) -> io::Result<FileAttr> {
-    stat_path(path)
+    stat_path(path, true)
 }
 
 pub fn set_perm(_path: &Path, _perm: FilePermissions) -> io::Result<()> {
