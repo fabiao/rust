@@ -258,14 +258,29 @@ pub fn wake(target_pid: u64) -> Result<(), Error> {
     decode(unsafe { syscall2(SYS_WAKE, target_pid, 0) }).map(|_| ())
 }
 
-/// `MapPhysical(virt, phys, len, writable)`: map a fixed physical range into
-/// this process's own address space (docs/12-device-management.md).
-/// Requires a `Capability::MapPhysical` token covering `[phys, phys+len)`.
-pub fn map_physical(virt: u64, phys: u64, len: u64, writable: bool) -> Result<(), Error> {
+/// `MapPhysical(virt, phys, len, writable, token)`: map a fixed physical range
+/// through one explicitly selected covering capability.
+pub fn map_physical(
+    virt: u64,
+    phys: u64,
+    len: u64,
+    writable: bool,
+    token: u32,
+) -> Result<(), Error> {
     // Safety: caller-provided ranges; the kernel validates `virt` against
     // `USER_ADDR_LIMIT` and `[phys, phys+len)` against the caller's
     // `MapPhysical` capability before touching any mapping.
-    decode(unsafe { syscall4(SYS_MAP_PHYSICAL, virt, phys, len, writable as u64) }).map(|_| ())
+    decode(unsafe {
+        syscall5(
+            SYS_MAP_PHYSICAL,
+            virt,
+            phys,
+            len,
+            writable as u64,
+            u64::from(token),
+        )
+    })
+    .map(|_| ())
 }
 
 /// `MapIoPort(port, len)`: activate `[port, port+len)` for direct Ring 3
