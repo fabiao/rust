@@ -145,6 +145,29 @@ unsafe fn syscall5(id: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 
     ret
 }
 
+/// # Safety
+/// Any pointer argument must be valid for the kernel's synchronous access
+/// during the call.
+unsafe fn syscall6(id: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
+    let ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") id => ret,
+            in("rdi") a0,
+            in("rsi") a1,
+            in("rdx") a2,
+            in("r10") a3,
+            in("r8") a4,
+            in("r9") a5,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
 /// `Log(ptr, len)`: print a UTF-8 string, clamped to `LOG_MAX`. Prefer
 /// `askme`'s `logln!` (or the std PAL's stdout) over calling this directly.
 pub fn log(msg: &str) {
@@ -199,11 +222,12 @@ pub fn revoke(virt: u64, len: u64) -> Result<(), Error> {
     decode(unsafe { syscall2(SYS_REVOKE, virt, len) }).map(|_| ())
 }
 
-/// `Grant(target_pid, virt, len, dest_virt, grant_token)`: share this
-/// process's mapping into another address space using the explicitly selected
-/// `Capability::Grant` authority.
+/// `Grant(target_pid, target_generation, virt, len, dest_virt, grant_token)`:
+/// share this process's mapping into a child address space using exact sender
+/// and receiver generations plus the explicitly selected `Capability::Grant`.
 pub fn grant(
     target_pid: u64,
+    target_generation: u64,
     virt: u64,
     len: u64,
     dest_virt: u64,
@@ -211,8 +235,18 @@ pub fn grant(
 ) -> Result<(), Error> {
     // Safety: shares a page this process mapped and, by convention, has
     // already finished writing to before granting it away.
-    decode(unsafe { syscall5(SYS_GRANT, target_pid, virt, len, dest_virt, u64::from(grant_token)) })
-        .map(|_| ())
+    decode(unsafe {
+        syscall6(
+            SYS_GRANT,
+            target_pid,
+            target_generation,
+            virt,
+            len,
+            dest_virt,
+            u64::from(grant_token),
+        )
+    })
+    .map(|_| ())
 }
 
 /// `ChannelCreate(target_pid, pages)`: establish a shared-memory channel,
