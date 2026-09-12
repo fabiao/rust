@@ -76,19 +76,19 @@ pub(crate) fn writer_to_endpoint(token: u32) -> io::Result<Pipe> {
 }
 
 pub(crate) fn accept_reader() -> io::Result<Pipe> {
-    let (virt, _peer, pages, _) = ask_sys::channel_accept(ask_abi::ChannelAcceptFilter::any())
+    let (virt, metadata) = ask_sys::channel_accept(ask_abi::ChannelAcceptFilter::any())
         .map_err(crate::sys::map_ask_error)?;
-    attach_reader(virt, pages)
+    attach_reader(virt, metadata.pages)
 }
 
 /// Claim the next mailbox deposit from `peer`, leaving unrelated deposits
 /// parked for their own Exact or Any acceptor.
 pub(crate) fn accept_reader_from(peer: u32) -> io::Result<Pipe> {
-    let (virt, _depositor, pages, _) = ask_sys::channel_accept(ask_abi::ChannelAcceptFilter::exact(
+    let (virt, metadata) = ask_sys::channel_accept(ask_abi::ChannelAcceptFilter::exact(
         u64::from(peer),
     ))
     .map_err(crate::sys::map_ask_error)?;
-    attach_reader(virt, pages)
+    attach_reader(virt, metadata.pages)
 }
 
 /// Drop every currently pending mailbox channel. Used when this process will
@@ -96,7 +96,7 @@ pub(crate) fn accept_reader_from(peer: u32) -> io::Result<Pipe> {
 pub(crate) fn discard_unclaimed_channels() {
     loop {
         match ask_sys::try_channel_accept(ask_abi::ChannelAcceptFilter::any()) {
-            Ok((virt, _, pages, _)) => revoke_mapping(virt, pages),
+            Ok((virt, metadata)) => revoke_mapping(virt, metadata.pages),
             Err(_) => break,
         }
     }
