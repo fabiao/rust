@@ -23,7 +23,8 @@ struct BumpState {
     end: AtomicU64,
 }
 
-static STATE: BumpState = BumpState { next: AtomicU64::new(HEAP_BASE), end: AtomicU64::new(HEAP_BASE) };
+static STATE: BumpState =
+    BumpState { next: AtomicU64::new(HEAP_BASE), end: AtomicU64::new(HEAP_BASE) };
 static LOCK: AtomicBool = AtomicBool::new(false);
 
 /// Single-core cooperative scheduler today (docs/04-scheduling.md) — a
