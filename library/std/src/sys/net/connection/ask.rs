@@ -107,6 +107,9 @@ fn netstack_error(result: i32) -> io::Error {
         ask_io::net::RESULT_INVALID => {
             io::const_error!(io::ErrorKind::InvalidInput, "netstack rejected request")
         }
+        ask_io::net::RESULT_EXHAUSTED => {
+            io::const_error!(io::ErrorKind::OutOfMemory, "netstack resource quota exhausted")
+        }
         _ => io::const_error!(io::ErrorKind::Other, "netstack operation failed"),
     }
 }
