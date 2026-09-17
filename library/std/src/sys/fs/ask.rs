@@ -299,6 +299,38 @@ fn map_fs_result(result: i32) -> io::Result<()> {
     if result < 0 { Err(unsupported_err()) } else { Ok(()) }
 }
 
+/// Translate one negative `askfs` reply into the closest `io::ErrorKind`.
+///
+/// The provider answers with a typed `ask_io::fs::FsError`, and collapsing all
+/// of them into `NotFound` made a quota refusal or a busy provider read as a
+/// missing path — actively misleading, and indistinguishable to a caller that
+/// wants to react to one but not the others. Unrecognized codes keep the
+/// conservative `Other`, never a specific kind the provider did not state.
+fn fs_error(result: i32, context: &'static str) -> io::Error {
+    use ask_io::fs::FsError;
+
+    let kind = match FsError::from_result(result) {
+        Some(FsError::NotFound) => io::ErrorKind::NotFound,
+        Some(FsError::NotDirectory) => io::ErrorKind::NotADirectory,
+        Some(FsError::IsDirectory) => io::ErrorKind::IsADirectory,
+        Some(FsError::PermissionDenied) => io::ErrorKind::PermissionDenied,
+        Some(FsError::ReadOnlyFilesystem) => io::ErrorKind::ReadOnlyFilesystem,
+        Some(FsError::AlreadyExists) => io::ErrorKind::AlreadyExists,
+        Some(FsError::DirectoryNotEmpty) => io::ErrorKind::DirectoryNotEmpty,
+        Some(FsError::CrossDevice) => io::ErrorKind::CrossesDevices,
+        Some(FsError::Invalid) => io::ErrorKind::InvalidInput,
+        Some(FsError::NameTooLong) => io::ErrorKind::InvalidFilename,
+        Some(FsError::NoSpace) => io::ErrorKind::StorageFull,
+        Some(FsError::QuotaExceeded) => io::ErrorKind::QuotaExceeded,
+        Some(FsError::Busy) => io::ErrorKind::ResourceBusy,
+        Some(FsError::StaleHandle) => io::ErrorKind::StaleNetworkFileHandle,
+        Some(FsError::Unsupported) => io::ErrorKind::Unsupported,
+        Some(FsError::Cancelled) => io::ErrorKind::Interrupted,
+        Some(FsError::Io) | Some(FsError::Malformed) | None => io::ErrorKind::Other,
+    };
+    io::Error::new(kind, context)
+}
+
 /// Metadata/`OP_UNLINK`-shaped requests carry bare path bytes; every one is
 /// bounded by `STAT_PATH_MAX` rather than `OPEN_PATH_MAX`.
 fn bounded_path(path: &[u8]) -> io::Result<&[u8]> {
@@ -323,7 +355,7 @@ fn metadata_call<T>(
         .map_err(|_| io::const_error!(io::ErrorKind::NotFound, "fs provider unreachable"))?;
     let completion = channel.call(op, payload)?;
     if completion.result < 0 {
-        return Err(io::Error::new(io::ErrorKind::NotFound, not_found));
+        return Err(fs_error(completion.result, not_found));
     }
     decode(completion.payload()).ok_or_else(unsupported_err)
 }
@@ -376,12 +408,15 @@ impl File {
                 .ok_or_else(unsupported_err)?;
         let completion = channel.call(ask_io::fs::OP_OPEN, payload)?;
         if completion.result < 0 {
-            return Err(io::const_error!(io::ErrorKind::NotFound, "fs: open failed"));
+            return Err(fs_error(completion.result, "fs: open failed"));
         }
         let (handle, size) =
             ask_io::fs::decode_fs_open_reply(completion.payload()).ok_or_else(unsupported_err)?;
         if handle == ask_io::fs::HANDLE_INVALID {
-            return Err(io::const_error!(io::ErrorKind::NotFound, "fs: open failed"));
+            return Err(io::const_error!(
+                io::ErrorKind::Other,
+                "fs: open returned no handle"
+            ));
         }
 
         Ok(File {
@@ -441,7 +476,7 @@ impl File {
         );
         let completion = inner.channel.call(ask_io::fs::OP_READ, payload)?;
         if completion.result < 0 {
-            return Err(io::const_error!(io::ErrorKind::Other, "askfs: read failed"));
+            return Err(fs_error(completion.result, "askfs: read failed"));
         }
         let data = completion.payload();
         let n = data.len().min(buf.len());
@@ -476,7 +511,7 @@ impl File {
                 .ok_or_else(unsupported_err)?;
         let completion = inner.channel.call(ask_io::fs::OP_WRITE, payload)?;
         if completion.result < 0 {
-            return Err(io::const_error!(io::ErrorKind::Other, "askfs: write failed"));
+            return Err(fs_error(completion.result, "askfs: write failed"));
         }
         let written = ask_io::fs::decode_fs_handle(completion.payload())
             .ok_or_else(unsupported_err)? as usize;
