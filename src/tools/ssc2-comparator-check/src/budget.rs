@@ -32,7 +32,7 @@ use rustc_middle::ty::{self, Instance, TyCtxt};
 /// default here instead of a Cargo dependency because `recipes/tools/rust`
 /// is a separate submodule/workspace that must never depend on a crate
 /// outside itself (docs/rust-toolchain.md, "ask-specific `src/tools/*`
-/// additions"). `ask_cookbook sign` (outside that submodule, so free to
+/// additions"). `askchef sign` (outside that submodule, so free to
 /// depend on `askabi` directly) is the real single source of truth at
 /// runtime: it passes `--stack-budget-pages=<askabi::sched::
 /// COMPARATOR_STACK_BUDGET_PAGES>`/`--block-budget=<askabi::sched::
@@ -40,7 +40,7 @@ use rustc_middle::ty::{self, Instance, TyCtxt};
 /// strip`, `main.rs`), so these consts only serve a standalone/manual
 /// invocation of this checker outside the `sign` gate — the shared wire
 /// format docs/rust-toolchain.md's own comment anticipated, once
-/// `ask_cookbook sign` became that real consumer on both sides of the
+/// `askchef sign` became that real consumer on both sides of the
 /// boundary.
 const DEFAULT_COMPARATOR_STACK_BUDGET_PAGES: u64 = 4;
 const DEFAULT_COMPARATOR_BLOCK_BUDGET: usize = 64;

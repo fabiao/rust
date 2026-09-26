@@ -10,9 +10,9 @@
 //! crate's own fully-resolved static callgraph (`callgraph`/`budget`
 //! modules) — every piece of docs/scheduling.md's "Safe-Rust-subset
 //! restriction rules" and "Stack budget, execution-bound metric, and
-//! load-path enforcement" is implemented. Wired into `ask_cookbook sign`
+//! load-path enforcement" is implemented. Wired into `askchef sign`
 //! as an enforced gate for any `ssc2_comparator = true` recipe
-//! (`recipes/tools/ask_cookbook/source/src/actions/sign.rs`), which also
+//! (`recipes/tools/askchef/source/src/actions/sign.rs`), which also
 //! passes `--stack-budget-pages`/`--block-budget` sourced from
 //! `askabi::sched` — see `budget::Budget`'s own doc comment for why that
 //! (not a Cargo dependency) is this crate's real single source of truth.
