@@ -36,7 +36,7 @@ fn resolve_fs_path(path: &Path) -> io::Result<(u32, heapless_path::PathBuf)> {
     let resolved = view
         .resolve(path, ask_io::view::Operation::Read)
         .map_err(|_| unsupported_err())?;
-    let mut encoded = [0u8; ask_io::fs::OPEN_PATH_MAX];
+    let mut encoded = [0u8; ask_io::fs::PATH_MAX];
     let relative = resolved
         .encode_path(&mut encoded)
         .map_err(|_| unsupported_err())?;
@@ -46,19 +46,19 @@ fn resolve_fs_path(path: &Path) -> io::Result<(u32, heapless_path::PathBuf)> {
 }
 
 /// Tiny fixed path builder — avoids `alloc` in the hot open path while still
-/// fitting `ask_io::fs::OPEN_PATH_MAX`.
+/// fitting `ask_io::fs::PATH_MAX`.
 mod heapless_path {
     use super::*;
 
     pub struct PathBuf {
-        buf: [u8; ask_io::fs::OPEN_PATH_MAX],
+        buf: [u8; ask_io::fs::PATH_MAX],
         len: usize,
     }
 
     impl PathBuf {
         pub fn new() -> Self {
             Self {
-                buf: [0; ask_io::fs::OPEN_PATH_MAX],
+                buf: [0; ask_io::fs::PATH_MAX],
                 len: 0,
             }
         }
@@ -68,7 +68,7 @@ mod heapless_path {
                 .len
                 .checked_add(bytes.len())
                 .ok_or_else(unsupported_err)?;
-            if end > ask_io::fs::OPEN_PATH_MAX {
+            if end > ask_io::fs::PATH_MAX {
                 return Err(unsupported_err());
             }
             self.buf[self.len..end].copy_from_slice(bytes);
@@ -331,29 +331,38 @@ fn fs_error(result: i32, context: &'static str) -> io::Error {
     io::Error::new(kind, context)
 }
 
-/// Metadata/`OP_UNLINK`-shaped requests carry bare path bytes; every one is
-/// bounded by `STAT_PATH_MAX` rather than `OPEN_PATH_MAX`.
-fn bounded_path(path: &[u8]) -> io::Result<&[u8]> {
-    if path.len() > ask_io::fs::STAT_PATH_MAX {
-        return Err(unsupported_err());
+/// Open a session with the provider's path window, stage one path request
+/// in it, and exchange it.
+fn path_exchange<const N: usize>(
+    provider_token: u32,
+    op: u32,
+    encode: impl FnOnce(&mut [u8; N], &mut [u8]) -> bool,
+) -> io::Result<crate::sys::channel::Completion> {
+    let mut channel =
+        SyncChannel::create_leased(provider_token, ask_io::fs::path_window::CHANNEL_PAGES)
+            .map_err(|_| io::const_error!(io::ErrorKind::NotFound, "fs provider unreachable"))?;
+    let mut request = [0u8; N];
+    let window = channel
+        .shared_region_mut(ask_io::fs::path_window::OFFSET, ask_io::fs::path_window::LEN)
+        .ok_or_else(unsupported_err)?;
+    if !encode(&mut request, window) {
+        return Err(io::const_error!(io::ErrorKind::InvalidFilename, "fs: path too long"));
     }
-    Ok(path)
+    channel.call(op, &request)
 }
 
 /// One path-addressed round trip. `askfs`'s stateless metadata operations
 /// (metadata, `MKDIR`, `UNLINK`, `RENAME`, directory enumeration, ...) need no open
 /// handle, but each still requires an accepted session because the provider
 /// serves only one client Channel at a time.
-fn metadata_call<T>(
+fn metadata_call<T, const N: usize>(
     provider_token: u32,
     op: u32,
-    payload: &[u8],
+    encode: impl FnOnce(&mut [u8; N], &mut [u8]) -> bool,
     not_found: &'static str,
     decode: impl FnOnce(&[u8]) -> Option<T>,
 ) -> io::Result<T> {
-    let mut channel = SyncChannel::create_leased(provider_token, 1)
-        .map_err(|_| io::const_error!(io::ErrorKind::NotFound, "fs provider unreachable"))?;
-    let completion = channel.call(op, payload)?;
+    let completion = path_exchange(provider_token, op, encode)?;
     if completion.result < 0 {
         return Err(fs_error(completion.result, not_found));
     }
@@ -361,15 +370,13 @@ fn metadata_call<T>(
 }
 
 /// A metadata round trip whose reply carries no payload beyond its result.
-fn metadata_unit(
+fn metadata_unit<const N: usize>(
     provider_token: u32,
     op: u32,
-    payload: &[u8],
+    encode: impl FnOnce(&mut [u8; N], &mut [u8]) -> bool,
     failure: &'static str,
 ) -> io::Result<()> {
-    let mut channel = SyncChannel::create_leased(provider_token, 1)
-        .map_err(|_| io::const_error!(io::ErrorKind::NotFound, "fs provider unreachable"))?;
-    let completion = channel.call(op, payload)?;
+    let completion = path_exchange(provider_token, op, encode)?;
     if completion.result < 0 {
         return Err(io::Error::new(io::ErrorKind::NotFound, failure));
     }
@@ -380,17 +387,18 @@ fn metadata_unit(
 /// to the request flag in the same namespace operation as metadata lookup.
 fn stat_path(path: &Path, nofollow: bool) -> io::Result<FileAttr> {
     let (provider_token, relative) = resolve_fs_path(path)?;
-    let mut request = [0u8; ask_io::fs::FS_METADATA_PATH_REQUEST_MAX];
-    let payload = ask_io::fs::encode_fs_metadata_path_request(
-        &mut request,
-        bounded_path(relative.as_bytes())?,
-        nofollow,
-    )
-    .ok_or_else(unsupported_err)?;
     metadata_call(
         provider_token,
         ask_io::fs::OP_METADATA,
-        payload,
+        |request: &mut [u8; ask_io::fs::FS_METADATA_PATH_REQUEST_LEN], window| {
+            ask_io::fs::encode_fs_metadata_path_request(
+                request,
+                window,
+                relative.as_bytes(),
+                nofollow,
+            )
+            .is_some()
+        },
         "fs: stat failed",
         |reply| ask_io::fs::decode_fs_metadata(reply).map(FileAttr::from_metadata),
     )
@@ -399,13 +407,21 @@ fn stat_path(path: &Path, nofollow: bool) -> io::Result<FileAttr> {
 impl File {
     pub fn open(path: &Path, opts: &OpenOptions) -> io::Result<File> {
         let (provider_token, relative) = resolve_fs_path(path)?;
-        let mut channel = SyncChannel::create_leased(provider_token, 1)
-            .map_err(|_| io::const_error!(io::ErrorKind::NotFound, "fs provider unreachable"))?;
+        let mut channel =
+            SyncChannel::create_leased(provider_token, ask_io::fs::path_window::CHANNEL_PAGES)
+                .map_err(|_| io::const_error!(io::ErrorKind::NotFound, "fs provider unreachable"))?;
 
-        let mut request = [0u8; 4 + ask_io::fs::OPEN_PATH_MAX];
-        let payload =
-            ask_io::fs::encode_fs_open_request(&mut request, opts.wire_flags(), relative.as_bytes())
-                .ok_or_else(unsupported_err)?;
+        let mut request = [0u8; ask_io::fs::FS_OPEN_REQUEST_LEN];
+        let window = channel
+            .shared_region_mut(ask_io::fs::path_window::OFFSET, ask_io::fs::path_window::LEN)
+            .ok_or_else(unsupported_err)?;
+        let payload = ask_io::fs::encode_fs_open_request(
+            &mut request,
+            window,
+            opts.wire_flags(),
+            relative.as_bytes(),
+        )
+        .ok_or_else(unsupported_err)?;
         let completion = channel.call(ask_io::fs::OP_OPEN, payload)?;
         if completion.result < 0 {
             return Err(fs_error(completion.result, "fs: open failed"));
@@ -629,17 +645,18 @@ impl DirBuilder {
     /// owner-writable directory permissions.
     pub fn mkdir(&self, path: &Path) -> io::Result<()> {
         let (provider_token, relative) = resolve_fs_path(path)?;
-        let mut request = [0u8; 4 + ask_io::fs::STAT_PATH_MAX];
-        let payload = ask_io::fs::encode_fs_mkdir_request(
-            &mut request,
-            DEFAULT_DIR_MODE,
-            relative.as_bytes(),
-        )
-        .ok_or_else(unsupported_err)?;
         metadata_unit(
             provider_token,
             ask_io::fs::OP_MKDIR,
-            payload,
+            |request: &mut [u8; ask_io::fs::FS_MKDIR_REQUEST_LEN], window| {
+                ask_io::fs::encode_fs_mkdir_request(
+                    request,
+                    window,
+                    DEFAULT_DIR_MODE,
+                    relative.as_bytes(),
+                )
+                .is_some()
+            },
             "fs: mkdir failed",
         )
     }
@@ -670,30 +687,15 @@ impl Iterator for ReadDir {
         if self.exhausted {
             return None;
         }
-        let mut request = [0u8; 16 + ask_io::fs::STAT_PATH_MAX];
-        let payload = match ask_io::fs::encode_fs_directory_request(
-            &mut request,
-            self.cookie,
-            self.relative.as_bytes(),
+        let cookie = self.cookie;
+        let relative = self.relative.as_bytes();
+        let completion = match path_exchange(
+            self.provider_token,
+            ask_io::fs::OP_READ_DIRECTORY,
+            |request: &mut [u8; ask_io::fs::FS_DIRECTORY_REQUEST_LEN], window| {
+                ask_io::fs::encode_fs_directory_request(request, window, cookie, relative).is_some()
+            },
         ) {
-            Some(payload) => payload,
-            None => {
-                self.exhausted = true;
-                return Some(Err(unsupported_err()));
-            }
-        };
-
-        let mut channel = match SyncChannel::create_leased(self.provider_token, 1) {
-            Ok(channel) => channel,
-            Err(_) => {
-                self.exhausted = true;
-                return Some(Err(io::const_error!(
-                    io::ErrorKind::NotFound,
-                    "fs provider unreachable"
-                )));
-            }
-        };
-        let completion = match channel.call(ask_io::fs::OP_READ_DIRECTORY, payload) {
             Ok(completion) => completion,
             Err(e) => {
                 self.exhausted = true;
@@ -777,11 +779,12 @@ pub fn readdir(path: &Path) -> io::Result<ReadDir> {
 
 pub fn unlink(path: &Path) -> io::Result<()> {
     let (provider_token, relative) = resolve_fs_path(path)?;
-    let payload = bounded_path(relative.as_bytes())?;
     metadata_unit(
         provider_token,
         ask_io::fs::OP_UNLINK,
-        payload,
+        |request: &mut [u8; ask_io::fs::FS_PATH_REQUEST_LEN], window| {
+            ask_io::fs::encode_fs_path_request(request, window, relative.as_bytes()).is_some()
+        },
         "fs: unlink failed",
     )
 }
@@ -798,17 +801,18 @@ pub fn rename(old: &Path, new: &Path) -> io::Result<()> {
             "fs: rename across providers"
         ));
     }
-    let mut request = [0u8; ask_io::fs::RENAME_REQUEST_MAX];
-    let payload = ask_io::fs::encode_fs_rename_request(
-        &mut request,
-        old_relative.as_bytes(),
-        new_relative.as_bytes(),
-    )
-    .ok_or_else(unsupported_err)?;
     metadata_unit(
         old_provider,
         ask_io::fs::OP_RENAME,
-        payload,
+        |request: &mut [u8; ask_io::fs::FS_TWO_PATH_REQUEST_LEN], window| {
+            ask_io::fs::encode_fs_two_path_request(
+                request,
+                window,
+                old_relative.as_bytes(),
+                new_relative.as_bytes(),
+            )
+            .is_some()
+        },
         "fs: rename failed",
     )
 }
