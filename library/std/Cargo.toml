@@ -90,6 +90,10 @@ ask_io = { package = "askio", path = "../../../../../core/libs/askio/source", fe
 ask_sys = { package = "asksys", path = "../../../../../core/libs/asksys/source", features = [
     "rustc-dep-of-std",
 ], public = true }
+ask_alloc = { package = "askalloc", path = "../../../../../core/libs/askalloc/source", features = [
+    "rustc-dep-of-std",
+] }
+dlmalloc = { version = "0.2.10", features = ['rustc-dep-of-std'] }
 
 [target.'cfg(target_os = "hermit")'.dependencies]
 hermit-abi = { version = "0.5.0", features = [
