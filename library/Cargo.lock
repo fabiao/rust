@@ -46,6 +46,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "askalloc"
+version = "0.1.0"
+dependencies = [
+ "askabi",
+ "asksys",
+ "dlmalloc",
+ "rustc-std-workspace-core",
+]
+
+[[package]]
 name = "askio"
 version = "0.1.0"
 dependencies = [
@@ -383,6 +393,7 @@ dependencies = [
  "addr2line",
  "alloc",
  "askabi",
+ "askalloc",
  "askio",
  "askipc",
  "asksys",
