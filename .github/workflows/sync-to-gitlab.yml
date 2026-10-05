@@ -20,7 +20,7 @@ jobs:
         run: |
           gh repo sync "${{ github.repository }}" \
             --branch main
-
+      
       - name: Refresh local main
         run: |
           git fetch origin main
