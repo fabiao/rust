@@ -3,6 +3,9 @@ name: Sync fork and mirror to GitLab
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   sync-and-mirror:
     runs-on: ubuntu-latest
