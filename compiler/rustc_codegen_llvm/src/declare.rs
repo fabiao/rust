@@ -43,9 +43,8 @@ pub(crate) fn declare_simple_fn<'ll>(
     ty: &'ll Type,
 ) -> &'ll Value {
     debug!("declare_simple_fn(name={:?}, ty={:?})", name, ty);
-    let llfn = unsafe {
-        llvm::LLVMRustGetOrInsertFunction(cx.llmod, name.as_c_char_ptr(), name.len(), ty)
-    };
+    let llfn =
+        unsafe { llvm::LLVMGetOrInsertFunction(cx.llmod, name.as_c_char_ptr(), name.len(), ty) };
 
     llvm::SetFunctionCallConv(llfn, callconv);
     llvm::set_unnamed_address(llfn, unnamed);
@@ -232,13 +231,12 @@ impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
                 options.insert(kcfi::TypeIdOptions::NORMALIZE_INTEGERS);
             }
 
-            if let Some(instance) = instance {
-                let kcfi_typeid = kcfi::typeid_for_instance(self.tcx, instance, options);
-                self.set_kcfi_type_metadata(llfn, kcfi_typeid);
+            let kcfi_typeid = if let Some(instance) = instance {
+                kcfi::typeid_for_instance(self.tcx, instance, options)
             } else {
-                let kcfi_typeid = kcfi::typeid_for_fnabi(self.tcx, fn_abi, options);
-                self.set_kcfi_type_metadata(llfn, kcfi_typeid);
-            }
+                kcfi::typeid_for_fnabi(self.tcx, fn_abi, options)
+            };
+            self.set_kcfi_type_metadata(llfn, kcfi_typeid);
         }
 
         llfn

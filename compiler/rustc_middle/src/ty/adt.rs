@@ -4,6 +4,8 @@ use std::ops::Range;
 use std::str;
 
 use rustc_abi::{FIRST_VARIANT, FieldIdx, ReprOptions, VariantIdx};
+use rustc_attr_ir::find_attr;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::intern::Interned;
@@ -11,19 +13,19 @@ use rustc_data_structures::stable_hash::{
     StableHash, StableHashControls, StableHashCtxt, StableHasher,
 };
 use rustc_errors::ErrorGuaranteed;
+use rustc_hir as hir;
 use rustc_hir::def::{CtorKind, DefKind, Res};
 use rustc_hir::def_id::DefId;
-use rustc_hir::{self as hir, LangItem, find_attr};
 use rustc_index::{IndexSlice, IndexVec};
 use rustc_macros::{StableHash, TyDecodable, TyEncodable};
 use rustc_session::DataTypeKind;
-use rustc_span::sym;
+use rustc_span::{bug, sym};
 use rustc_type_ir::FieldInfo;
 use rustc_type_ir::solve::AdtDestructorKind;
 use tracing::{debug, info, trace};
 
 use super::{
-    AsyncDestructor, Destructor, FieldDef, GenericPredicates, Ty, TyCtxt, VariantDef, VariantDiscr,
+    AsyncDestructor, Destructor, FieldDef, GenericClauses, Ty, TyCtxt, VariantDef, VariantDiscr,
 };
 use crate::mir::interpret::ErrorHandled;
 use crate::ty::util::{Discr, IntTypeExt};
@@ -64,6 +66,8 @@ bitflags::bitflags! {
         /// Indicates whether the type is `FieldRepresentingType`.
         const IS_FIELD_REPRESENTING_TYPE    = 1 << 13;
         /// Indicates whether the type is `MaybeDangling<_>`.
+        /// Note that this is not the only type with "maybe dangling" semantics!
+        /// Use `ty.is_like_maybe_dangling()` to check for that.
         const IS_MAYBE_DANGLING             = 1 << 14;
     }
 }
@@ -527,12 +531,6 @@ impl<'tcx> AdtDef<'tcx> {
         self.flags().contains(AdtFlags::IS_MANUALLY_DROP)
     }
 
-    /// Returns `true` if this is `MaybeDangling<T>`.
-    #[inline]
-    pub fn is_maybe_dangling(self) -> bool {
-        self.flags().contains(AdtFlags::IS_MAYBE_DANGLING)
-    }
-
     /// Returns `true` if this is `Pin<T>`.
     #[inline]
     pub fn is_pin(self) -> bool {
@@ -562,8 +560,8 @@ impl<'tcx> AdtDef<'tcx> {
     }
 
     #[inline]
-    pub fn predicates(self, tcx: TyCtxt<'tcx>) -> GenericPredicates<'tcx> {
-        tcx.predicates_of(self.did())
+    pub fn clauses(self, tcx: TyCtxt<'tcx>) -> GenericClauses<'tcx> {
+        tcx.clauses_of(self.did())
     }
 
     /// Returns an iterator over all fields contained
@@ -658,7 +656,7 @@ impl<'tcx> AdtDef<'tcx> {
                     Ok(Discr { val: b, ty })
                 } else {
                     info!("invalid enum discriminant: {:#?}", val);
-                    let guar = tcx.dcx().emit_err(crate::error::ConstEvalNonIntError {
+                    let guar = tcx.dcx().emit_err(crate::diagnostics::ConstEvalNonIntError {
                         span: tcx.def_span(expr_did),
                     });
                     Err(guar)

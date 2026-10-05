@@ -3,12 +3,13 @@ use core::cmp::min;
 use core::iter;
 
 use hir::def_id::LocalDefId;
+use itertools::Itertools;
 use rustc_ast::util::parser::ExprPrecedence;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_data_structures::packed::Pu128;
 use rustc_errors::{Applicability, Diag, MultiSpan, listify, msg};
 use rustc_hir::def::{CtorKind, CtorOf, DefKind, Res};
 use rustc_hir::intravisit::Visitor;
-use rustc_hir::lang_items::LangItem;
 use rustc_hir::{
     self as hir, Arm, CoroutineDesugaring, CoroutineKind, CoroutineSource, Expr, ExprKind,
     GenericBound, HirId, LoopSource, Node, PatExpr, PatExprKind, Path, QPath, Stmt, StmtKind,
@@ -17,14 +18,13 @@ use rustc_hir::{
 use rustc_hir_analysis::hir_ty_lowering::HirTyLowerer;
 use rustc_hir_analysis::suggest_impl_trait;
 use rustc_middle::middle::stability::EvalResult;
-use rustc_middle::span_bug;
+use rustc_middle::ty::consts::ConstExt;
 use rustc_middle::ty::print::{with_no_trimmed_paths, with_types_for_suggestion};
 use rustc_middle::ty::{
     self, Article, Binder, IsSuggestable, Ty, TyCtxt, TypeVisitableExt, Unnormalized, Upcast,
     suggest_constraining_type_params,
 };
-use rustc_session::diagnostics::ExprParenthesesNeeded;
-use rustc_span::{ExpnKind, Ident, MacroKind, Span, Spanned, Symbol, sym};
+use rustc_span::{ExpnKind, Ident, MacroKind, Span, Spanned, Symbol, span_bug, sym};
 use rustc_trait_selection::error_reporting::InferCtxtErrorExt;
 use rustc_trait_selection::error_reporting::traits::DefIdOrName;
 use rustc_trait_selection::error_reporting::traits::suggestions::ReturnsVisitor;
@@ -34,7 +34,7 @@ use rustc_trait_selection::traits::query::evaluate_obligation::InferCtxtExt as _
 use tracing::{debug, instrument};
 
 use super::FnCtxt;
-use crate::diagnostics::{self, SuggestBoxingForReturnImplTrait};
+use crate::diagnostics::{self, ExprParenthesesNeeded, SuggestBoxingForReturnImplTrait};
 use crate::fn_ctxt::rustc_span::BytePos;
 use crate::method::probe;
 use crate::method::probe::{IsSuggestion, Mode, ProbeScope};
@@ -262,8 +262,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         found_type: Ty<'tcx>,
     ) -> bool {
         let tcx = self.tcx;
-        let expected = self.resolve_vars_if_possible(expected_type);
-        let found = self.resolve_vars_if_possible(found_type);
+        let expected = self.deeply_resolve_ignoring_regions(expected_type);
+        let found = self.deeply_resolve_ignoring_regions(found_type);
 
         if expected.references_error() || found.references_error() || expected.is_unit() {
             return false;
@@ -670,10 +670,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     }
 
     /// When encountering a closure that captures variables, where a FnPtr is expected,
-    /// suggest a non-capturing closure
-    pub(in super::super) fn suggest_no_capture_closure(
+    /// explain why coercion fails and suggest changing the return type to `impl Fn(...)`.
+    pub(in super::super) fn suggest_closure_to_fn_ptr_coercion(
         &self,
         err: &mut Diag<'_>,
+        expr: &hir::Expr<'_>,
         expected: Ty<'tcx>,
         found: Ty<'tcx>,
     ) -> bool {
@@ -701,9 +702,42 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 multi_span,
                 "closures can only be coerced to `fn` types if they do not capture any variables",
             );
+
+            // If the expected fn pointer type comes from the enclosing function's return type,
+            // suggest changing it to `impl Fn(...)` so that a capturing closure can be returned.
+            self.suggest_impl_fn_for_fn_ptr_ret(err, expr);
+
             return true;
         }
         false
+    }
+
+    /// When a capturing closure is returned where a `fn(...)` pointer return type is expected,
+    /// suggest changing the return type to `impl Fn(...)`.
+    fn suggest_impl_fn_for_fn_ptr_ret(&self, err: &mut Diag<'_>, expr: &hir::Expr<'_>) {
+        let Some((_, fn_decl)) = self.get_fn_decl(expr.hir_id) else { return };
+        let hir::FnRetTy::Return(ret_ty) = fn_decl.output else { return };
+        let hir::TyKind::FnPtr(fn_ptr_ty) = ret_ty.kind else { return };
+
+        let hir::FnDecl { inputs, output, .. } = fn_ptr_ty.decl;
+
+        let inputs_str =
+            inputs.iter().map(|ty| rustc_hir_pretty::ty_to_string(self, ty)).join(", ");
+
+        let output_str = match output {
+            hir::FnRetTy::DefaultReturn(_) => String::new(),
+            hir::FnRetTy::Return(ty) => {
+                format!(" -> {}", rustc_hir_pretty::ty_to_string(self, ty))
+            }
+        };
+
+        let suggestion = format!("impl Fn({inputs_str}){output_str}");
+        err.span_suggestion(
+            ret_ty.span,
+            "change the return type to return a type-erased closure instead",
+            suggestion,
+            Applicability::MaybeIncorrect,
+        );
     }
 
     /// When encountering an `impl Future` where `BoxFuture` is expected, suggest `Box::pin`.
@@ -958,7 +992,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         }
 
         let found =
-            self.resolve_numeric_literals_with_default(self.resolve_vars_if_possible(found));
+            self.resolve_numeric_literals_with_default(self.deeply_resolve_ignoring_regions(found));
         // Only suggest changing the return type for methods that
         // haven't set a return type at all (and aren't `fn main()`, impl or closure).
         match &fn_decl.output {
@@ -993,7 +1027,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         .segments
                         .last()
                         .and_then(|seg| seg.args)
-                        .map_or(false, |args| !args.constraints.is_empty())
+                        .is_some_and(|args| !args.constraints.is_empty())
                 {
                     // Use the path to get the trait name string
                     let trait_name = trait_ref
@@ -1288,7 +1322,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         if !expected.is_unit() {
             return;
         }
-        let found = self.resolve_vars_if_possible(found);
+        let found = self.deeply_resolve_ignoring_regions(found);
 
         let innermost_loop = if self.is_loop(id) {
             Some(self.tcx.hir_node(id))
@@ -1433,7 +1467,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         expr: &hir::Expr<'_>,
     ) -> bool {
         let sp = self.tcx.sess.source_map().start_point(expr.span).with_parent(None);
-        if let Some(sp) = self.tcx.sess.psess.ambiguous_block_expr_parse.borrow().get(&sp) {
+        if let Some(sp) =
+            self.tcx.sess.psess.complete_stmt_exprs_before_bin_op_lookalike.borrow().get(&sp)
+        {
             // `{ 42 } &&x` (#61475) or `{ 42 } && if x { 1 } else { 0 }`
             err.subdiagnostic(ExprParenthesesNeeded::surrounding(*sp));
             true
@@ -1658,12 +1694,18 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         }
 
         let suggestion = match self.tcx.hir_maybe_get_struct_pattern_shorthand_field(expr) {
-            Some(ident) => format!(": {ident}.is_some()"),
-            None => ".is_some()".to_string(),
+            Some(ident) => vec![(expr.span.shrink_to_hi(), format!(": {ident}.is_some()"))],
+            None if self.precedence(expr) < ExprPrecedence::Unambiguous => {
+                // Apply the method to the whole expression, e.g. `(*value).is_some()`.
+                vec![
+                    (expr.span.shrink_to_lo(), "(".to_string()),
+                    (expr.span.shrink_to_hi(), ").is_some()".to_string()),
+                ]
+            }
+            None => vec![(expr.span.shrink_to_hi(), ".is_some()".to_string())],
         };
 
-        diag.span_suggestion_verbose(
-            expr.span.shrink_to_hi(),
+        diag.multipart_suggestion(
             "use `Option::is_some` to test if the `Option` has a value",
             suggestion,
             Applicability::MachineApplicable,
@@ -1727,7 +1769,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             provided_ty
         };
 
-        if !self.may_coerce(expected_ty, dummy_ty) {
+        if !self.may_coerce_except_never(expected_ty, dummy_ty) {
             return;
         }
         let msg = format!("use `{adt_name}::map_or` to deref inner value of `{adt_name}`");
@@ -1958,9 +2000,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             }
             _ => return false,
         };
-        if item.def_id == old_def_id
-            || !matches!(self.tcx.def_kind(item.def_id), DefKind::AssocConst { .. })
-        {
+        if item.def_id == old_def_id || self.tcx.def_kind(item.def_id) != DefKind::AssocConst {
             // Same item
             return false;
         }
@@ -1969,7 +2009,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         if item_ty.has_param() {
             return false;
         }
-        if self.may_coerce(item_ty, expected_ty) {
+        // An unused associated const of type `!` may not have been evaluated yet. Do not
+        // suggest referring to it just because `!` can coerce to the expected type.
+        if self.may_coerce_except_never(item_ty, expected_ty) {
             err.span_suggestion_verbose(
                 segment.ident.span,
                 format!("try referring to the associated const `{capitalized_name}` instead",),
@@ -2060,7 +2102,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 {
                     let manually_impl = "consider manually implementing `Clone` to avoid the \
                         implicit type parameter bounds";
-                    match &errors[..] {
+                    match errors.as_slice() {
                         [] => {}
                         [error] => {
                             let msg = "`Clone` is not implemented because a trait bound is not \
@@ -2091,6 +2133,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         }
                         _ => {
                             let unsatisfied_bounds: Vec<_> = errors
+                                .as_slice()
                                 .iter()
                                 .filter_map(|error| match error.obligation.cause.code() {
                                     traits::ObligationCauseCode::ImplDerived(data) => {
@@ -2125,12 +2168,15 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                     unsatisfied_bounds_spans.push_span_label(span, label);
                                 }
                                 diag.span_help(unsatisfied_bounds_spans, msg);
-                                if errors.iter().all(|error| match error.obligation.cause.code() {
-                                    traits::ObligationCauseCode::ImplDerived(data) => {
-                                        self.tcx.is_automatically_derived(data.impl_or_alias_def_id)
-                                            && data.impl_or_alias_def_id.is_local()
+                                if errors.as_slice().iter().all(|error| {
+                                    match error.obligation.cause.code() {
+                                        traits::ObligationCauseCode::ImplDerived(data) => {
+                                            self.tcx
+                                                .is_automatically_derived(data.impl_or_alias_def_id)
+                                                && data.impl_or_alias_def_id.is_local()
+                                        }
+                                        _ => false,
                                     }
-                                    _ => false,
                                 }) {
                                     diag.help(manually_impl);
                                     suggest_derive = false;
@@ -2138,8 +2184,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             } else {
                                 diag.help(format!(
                                     "{msg}: {}",
-                                    listify(&errors, |e| format!("`{}`", e.obligation.predicate))
-                                        .unwrap(),
+                                    listify(errors.as_slice(), |e| format!(
+                                        "`{}`",
+                                        e.obligation.predicate
+                                    ))
+                                    .unwrap(),
                                 ));
                             }
                         }
@@ -2245,14 +2294,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         }
     }
 
-    pub(crate) fn is_field_suggestable(
-        &self,
-        field: &ty::FieldDef,
-        hir_id: HirId,
-        span: Span,
-    ) -> bool {
+    pub(crate) fn is_field_suggestable(&self, field: &ty::FieldDef, span: Span) -> bool {
         // The field must be visible in the containing module.
-        field.vis.is_accessible_from(self.tcx.parent_module(hir_id), self.tcx)
+        field.vis.is_accessible_from(self.mod_id, self.tcx)
             // The field must not be unstable.
             && !matches!(
                 self.tcx.eval_stability(field.did, None, rustc_span::DUMMY_SP, None),
@@ -2326,7 +2370,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         } else {
             return false;
         };
-        if is_ctor || !self.may_coerce(args.type_at(0), expected) {
+        let inner_ty = args.type_at(0);
+
+        // For `Option<!>` where `Option<u32>` is expected, extracting `!` cannot produce
+        // an `Option<u32>`. Never-to-any coercion alone must not justify `.expect()` or `?`.
+        if is_ctor || !self.may_coerce_except_never(inner_ty, expected) {
             return false;
         }
 
@@ -2518,7 +2566,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 && match expr.kind {
                     ExprKind::Path(QPath::Resolved(
                         None,
-                        Path { res: Res::Def(DefKind::Const { .. }, _), .. },
+                        Path { res: Res::Def(DefKind::Const, _), .. },
                     )) => true,
                     ExprKind::Call(
                         Expr {
@@ -2816,7 +2864,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         true
     }
 
-    /// Identify some cases where `as_ref()` would be appropriate and suggest it.
+    /// Identify some cases where `as_ref()` or `as_mut()` would be appropriate and suggest it.
     ///
     /// Given the following code:
     /// ```compile_fail,E0308
@@ -2832,7 +2880,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     /// ```ignore (illustrative)
     /// opt.map(|param| { takes_ref(param) });
     /// ```
-    fn can_use_as_ref(&self, expr: &hir::Expr<'_>) -> Option<(Vec<(Span, String)>, &'static str)> {
+    fn can_use_as_ref_or_mut(
+        &self,
+        expr: &hir::Expr<'_>,
+        mutability: hir::Mutability,
+    ) -> Option<(Vec<(Span, String)>, &'static str)> {
         let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = expr.kind else {
             return None;
         };
@@ -2869,9 +2921,17 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             return None;
         };
 
-        let self_ty = self.typeck_results.borrow().expr_ty_opt(receiver)?;
+        let mut self_ty = self.typeck_results.borrow().expr_ty_opt(receiver)?;
+        while let ty::Ref(_, inner, ref_mutability) = self_ty.kind() {
+            // `as_mut()` cannot borrow through a shared reference,
+            // also we cannot suggest `as_ref()` either when the reference is shared
+            if mutability.is_mut() && ref_mutability.is_not() {
+                return None;
+            }
+            self_ty = *inner;
+        }
         let name = method_path.ident.name;
-        let is_as_ref_able = match self_ty.peel_refs().kind() {
+        let can_borrow = match self_ty.kind() {
             ty::Adt(def, _) => {
                 (self.tcx.is_diagnostic_item(sym::Option, def.did())
                     || self.tcx.is_diagnostic_item(sym::Result, def.did()))
@@ -2879,11 +2939,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             }
             _ => false,
         };
-        if is_as_ref_able {
-            Some((
-                vec![(method_path.ident.span.shrink_to_lo(), "as_ref().".to_string())],
-                "consider using `as_ref` instead",
-            ))
+        if can_borrow {
+            let (suggestion, message) = match mutability {
+                hir::Mutability::Not => ("as_ref().", "consider using `as_ref` instead"),
+                hir::Mutability::Mut => ("as_mut().", "consider using `as_mut` instead"),
+            };
+            Some((vec![(method_path.ident.span.shrink_to_lo(), suggestion.to_string())], message))
         } else {
             None
         }
@@ -2931,8 +2992,40 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
         // `ExprKind::DropTemps` is semantically irrelevant for these suggestions.
         let expr = expr.peel_drop_temps();
-
         match (&expr.kind, expected.kind(), checked_ty.kind()) {
+            // Handle call arguments that need another shared or mutable reference, such as
+            // `&T` to `&&T` or `&T` to `&mut &T`.
+            // Keep ordinary `T` to `&T` cases on later path so its more
+            // specific suggestions, such as `Option::as_ref()`, are preserved.
+            (_, &ty::Ref(_, exp, mutability), _)
+                if exp.is_ref()
+                    && matches!(
+                        self.tcx.parent_hir_node(expr.hir_id),
+                        hir::Node::Expr(hir::Expr {
+                            kind:
+                                hir::ExprKind::Call(_, args)
+                                | hir::ExprKind::MethodCall(_, _, args, _),
+                            ..
+                        }) if args.iter().any(|arg| arg.hir_id == expr.hir_id)
+                    )
+                    && self.can_eq(self.param_env, exp, checked_ty) =>
+            {
+                let borrow = mutability.ref_prefix_str();
+                let sugg = if expr_needs_parens(expr) {
+                    vec![
+                        (sp.shrink_to_lo(), format!("{borrow}(")),
+                        (sp.shrink_to_hi(), ")".to_string()),
+                    ]
+                } else {
+                    vec![(sp.shrink_to_lo(), borrow.to_string())]
+                };
+                return Some((
+                    sugg,
+                    format!("consider {}borrowing here", mutability.mutably_str()),
+                    Applicability::MachineApplicable,
+                    false,
+                ));
+            }
             (_, &ty::Ref(_, exp, _), &ty::Ref(_, check, _)) => match (exp.kind(), check.kind()) {
                 (&ty::Str, &ty::Array(arr, _) | &ty::Slice(arr)) if arr == self.tcx.types.u8 => {
                     if let hir::ExprKind::Lit(_) = expr.kind
@@ -3042,7 +3135,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         return Some((suggs, help, app, mutref));
                     }
 
-                    if let Some((sugg, msg)) = self.can_use_as_ref(expr) {
+                    if let Some((sugg, msg)) = self.can_use_as_ref_or_mut(expr, mutability) {
                         return Some((
                             sugg,
                             msg.to_string(),

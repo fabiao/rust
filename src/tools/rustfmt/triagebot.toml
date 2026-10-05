@@ -7,9 +7,22 @@
 
 [relabel]
 allow-unauthenticated = [
-    "needs-triage",
-    "S-*",
+    "A-*",
+    "B-*",
     "C-*",
+    "E-*",
+    "F-*",
+    "I-*",
+    "needs-rfc",
+    "needs-triage",
+    "regression-*",
+    "S-*",
+    "SO-*",
+    "T-*",
+    "UO-*",
+    "unstable-language-feature",
+    "unstable-option",
+    "X-*",
 ]
 
 # ------------------------------------------------------------------------------
@@ -26,6 +39,19 @@ exclude_labels = [
 # manually if we determine that a PR does not need relnotes.
 [autolabel."release-notes"]
 pr_merged = true
+
+# Prioritization of regression triaging.
+[autolabel."I-prioritize"]
+trigger_labels = [
+    "regression-from-stable-to-beta",
+    "regression-from-stable-to-nightly",
+    "regression-from-stable-to-stable",
+    "regression-untriaged",
+]
+exclude_labels = [
+    "P-*",
+    "requires-nightly",
+]
 
 [autolabel."A-CI"]
 trigger_files = [
@@ -77,7 +103,70 @@ add_labels = ["S-waiting-on-review"]
 [shortcut]
 
 # ------------------------------------------------------------------------------
+# Backport nominations (rustfmt repo side)
+# ------------------------------------------------------------------------------
+
+[notify-zulip."beta-nominated".rustfmt]
+zulip_stream = 621384 # #t-rustfmt/backports
+topic = "rustfmt#{number}: beta-nominated"
+message_on_add = [
+    """\
+@*T-rustfmt* @*T-rustfmt-contributors* PR rustfmt#{number} "{title}" has been nominated
+for beta backport.
+""",
+    """\
+/poll Approve beta backport of rustfmt#{number}?
+approve
+decline
+don't know
+""",
+]
+message_on_remove = "PR rustfmt#{number}'s beta-nomination has been removed."
+
+[notify-zulip."beta-accepted".rustfmt]
+zulip_stream = 621384 # #t-rustfmt/backports
+# Put it in the same thread as beta-nominated.
+topic = "rustfmt#{number}: beta-nominated"
+message_on_add = "PR rustfmt#{number} has been **accepted** for **beta** backport."
+
+[notify-zulip."stable-nominated".rustfmt]
+zulip_stream = 621384 # #t-rustfmt/backports
+topic = "rustfmt#{number}: stable-nominated"
+message_on_add = [
+    """\
+@*T-rustfmt* @*T-rustfmt-contributors* PR rustfmt#{number} "{title}" has been nominated
+for stable backport.
+""",
+    """\
+/poll Approve stable backport of rustfmt#{number}?
+approve
+approve (but does not justify new dot release on its own)
+decline
+don't know
+""",
+]
+message_on_remove = "PR rustfmt#{number}'s stable-nomination has been removed."
+
+[notify-zulip."stable-accepted".rustfmt]
+zulip_stream = 621384 # #t-rustfmt/backports
+# Put it in the same thread as stable-nominated.
+topic = "rustfmt#{number}: stable-nominated"
+message_on_add = "PR rustfmt#{number} has been **accepted** for **stable** backport."
+
+# ------------------------------------------------------------------------------
 # PR assignments
 # ------------------------------------------------------------------------------
 
 [assign]
+
+# ------------------------------------------------------------------------------
+# Misc
+# ------------------------------------------------------------------------------
+
+# Canonicalize issue numbers to avoid closing the wrong issue
+# when commits are included in subtrees, as well as warning links in commits.
+# Documentation at: https://forge.rust-lang.org/triagebot/issue-links.html
+[issue-links]
+# This prevents links from resolving to the wrong repository when the subtree is
+# merged upstream while still allowing issue links in commits.
+check-commits = "uncanonicalized"

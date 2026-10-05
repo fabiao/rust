@@ -7,6 +7,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 
 use super::{ProcRes, TestCx, disable_error_reporting};
 use crate::common::TestSuite;
+use crate::read2::Truncated;
 use crate::util::{ArgFileCommand, copy_dir_all, dylib_env_var};
 
 impl TestCx<'_> {
@@ -76,7 +77,12 @@ impl TestCx<'_> {
 
         let tools_bin = host_build_root.join("bootstrap-tools");
         let support_host_path = tools_bin.join(&self.config.host).join("release");
-        let support_lib_path = support_host_path.join("librun_make_support.rlib");
+        let support_lib_rlib_path = self
+            .config
+            .run_make_support_rlib
+            .as_ref()
+            .expect("run-make-support .rlib has to be passed for run-make tests");
+        let support_lib_rmeta_path = self.config.run_make_support_rmeta.as_ref();
 
         let support_lib_deps = discover_out_dirs(support_host_path.join("build"));
         let support_lib_deps_deps = discover_out_dirs(tools_bin.join("release").join("build"));
@@ -123,16 +129,19 @@ impl TestCx<'_> {
             .arg("-o")
             .arg(&recipe_bin)
             // Specify library search paths for `run_make_support`.
-            .arg(format!("-Ldependency={}", &support_lib_path.parent().unwrap()))
             .args(out_dirs_to_args(support_lib_deps))
             .args(out_dirs_to_args(support_lib_deps_deps))
             // Provide `run_make_support` as extern prelude, so test writers don't need to write
             // `extern run_make_support;`.
             .arg("--extern")
-            .arg(format!("run_make_support={}", &support_lib_path))
+            .arg(format!("run_make_support={}", &support_lib_rlib_path))
             .arg("--edition=2024")
             .arg(&self.testpaths.file.join("rmake.rs"))
             .arg("-Cprefer-dynamic");
+
+        if let Some(support_lib_rmeta_path) = support_lib_rmeta_path {
+            rustc.arg("--extern").arg(format!("run_make_support={}", &support_lib_rmeta_path));
+        }
 
         // In test code we want to be very pedantic about values being silently discarded that are
         // annotated with `#[must_use]`.
@@ -167,8 +176,6 @@ impl TestCx<'_> {
 
         let mut cmd = Command::new(&recipe_bin);
         cmd.current_dir(&rmake_out_dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
             // Provide the target-specific env var that is used to record dylib search paths. For
             // example, this could be `LD_LIBRARY_PATH` on some linux distros but `PATH` on Windows.
             .env("LD_LIB_PATH_ENVVAR", dylib_env_var())
@@ -194,6 +201,11 @@ impl TestCx<'_> {
             // Provide which LLVM components are available (e.g. which LLVM components are provided
             // through a specific CI runner).
             .env("LLVM_COMPONENTS", &self.config.llvm_components);
+
+        if let Some(codegen_backend) = &self.config.override_codegen_backend {
+            // In case it's a different codegen backend than LLVM.
+            cmd.env("RUSTC_CODEGEN_BACKEND", codegen_backend.as_str());
+        }
 
         // The `run-make-cargo` and `build-std` suites need an in-tree `cargo`, `run-make` does not.
         if matches!(self.config.suite, TestSuite::RunMakeCargo | TestSuite::BuildStd) {
@@ -329,16 +341,39 @@ impl TestCx<'_> {
             }
         }
 
-        let proc = disable_error_reporting(|| cmd.spawn().expect("failed to spawn `rmake`"));
-        let (Output { stdout, stderr, status }, truncated) = self.read2_abbreviated(proc);
-        let stdout = String::from_utf8_lossy(&stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&stderr).into_owned();
-        // This conditions on `status.success()` so we don't print output twice on error.
-        // NOTE: this code is called from an executor thread, so it's hidden by default unless --no-capture is passed.
-        self.dump_output(status.success(), &cmd.get_program().to_string_lossy(), &stdout, &stderr);
-        if !status.success() {
-            let res = ProcRes { status, stdout, stderr, truncated, cmdline: format!("{:?}", cmd) };
-            self.fatal_proc_rec("rmake recipe failed to complete", &res);
+        if self.config.capture {
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+            let proc = disable_error_reporting(|| cmd.spawn().expect("failed to spawn `rmake`"));
+            let (Output { stdout, stderr, status }, truncated) = self.read2_abbreviated(proc);
+            let stdout = String::from_utf8_lossy(&stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&stderr).into_owned();
+            // This conditions on `status.success()` so we don't print output twice on error.
+            self.dump_output(
+                status.success(),
+                &cmd.get_program().to_string_lossy(),
+                &stdout,
+                &stderr,
+            );
+            if !status.success() {
+                let res =
+                    ProcRes { status, stdout, stderr, truncated, cmdline: format!("{:?}", cmd) };
+                self.fatal_proc_rec("rmake recipe failed to complete", &res);
+            }
+        } else {
+            // When --no-capture is passed, we don't need to capture the output and just wait for the process to finish
+            let mut proc =
+                disable_error_reporting(|| cmd.spawn().expect("failed to spawn `rmake`"));
+            let status = proc.wait().expect("failed to wait for `rmake`");
+            if !status.success() {
+                let res = ProcRes {
+                    status,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    truncated: Truncated::No,
+                    cmdline: format!("{:?}", cmd),
+                };
+                self.fatal_proc_rec("rmake recipe failed to complete", &res);
+            }
         }
     }
 }

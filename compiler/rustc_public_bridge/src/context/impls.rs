@@ -5,10 +5,13 @@
 use std::iter;
 
 use rustc_abi::{Endian, Layout, ReprOptions};
+use rustc_attr_ir::Attribute;
+use rustc_attr_ir::lang_items::LangItem;
+use rustc_crate_store::ForeignModule;
 use rustc_hir::def::DefKind;
-use rustc_hir::{Attribute, LangItem};
 use rustc_middle::mir::interpret::{AllocId, ConstAllocation, ErrorHandled, GlobalAlloc, Scalar};
 use rustc_middle::mir::{BinOp, Body, Const as MirConst, ConstValue, UnOp};
+use rustc_middle::ty::consts::ConstExt;
 use rustc_middle::ty::layout::{FnAbiOf, LayoutOf};
 use rustc_middle::ty::print::{
     with_forced_trimmed_paths, with_no_trimmed_paths, with_resolve_crate_name,
@@ -21,7 +24,6 @@ use rustc_middle::ty::{
     ValTree, VariantDef, VtblEntry,
 };
 use rustc_middle::{mir, ty};
-use rustc_session::cstore::ForeignModule;
 use rustc_span::def_id::{CrateNum, DefId, LOCAL_CRATE};
 use rustc_span::{Span, Symbol};
 use rustc_target::callconv::FnAbi;
@@ -49,6 +51,16 @@ impl<'tcx, B: Bridge> AllocRangeHelpers<'tcx> for CompilerCtxt<'tcx, B> {
         size: rustc_abi::Size,
     ) -> mir::interpret::AllocRange {
         rustc_middle::mir::interpret::alloc_range(offset, size)
+    }
+}
+
+impl<'tcx, B: Bridge> rustc_hir_pretty::PpAnn for CompilerCtxt<'tcx, B> {
+    fn nested(&self, state: &mut rustc_hir_pretty::State<'_>, nested: rustc_hir_pretty::Nested) {
+        rustc_hir_pretty::PpAnn::nested(
+            &(&self.tcx as &dyn rustc_hir::intravisit::HirTyCtxt<'_>),
+            state,
+            nested,
+        )
     }
 }
 
@@ -214,31 +226,22 @@ impl<'tcx, B: Bridge> CompilerCtxt<'tcx, B> {
         self.tcx.generics_of(def_id)
     }
 
-    pub fn predicates_of(
-        &self,
-        def_id: DefId,
-    ) -> (Option<DefId>, Vec<(ty::PredicateKind<'tcx>, Span)>) {
-        let ty::GenericPredicates { parent, predicates } = self.tcx.predicates_of(def_id);
+    pub fn clauses_of(&self, def_id: DefId) -> (Option<DefId>, Vec<(ty::ClauseKind<'tcx>, Span)>) {
+        let ty::GenericClauses { parent, clauses } = self.tcx.clauses_of(def_id);
         (
             parent,
-            predicates
-                .iter()
-                .map(|(clause, span)| (clause.as_predicate().kind().skip_binder(), *span))
-                .collect(),
+            clauses.iter().map(|(clause, span)| (clause.kind().skip_binder(), *span)).collect(),
         )
     }
 
-    pub fn explicit_predicates_of(
+    pub fn explicit_clauses_of(
         &self,
         def_id: DefId,
-    ) -> (Option<DefId>, Vec<(ty::PredicateKind<'tcx>, Span)>) {
-        let ty::GenericPredicates { parent, predicates } = self.tcx.explicit_predicates_of(def_id);
+    ) -> (Option<DefId>, Vec<(ty::ClauseKind<'tcx>, Span)>) {
+        let ty::GenericClauses { parent, clauses } = self.tcx.explicit_clauses_of(def_id);
         (
             parent,
-            predicates
-                .iter()
-                .map(|(clause, span)| (clause.as_predicate().kind().skip_binder(), *span))
-                .collect(),
+            clauses.iter().map(|(clause, span)| (clause.kind().skip_binder(), *span)).collect(),
         )
     }
 
@@ -304,7 +307,7 @@ impl<'tcx, B: Bridge> CompilerCtxt<'tcx, B> {
             .get_attrs_by_path(def_id, &attr_name)
             .filter_map(|attribute| {
                 if let Attribute::Unparsed(u) = attribute {
-                    let attr_str = rustc_hir_pretty::attribute_to_string(&self.tcx, attribute);
+                    let attr_str = rustc_hir_pretty::attribute_to_string(self, attribute);
                     Some((attr_str, u.span))
                 } else {
                     None
@@ -323,7 +326,7 @@ impl<'tcx, B: Bridge> CompilerCtxt<'tcx, B> {
         attrs_iter
             .filter_map(|attribute| {
                 if let Attribute::Unparsed(u) = attribute {
-                    let attr_str = rustc_hir_pretty::attribute_to_string(&self.tcx, attribute);
+                    let attr_str = rustc_hir_pretty::attribute_to_string(self, attribute);
                     Some((attr_str, u.span))
                 } else {
                     None
@@ -490,6 +493,16 @@ impl<'tcx, B: Bridge> CompilerCtxt<'tcx, B> {
         ty::Const::zero_sized(self.tcx, ty_internal)
     }
 
+    /// Create a caller location constant from a span.
+    ///
+    /// This produces a `&'static core::panic::Location<'static>` constant,
+    /// which is the implicit extra argument for `#[track_caller]` functions.
+    pub fn span_as_caller_location(&self, span: Span) -> MirConst<'tcx> {
+        let val = self.tcx.span_as_caller_location(span);
+        let ty = self.tcx.caller_location_ty();
+        MirConst::from_value(val, ty)
+    }
+
     /// Create a new constant that represents the given string value.
     pub fn new_const_str(&self, value: &str) -> MirConst<'tcx> {
         let ty = Ty::new_static_str(self.tcx);
@@ -651,6 +664,15 @@ impl<'tcx, B: Bridge> CompilerCtxt<'tcx, B> {
     /// Check if this is an empty DropGlue shim.
     pub fn is_empty_drop_shim(&self, instance: ty::Instance<'tcx>) -> bool {
         matches!(instance.def, ty::InstanceKind::Shim(ty::ShimKind::DropGlue(_, None)))
+    }
+
+    /// Check if this instance requires a caller location argument.
+    ///
+    /// Functions with `#[track_caller]` have an implicit extra
+    /// `&'static core::panic::Location<'static>` argument appended to their ABI,
+    /// which is not visible in their MIR body signature.
+    pub fn instance_requires_caller_location(&self, instance: ty::Instance<'tcx>) -> bool {
+        instance.def.requires_caller_location(self.tcx)
     }
 
     /// Convert a non-generic crate item into an instance.

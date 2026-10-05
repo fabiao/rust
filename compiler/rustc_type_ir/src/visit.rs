@@ -52,7 +52,7 @@ use smallvec::SmallVec;
 use thin_vec::ThinVec;
 
 use crate::inherent::*;
-use crate::{self as ty, Interner, TypeFlags};
+use crate::{self as ty, Const, Interner, PredicateProxy, Region, TypeFlags};
 
 /// This trait is implemented for every type that can be visited,
 /// providing the skeleton of the traversal.
@@ -104,7 +104,7 @@ pub trait TypeVisitor<I: Interner>: Sized {
 
     // `Region` is non-recursive so the default region visitor has no
     // `super_visit_with` method to call.
-    fn visit_region(&mut self, r: I::Region) -> Self::Result {
+    fn visit_region(&mut self, r: Region<I>) -> Self::Result {
         if let ty::ReError(guar) = r.kind() {
             self.visit_error(guar)
         } else {
@@ -112,11 +112,11 @@ pub trait TypeVisitor<I: Interner>: Sized {
         }
     }
 
-    fn visit_const(&mut self, c: I::Const) -> Self::Result {
+    fn visit_const(&mut self, c: Const<I>) -> Self::Result {
         c.super_visit_with(self)
     }
 
-    fn visit_predicate(&mut self, p: I::Predicate) -> Self::Result {
+    fn visit_predicate<P: PredicateProxy<I>>(&mut self, p: P) -> Self::Result {
         p.super_visit_with(self)
     }
 
@@ -465,7 +465,7 @@ impl<I: Interner> TypeVisitor<I> for HasTypeFlagsVisitor {
     }
 
     #[inline]
-    fn visit_region(&mut self, r: I::Region) -> Self::Result {
+    fn visit_region(&mut self, r: Region<I>) -> Self::Result {
         // Note: no `super_visit_with` call, as usual for `Region`.
         if r.flags().intersects(self.flags) {
             ControlFlow::Break(FoundFlags)
@@ -475,7 +475,7 @@ impl<I: Interner> TypeVisitor<I> for HasTypeFlagsVisitor {
     }
 
     #[inline]
-    fn visit_const(&mut self, c: I::Const) -> Self::Result {
+    fn visit_const(&mut self, c: Const<I>) -> Self::Result {
         // Note: no `super_visit_with` call.
         if c.flags().intersects(self.flags) {
             ControlFlow::Break(FoundFlags)
@@ -485,7 +485,7 @@ impl<I: Interner> TypeVisitor<I> for HasTypeFlagsVisitor {
     }
 
     #[inline]
-    fn visit_predicate(&mut self, predicate: I::Predicate) -> Self::Result {
+    fn visit_predicate<P: PredicateProxy<I>>(&mut self, predicate: P) -> Self::Result {
         // Note: no `super_visit_with` call.
         if predicate.flags().intersects(self.flags) {
             ControlFlow::Break(FoundFlags)
@@ -572,7 +572,7 @@ impl<I: Interner> TypeVisitor<I> for HasEscapingVarsVisitor {
     }
 
     #[inline]
-    fn visit_region(&mut self, r: I::Region) -> Self::Result {
+    fn visit_region(&mut self, r: Region<I>) -> Self::Result {
         // If the region is bound by `outer_index` or anything outside
         // of outer index, then it escapes the binders we have
         // visited.
@@ -583,7 +583,7 @@ impl<I: Interner> TypeVisitor<I> for HasEscapingVarsVisitor {
         }
     }
 
-    fn visit_const(&mut self, ct: I::Const) -> Self::Result {
+    fn visit_const(&mut self, ct: Const<I>) -> Self::Result {
         // If the outer-exclusive-binder is *strictly greater* than
         // `outer_index`, that means that `ct` contains some content
         // bound at `outer_index` or above (because
@@ -597,7 +597,7 @@ impl<I: Interner> TypeVisitor<I> for HasEscapingVarsVisitor {
     }
 
     #[inline]
-    fn visit_predicate(&mut self, predicate: I::Predicate) -> Self::Result {
+    fn visit_predicate<P: PredicateProxy<I>>(&mut self, predicate: P) -> Self::Result {
         if predicate.outer_exclusive_binder() > self.outer_index {
             ControlFlow::Break(FoundEscapingVars)
         } else {

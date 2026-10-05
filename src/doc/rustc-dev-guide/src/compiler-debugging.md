@@ -4,8 +4,7 @@ This chapter contains a few tips to debug the compiler.
 These tips aim to be useful no matter what you are working on.
 Some of the other chapters have
 advice about specific parts of the compiler (e.g. the [Queries Debugging and
-Testing chapter](./incrcomp-debugging.html) or the [LLVM Debugging
-chapter](./backend/debugging.md)).
+Testing chapter](./incrcomp-debugging.md) or the [LLVM Debugging chapter](./backend/debugging.md)).
 
 ## Configuring the compiler
 
@@ -76,7 +75,7 @@ stack backtrace:
   34: <std::thread::local::LocalKey<T>>::with
   35: rustc::ty::context::TyCtxt::create_and_enter
   36: rustc_driver::driver::compile_input
-  37: rustc_driver::run_compiler
+  37: rustc_driver::compiler_entrypoint
 ```
 
 If you set `debug = true`, you will get line numbers for the stack trace.
@@ -94,7 +93,7 @@ stack backtrace:
   33: rustc_driver::driver::compile_input
              at /home/user/rust/compiler/rustc_driver/src/driver.rs:1010
              at /home/user/rust/compiler/rustc_driver/src/driver.rs:212
-  34: rustc_driver::run_compiler
+  34: rustc_driver::compiler_entrypoint
              at /home/user/rust/compiler/rustc_driver/src/lib.rs:253
 ```
 
@@ -182,7 +181,7 @@ stack backtrace:
    9: rustc_typeck::check::FnCtxt::select_obligations_where_possible
              at /home/user/rust/compiler/rustc_typeck/src/check/mod.rs:2192
   (~~~ IRRELEVANT PART OF BACKTRACE REMOVED BY ME ~~~)
-  36: rustc_driver::run_compiler
+  36: rustc_driver::compiler_entrypoint
              at /home/user/rust/compiler/rustc_driver/src/lib.rs:253
 ```
 
@@ -281,7 +280,7 @@ Here are some notable ones:
 | `rustc_dump_item_bounds` | Dumps the [`item_bounds`] of an item. |
 | `rustc_dump_layout` | [See this section](#debugging-type-layouts). |
 | `rustc_dump_object_lifetime_defaults` | Dumps the [object lifetime defaults] of an item. |
-| `rustc_dump_predicates` | Dumps the [`predicates_of`] an item. |
+| `rustc_dump_clauses` | Dumps the [`clauses_of`] an item. |
 | `rustc_dump_symbol_name` | Dumps the mangled & demangled [`symbol_name`] of an item. |
 | `rustc_dump_variances` | Dumps the [variances] of an item. |
 | `rustc_dump_vtable` | Dumps the vtable layout of an impl, or a type alias of a dyn type. |
@@ -293,7 +292,7 @@ Right below you can find elaborate explainers on a selected few.
 [`def_path_str`]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/context/struct.TyCtxt.html#method.def_path_str
 [`inferred_outlives_of`]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/context/struct.TyCtxt.html#method.inferred_outlives_of
 [`item_bounds`]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/context/struct.TyCtxt.html#method.item_bounds
-[`predicates_of`]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/context/struct.TyCtxt.html#method.predicates_of
+[`clauses_of`]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/context/struct.TyCtxt.html#method.clauses_of
 [`symbol_name`]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/context/struct.TyCtxt.html#method.symbol_name
 [object lifetime defaults]: https://doc.rust-lang.org/reference/lifetime-elision.html#default-trait-object-lifetimes
 [opaq]: ./opaque-types-impl-trait-inference.md
@@ -315,7 +314,23 @@ $ dot -T pdf maybe_init_suffix.dot > maybe_init_suffix.pdf
 $ firefox maybe_init_suffix.pdf # Or your favorite pdf viewer
 ```
 
-### Debugging type layouts
+Graphviz also comes with a preprocessor program,
+[`unflatten`](https://graphviz.org/docs/cli/unflatten/), that
+sometimes helps making the outputs look less oddly spread out.
+It reads a dot file and outputs another dot file, so you can use it in a pipe,
+e.g:
+```
+$ unflatten mir_dump/*.foo.-------.nll.0.regioncx.all.dot | dot -Tpdf  -o foo-outlives.pdf
+```
+
+This is particularly useful for complicated region outlives graphs from 
+[the borrow checker](borrow-check/debugging.md).
+
+[An online Graphviz editor and visualiser is
+also available](https://dreampuf.github.io/GraphvizOnline).
+
+
+## Narrowing (Bisecting) Regressions
 
 The internal attribute `#[rustc_dump_layout(...)]` can be used to dump the
 [`Layout`] of the type it is attached to.
@@ -376,6 +391,9 @@ error: aborting due to previous error
 
 [`Layout`]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_public/abi/struct.Layout.html
 
+## Debugging borrowcheck
+
+Debugging the borrow checker has [its own chapter](borrow-check/debugging.md).
 
 ## Configuring CodeLLDB for debugging `rustc`
 

@@ -17,7 +17,7 @@ use crate::hash::Hash;
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut, SeekFrom};
 use crate::path::{Path, PathBuf};
 use crate::sync::Mutex;
-pub use crate::sys::fs::common::Dir;
+pub use crate::sys::fs::common::{Dir, ExtraHomeDirs, ExtraMediaDirs};
 use crate::sys::channel::SyncChannel;
 use crate::sys::pal::unsupported_err;
 use crate::sys::time::SystemTime;
@@ -872,6 +872,8 @@ pub fn lstat(path: &Path) -> io::Result<FileAttr> {
 pub fn set_perm(_path: &Path, _perm: FilePermissions) -> io::Result<()> {
     unsupported()
 }
+
+pub use set_perm as set_perm_nofollow;
 
 pub fn set_times(_path: &Path, _times: FileTimes) -> io::Result<()> {
     unsupported()

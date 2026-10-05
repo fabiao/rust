@@ -74,8 +74,7 @@ impl<'tcx> Visitor<'tcx> for DeduceParamAttrs {
                   MutatingUseContext::Store
                 | MutatingUseContext::SetDiscriminant
                 | MutatingUseContext::AsmOutput
-                | MutatingUseContext::Projection
-                | MutatingUseContext::Retag) => {
+                | MutatingUseContext::Projection) => {
                 self.usage[i] |= UsageSummary::MUTATE;
             }
             | PlaceContext::NonMutatingUse(NonMutatingUseContext::RawBorrow) => {
@@ -136,7 +135,7 @@ impl<'tcx> Visitor<'tcx> for DeduceParamAttrs {
             }
 
             // Like a call, but more conservative because the backend may introduce writes to an
-            // argument if the argument is passed as `PassMode::Indirect { on_stack: false, ... }`.
+            // argument if the argument is passed as `PassMode::Indirect { mode: IndirectMode::Pointer, ... }`.
             TerminatorKind::TailCall { .. } => {
                 for usage in self.usage.iter_mut() {
                     *usage |= UsageSummary::MUTATE;

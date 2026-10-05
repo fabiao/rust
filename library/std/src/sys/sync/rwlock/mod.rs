@@ -10,7 +10,8 @@ cfg_select! {
         all(target_family = "wasm", target_feature = "atomics"),
         target_os = "hermit",
         target_os = "ask",
-       target_os = "motor",
+        target_os = "motor",
+        all(target_os = "wasi", target_env = "p3"),
     ) => {
         mod futex;
         pub use futex::RwLock;

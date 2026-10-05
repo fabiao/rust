@@ -1,6 +1,6 @@
 cfg_select! {
     any(
-        all(target_os = "windows", not(target_vendor="win7")),
+        all(target_os = "windows", not(target_vendor = "win7")),
         target_os = "linux",
         target_os = "android",
         target_os = "freebsd",
@@ -11,14 +11,12 @@ cfg_select! {
         all(target_family = "wasm", target_feature = "atomics"),
         target_os = "hermit",
         target_os = "ask",
+        all(target_os = "wasi", target_env = "p3"),
     ) => {
         mod futex;
         pub use futex::Condvar;
     }
-    any(
-        target_family = "unix",
-        target_os = "teeos",
-    ) => {
+    any(target_family = "unix", target_os = "teeos") => {
         mod pthread;
         pub use pthread::Condvar;
     }

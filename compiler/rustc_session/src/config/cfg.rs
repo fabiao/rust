@@ -154,6 +154,7 @@ pub(crate) fn disallow_cfgs(sess: &Session, user_cfgs: &Cfg) {
             | (sym::target_has_atomic_load_store, Some(_))
             | (sym::target_has_reliable_f16, None | Some(_))
             | (sym::target_has_reliable_f16_math, None | Some(_))
+            | (sym::target_has_reliable_f16b, None | Some(_))
             | (sym::target_has_reliable_f128, None | Some(_))
             | (sym::target_has_reliable_f128_math, None | Some(_))
             | (sym::target_thread_local, None) => disallow(cfg, "--target"),
@@ -304,7 +305,7 @@ pub(crate) fn default_configuration(sess: &Session) -> Cfg {
         }
     }
 
-    if !sess.target.singlethread(&sess.target_features) {
+    if !sess.target.singlethread(&sess.internal_target_features) {
         ins_none!(sym::target_has_threads);
     }
 
@@ -391,6 +392,7 @@ impl CheckCfg {
         ins!(sym::doc, no_values);
         ins!(sym::doctest, no_values);
         ins!(sym::miri, no_values);
+        ins!(sym::rust_analyzer, no_values);
         ins!(sym::rustfmt, no_values);
 
         ins!(sym::overflow_checks, no_values);

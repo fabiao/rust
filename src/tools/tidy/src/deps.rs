@@ -1,18 +1,15 @@
 //! Checks the licenses of third-party dependencies.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::{Display, Formatter};
-use std::fs::{File, read_dir};
-use std::io::Write;
+use std::fs::{self, read_dir};
+use std::io;
 use std::path::Path;
 
 use cargo_metadata::semver::Version;
 use cargo_metadata::{Metadata, Package, PackageId};
 
 use crate::diagnostics::{RunningCheck, TidyCtx};
-
-#[path = "../../../bootstrap/src/utils/proc_macro_deps.rs"]
-mod proc_macro_deps;
 
 #[derive(Clone, Copy)]
 struct ListLocation {
@@ -38,6 +35,7 @@ macro_rules! location {
 #[rustfmt::skip]
 const LICENSES: &[&str] = &[
     // tidy-alphabetical-start
+    "(MIT OR Apache-2.0) AND MIT",
     "0BSD OR MIT OR Apache-2.0",                           // adler2 license
     "Apache-2.0 / MIT",
     "Apache-2.0 OR ISC OR MIT",
@@ -97,13 +95,32 @@ pub(crate) struct WorkspaceInfo<'a> {
     pub(crate) path: &'a str,
     /// The list of license exceptions.
     pub(crate) exceptions: ExceptionList,
-    /// Optionally:
-    /// * A list of crates for which dependencies need to be explicitly allowed.
-    /// * The list of allowed dependencies.
-    /// * The source code location of the allowed dependencies list
-    crates_and_deps: Option<(&'a [&'a str], &'a [&'a str], ListLocation)>,
+    /// The list of dependencies that are allowed. If None, any crate with an
+    /// acceptable license is allowed.
+    allowed_deps: Option<PermittedDeps<'a>>,
     /// Submodules required for the workspace
     pub(crate) submodules: &'a [&'a str],
+}
+
+#[derive(Clone, Copy)]
+struct PermittedDeps<'a> {
+    /// A list of crates for which dependencies need to be explicitly allowed
+    /// or None to check the entire workspace.
+    roots: Option<&'a [&'a str]>,
+    /// The list of allowed dependencies.
+    deps: &'a [&'a str],
+    /// The source code location of the allowed dependencies list.
+    deps_loc: ListLocation,
+}
+
+impl<'a> PermittedDeps<'a> {
+    const fn new(
+        roots: Option<&'a [&'a str]>,
+        deps: &'a [&'a str],
+        deps_loc: ListLocation,
+    ) -> Self {
+        Self { roots, deps, deps_loc }
+    }
 }
 
 const WORKSPACE_LOCATION: ListLocation = location!(+4);
@@ -115,8 +132,8 @@ pub(crate) const WORKSPACES: &[WorkspaceInfo<'static>] = &[
     WorkspaceInfo {
         path: ".",
         exceptions: EXCEPTIONS,
-        crates_and_deps: Some((
-            &["rustc-main"],
+        allowed_deps: Some(PermittedDeps::new(
+            Some(&["rustc-main"]),
             PERMITTED_RUSTC_DEPENDENCIES,
             PERMITTED_RUSTC_DEPS_LOCATION,
         )),
@@ -125,8 +142,8 @@ pub(crate) const WORKSPACES: &[WorkspaceInfo<'static>] = &[
     WorkspaceInfo {
         path: "library",
         exceptions: EXCEPTIONS_STDLIB,
-        crates_and_deps: Some((
-            &["sysroot"],
+        allowed_deps: Some(PermittedDeps::new(
+            None,
             PERMITTED_STDLIB_DEPENDENCIES,
             PERMITTED_STDLIB_DEPS_LOCATION,
         )),
@@ -135,14 +152,14 @@ pub(crate) const WORKSPACES: &[WorkspaceInfo<'static>] = &[
     WorkspaceInfo {
         path: "library/stdarch",
         exceptions: EXCEPTIONS_STDARCH,
-        crates_and_deps: None,
+        allowed_deps: None,
         submodules: &[],
     },
     WorkspaceInfo {
         path: "compiler/rustc_codegen_cranelift",
         exceptions: EXCEPTIONS_CRANELIFT,
-        crates_and_deps: Some((
-            &["rustc_codegen_cranelift"],
+        allowed_deps: Some(PermittedDeps::new(
+            None,
             PERMITTED_CRANELIFT_DEPENDENCIES,
             PERMITTED_CRANELIFT_DEPS_LOCATION,
         )),
@@ -151,19 +168,19 @@ pub(crate) const WORKSPACES: &[WorkspaceInfo<'static>] = &[
     WorkspaceInfo {
         path: "compiler/rustc_codegen_gcc",
         exceptions: EXCEPTIONS_GCC,
-        crates_and_deps: None,
+        allowed_deps: None,
         submodules: &[],
     },
     WorkspaceInfo {
         path: "src/bootstrap",
         exceptions: EXCEPTIONS_BOOTSTRAP,
-        crates_and_deps: None,
+        allowed_deps: None,
         submodules: &[],
     },
     WorkspaceInfo {
         path: "src/tools/cargo",
         exceptions: EXCEPTIONS_CARGO,
-        crates_and_deps: None,
+        allowed_deps: None,
         submodules: &["src/tools/cargo"],
     },
     // FIXME uncomment once all deps are vendored
@@ -180,25 +197,25 @@ pub(crate) const WORKSPACES: &[WorkspaceInfo<'static>] = &[
     WorkspaceInfo {
         path: "src/tools/rust-analyzer",
         exceptions: EXCEPTIONS_RUST_ANALYZER,
-        crates_and_deps: None,
+        allowed_deps: None,
         submodules: &[],
     },
     WorkspaceInfo {
         path: "src/tools/rustbook",
         exceptions: EXCEPTIONS_RUSTBOOK,
-        crates_and_deps: None,
+        allowed_deps: None,
         submodules: &["src/doc/book", "src/doc/reference"],
     },
     WorkspaceInfo {
         path: "src/tools/rustc-perf",
         exceptions: EXCEPTIONS_RUSTC_PERF,
-        crates_and_deps: None,
+        allowed_deps: None,
         submodules: &["src/tools/rustc-perf"],
     },
     WorkspaceInfo {
         path: "tests/run-make-cargo/uefi-qemu/uefi_qemu_test",
         exceptions: EXCEPTIONS_UEFI_QEMU_TEST,
-        crates_and_deps: None,
+        allowed_deps: None,
         submodules: &[],
     },
 ];
@@ -339,7 +356,6 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "equivalent",
     "errno",
     "expect-test",
-    "fallible-iterator", // dependency of `thorin`
     "fastrand",
     "find-msvc-tools",
     "flate2",
@@ -354,11 +370,10 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "gimli",
     "gsgdt",
     "hashbrown",
-    "icu_collections",
     "icu_list",
-    "icu_locale",
     "icu_locale_core",
-    "icu_locale_data",
+    "icu_locale_fallback",
+    "icu_locale_fallback_data",
     "icu_provider",
     "ident_case",
     "indexmap",
@@ -373,7 +388,7 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "jiff-tzdb-platform",
     "jobserver",
     "lazy_static",
-    "leb128",
+    "leb128fmt",
     "libc",
     "libloading",
     "linux-raw-sys",
@@ -406,7 +421,6 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "ppv-lite86",
     "proc-macro-hack",
     "proc-macro2",
-    "psm",
     "pulldown-cmark",
     "pulldown-cmark-escape",
     "punycode",
@@ -436,6 +450,7 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "scoped-tls",
     "scopeguard",
     "self_cell",
+    "semver",
     "serde",
     "serde_core",
     "serde_derive",
@@ -449,7 +464,6 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "simd-adler32",
     "smallvec",
     "stable_deref_trait",
-    "stacker",
     "static_assertions",
     "strsim",
     "syn",
@@ -486,7 +500,6 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "unicode-script",
     "unicode-security",
     "unicode-width",
-    "utf8_iter",
     "utf8parse",
     "valuable",
     "version_check",
@@ -504,16 +517,7 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "windows-result",
     "windows-strings",
     "windows-sys",
-    "windows-targets",
     "windows-threading",
-    "windows_aarch64_gnullvm",
-    "windows_aarch64_msvc",
-    "windows_i686_gnu",
-    "windows_i686_gnullvm",
-    "windows_i686_msvc",
-    "windows_x86_64_gnu",
-    "windows_x86_64_gnullvm",
-    "windows_x86_64_msvc",
     "wit-bindgen-rt@0.39.0", // pinned to a specific version due to using a binary blob: <https://github.com/rust-lang/rust/pull/136395#issuecomment-2692769062>
     "writeable",
     "yoke",
@@ -539,6 +543,7 @@ const PERMITTED_STDLIB_DEPENDENCIES: &[&str] = &[
     "cfg-if",
     "compiler_builtins",
     "dlmalloc",
+    "find-msvc-tools", // via cc
     "foldhash", // FIXME: only appears in Cargo.lock due to https://github.com/rust-lang/cargo/issues/10801
     "fortanix-sgx-abi",
     "getopts",
@@ -652,7 +657,8 @@ pub fn check(root: &Path, cargo: &Path, tidy_ctx: TidyCtx) {
 
     check_proc_macro_dep_list(root, cargo, bless, &mut check);
 
-    for &WorkspaceInfo { path, exceptions, crates_and_deps, submodules } in WORKSPACES {
+    for &WorkspaceInfo { path, exceptions, allowed_deps: crates_and_deps, submodules } in WORKSPACES
+    {
         if has_missing_submodule(root, submodules, tidy_ctx.is_running_on_ci()) {
             continue;
         }
@@ -677,14 +683,14 @@ pub fn check(root: &Path, cargo: &Path, tidy_ctx: TidyCtx) {
             check.error(format!("{path} is part of another workspace ({} != {}), remove from `WORKSPACES` ({WORKSPACE_LOCATION})", absolute_root.display(), absolute_root_real.display()));
         }
         check_license_exceptions(&metadata, path, exceptions, &mut check);
-        if let Some((crates, permitted_deps, location)) = crates_and_deps {
-            let descr = crates.get(0).unwrap_or(&path);
+        if let Some(PermittedDeps { roots, deps: permitted_deps, deps_loc }) = crates_and_deps {
+            let descr = roots.map_or(path, |roots| roots.get(0).unwrap_or(&path));
             check_permitted_dependencies(
                 &metadata,
                 descr,
                 permitted_deps,
-                crates,
-                location,
+                roots,
+                deps_loc,
                 &mut check,
             );
         }
@@ -721,53 +727,65 @@ fn check_proc_macro_dep_list(root: &Path, cargo: &Path, bless: bool, check: &mut
     }
     // Remove the proc-macro crates themselves
     proc_macro_deps.retain(|pkg| !is_proc_macro_pkg(&metadata[pkg]));
+    // Sort and deduplicate the crate names.
+    // Cargo package names may contain `-`, but will normalize these to `_` before passing to rustc.
+    // As bootstrap parses the `--crate-name` flag, use the name of the actual lib target which has
+    // been normalized.
+    let proc_macro_deps = proc_macro_deps
+        .into_iter()
+        .filter_map(|dep| {
+            metadata[dep].targets.iter().find_map(|target| target.is_lib().then_some(&target.name))
+        })
+        .collect::<BTreeSet<_>>();
 
-    let proc_macro_deps: HashSet<_> =
-        proc_macro_deps.into_iter().map(|dep| metadata[dep].name.as_ref()).collect();
-    let expected = proc_macro_deps::CRATES.iter().copied().collect::<HashSet<_>>();
+    let expected = {
+        use std::fmt::Write;
 
-    let needs_blessing = proc_macro_deps.difference(&expected).next().is_some()
-        || expected.difference(&proc_macro_deps).next().is_some();
-
-    if needs_blessing && bless {
-        let mut proc_macro_deps: Vec<_> = proc_macro_deps.into_iter().collect();
-        proc_macro_deps.sort();
-        let mut file = File::create(root.join("src/bootstrap/src/utils/proc_macro_deps.rs"))
-            .expect("`proc_macro_deps` should exist");
-        writeln!(
-            &mut file,
-            "/// Do not update manually - use `./x.py test tidy --bless`
+        const HEADER: &str = "\
+/// Do not update manually - use `./x.py test tidy --bless`
 /// Holds all direct and indirect dependencies of proc-macro crates in tree.
 /// See <https://github.com/rust-lang/rust/issues/134863>
 pub static CRATES: &[&str] = &[
-    // tidy-alphabetical-start"
-        )
-        .unwrap();
-        for dep in proc_macro_deps {
-            writeln!(&mut file, "    {dep:?},").unwrap();
-        }
-        writeln!(
-            &mut file,
-            "    // tidy-alphabetical-end
-];"
-        )
-        .unwrap();
-    } else {
-        let mut error_found = false;
+    // tidy-alphabetical-start
+";
+        const FOOTER: &str = "    // tidy-alphabetical-end
+];
+";
 
-        for missing in proc_macro_deps.difference(&expected) {
-            error_found = true;
-            check.error(format!(
-                "proc-macro crate dependency `{missing}` is not registered in `src/bootstrap/src/utils/proc_macro_deps.rs`",
-            ));
+        let mut buf = String::with_capacity(4096);
+        buf.push_str(HEADER);
+        for dep in proc_macro_deps {
+            writeln!(buf, "    {dep:?},").unwrap();
         }
-        for extra in expected.difference(&proc_macro_deps) {
-            error_found = true;
-            check.error(format!(
-                "`{extra}` is registered in `src/bootstrap/src/utils/proc_macro_deps.rs`, but is not a proc-macro crate dependency",
-            ));
+        buf.push_str(FOOTER);
+        buf
+    };
+
+    const PROC_MACRO_DEPS_RS: &str = "src/bootstrap/src/utils/proc_macro_deps.rs";
+    let proc_macro_deps_rs_path = &root.join(PROC_MACRO_DEPS_RS);
+    let actual = match fs::read_to_string(proc_macro_deps_rs_path) {
+        Ok(actual) => actual,
+        Err(e) => {
+            if e.kind() == io::ErrorKind::NotFound {
+                check.error(format!(
+                    "`{PROC_MACRO_DEPS_RS}` not found; has it been moved or renamed?"
+                ));
+            } else {
+                check.error(format!("`{PROC_MACRO_DEPS_RS}` could not be read: {e:?}"));
+            }
+            return;
         }
-        if error_found {
+    };
+
+    if actual != expected {
+        if bless {
+            fs::write(proc_macro_deps_rs_path, &expected).unwrap();
+        } else {
+            let diff = similar::TextDiff::from_lines(&actual, &expected);
+            let mut unified = diff.unified_diff();
+            unified.header(PROC_MACRO_DEPS_RS, "(expected)");
+
+            check.error(format!("`{PROC_MACRO_DEPS_RS}` is not up-to-date:\n{unified}"));
             check.message("Run `./x.py test tidy --bless` to regenerate the list");
         }
     }
@@ -929,15 +947,21 @@ fn check_permitted_dependencies(
     metadata: &Metadata,
     descr: &str,
     permitted_dependencies: &[&'static str],
-    restricted_dependency_crates: &[&'static str],
+    restricted_dependency_crates: Option<&[&'static str]>,
     permitted_location: ListLocation,
     check: &mut RunningCheck,
 ) {
     let mut has_permitted_dep_error = false;
     let mut deps = HashSet::new();
-    for to_check in restricted_dependency_crates {
-        let to_check = pkg_from_name(metadata, to_check);
-        deps_of(metadata, &to_check.id, &mut deps);
+    if let Some(restricted_dependency_crates) = restricted_dependency_crates {
+        for to_check in restricted_dependency_crates {
+            let to_check = pkg_from_name(metadata, to_check);
+            deps_of(metadata, &to_check.id, &mut deps);
+        }
+    } else {
+        for to_check in &metadata.packages {
+            deps_of(metadata, &to_check.id, &mut deps);
+        }
     }
 
     // Check that the PERMITTED_DEPENDENCIES does not have unused entries.
