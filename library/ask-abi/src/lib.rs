@@ -12,7 +12,6 @@ pub mod alloc;
 
 pub const SYS_LOG: u64 = 0;
 pub const SYS_EXIT: u64 = 1;
-pub const SYS_SPAWN_RAW: u64 = 2;
 pub const SYS_YIELD: u64 = 3;
 pub const SYS_MAP: u64 = 4;
 pub const SYS_REVOKE: u64 = 5;
@@ -190,17 +189,6 @@ pub fn exit(code: u64) -> ! {
         // Safety: `SYS_EXIT` never returns.
         unsafe { syscall2(SYS_EXIT, code, 0) };
     }
-}
-
-/// `SpawnRaw(block_ptr, block_len)`: spawn from a binary capability block.
-/// Untyped here — the `CapabilityBlock` struct is `askme`'s; use
-/// `askme::syscall::spawn_raw` instead of calling this directly.
-/// # Safety
-/// `[block_ptr, block_ptr+block_len)` must be a valid, live capability
-/// block the kernel can read synchronously during the call.
-pub unsafe fn spawn_raw(block_ptr: *const u8, block_len: usize) -> Result<usize, Error> {
-    decode(unsafe { syscall2(SYS_SPAWN_RAW, block_ptr as u64, block_len as u64) })
-        .map(|v| v as usize)
 }
 
 /// `Yield()`: give up the core cooperatively.
