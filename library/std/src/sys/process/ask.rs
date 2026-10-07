@@ -152,7 +152,7 @@ impl Command {
 
         let launched = launch(name, &argv, &env)?;
         let pipes = attach_parent_stdio(launched, &stdin, &stdout, &stderr)?;
-        Ok((Process { pid: launched.pid, status: None }, pipes))
+        Ok((Process { identity: launched.identity(), status: None }, pipes))
     }
 }
 
@@ -268,7 +268,7 @@ fn launch(name: &[u8], argv: &[u8], env: &[u8]) -> io::Result<ask_io::process::L
         env: ask_io::process::Buffer::new(env_offset as u32, env.len() as u32)
             .ok_or_else(pal::unsupported_err)?,
         flags: ask_io::process::FLAG_FOREGROUND,
-        stdout_peer_pid: 0,
+        stdout_peer: None,
     };
     let mut payload = [0; ask_io::process::LAUNCH_REQUEST_LEN];
     let completion = guard.call(
@@ -407,21 +407,21 @@ impl From<u8> for ExitCode {
 }
 
 pub struct Process {
-    pid: u32,
+    identity: ask_io::process::ProcessIdentity,
     status: Option<ExitStatus>,
 }
 
 impl Process {
     pub fn id(&self) -> u32 {
-        self.pid
+        self.identity.pid as u32
     }
 
     pub fn kill(&mut self) -> io::Result<()> {
-        let mut payload = [0; 4];
+        let mut payload = [0; ask_io::process::PROCESS_IDENTITY_LEN];
         let mut guard = launcher()?;
         let completion = guard.call(
             ask_io::process::OP_CANCEL,
-            ask_io::process::encode_process_id(&mut payload, self.pid),
+            ask_io::process::encode_process_identity(&mut payload, self.identity),
         )?;
         drop(guard);
         if completion.result != ask_io::process::RESULT_OK {
@@ -450,7 +450,7 @@ impl Process {
         let mut guard = launcher()?;
         let completion = guard.call(
             ask_io::process::OP_WAIT,
-            ask_io::process::encode_wait_request(&mut payload, self.pid, flags),
+            ask_io::process::encode_wait_request(&mut payload, self.identity, flags),
         )?;
         drop(guard);
         if completion.result == ask_io::process::RESULT_BUSY {
