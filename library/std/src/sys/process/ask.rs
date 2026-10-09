@@ -267,7 +267,7 @@ fn launch(name: &[u8], argv: &[u8], env: &[u8]) -> io::Result<ask_io::process::L
             .ok_or_else(pal::unsupported_err)?,
         env: ask_io::process::Buffer::new(env_offset as u32, env.len() as u32)
             .ok_or_else(pal::unsupported_err)?,
-        flags: ask_io::process::FLAG_FOREGROUND,
+        flags: ask_io::process::launch_flag::FOREGROUND,
         stdout_peer: None,
     };
     let mut payload = [0; ask_io::process::LAUNCH_REQUEST_LEN];
@@ -435,7 +435,7 @@ impl Process {
     }
 
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        match self.wait_flags(ask_io::process::FLAG_NONBLOCK) {
+        match self.wait_flags(ask_io::process::wait_flag::NONBLOCK) {
             Ok(status) => Ok(Some(status)),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
             Err(error) => Err(error),
