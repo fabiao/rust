@@ -1,22 +1,21 @@
 //! System allocator for ASK: dlmalloc over `askalloc` segments, which the
 //! kernel places (`Map` with `ANYWHERE`) and revokes when dlmalloc frees or
-//! trims them, so the heap is bounded only by the process's memory account
-//! (docs/implementations/designs/process-heap.md). The futex mutex parks a
-//! contending thread instead of spinning while the owner runs.
+//! trims them. Adjacent backing allocations remain separately reclaimable.
+//! The futex mutex parks a contending thread while the owner runs.
 
 use core::cell::SyncUnsafeCell;
 
 use crate::alloc::Layout;
 use crate::sys::sync::Mutex;
 
-type Heap = dlmalloc::Dlmalloc<ask_alloc::Segments<ask_alloc::KernelPages>>;
+type Heap = ask_alloc::Dlmalloc<ask_alloc::Segments<ask_alloc::KernelPages>>;
 
 struct SyncHeap(Heap);
 // SAFETY: every access to the heap holds `LOCK`.
 unsafe impl Sync for SyncHeap {}
 
 static HEAP: SyncUnsafeCell<SyncHeap> = SyncUnsafeCell::new(SyncHeap(
-    dlmalloc::Dlmalloc::new_with_allocator(ask_alloc::Segments::new(
+    ask_alloc::Dlmalloc::new_with_allocator(ask_alloc::Segments::new(
         ask_alloc::KernelPages::new(ask_abi::APP_FRAME_TOKEN),
     )),
 ));
