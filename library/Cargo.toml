@@ -91,7 +91,8 @@ windows-sys = { path = 'windows-sys' }
 
 # ASK's std PAL consumes these packages by path below. Their own manifests
 # retain ordinary version dependencies so non-Rust-tree consumers resolve
-# through ASK's explicit registry overlay; scope the two transitive redirects
+# through ASK's explicit registry overlay; scope these transitive redirects
 # to this workspace rather than inheriting the superproject's full catalog.
 askabi = { path = '../../../../core/libs/askabi/source' }
 asksys = { path = '../../../../core/libs/asksys/source' }
+askio = { path = '../../../../core/libs/askio/source' }
