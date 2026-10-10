@@ -68,6 +68,7 @@ name = "askipc"
 version = "0.1.0"
 dependencies = [
  "askabi",
+ "askio",
  "asksys",
  "rustc-std-workspace-core",
 ]

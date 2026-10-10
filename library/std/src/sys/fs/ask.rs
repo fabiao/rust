@@ -82,12 +82,29 @@ mod heapless_path {
     }
 }
 
+/// Timestamps to store; an unset field is omitted from the provider request
+/// and keeps its stored value.
 #[derive(Copy, Clone, Debug, Default)]
-pub struct FileTimes {}
+pub struct FileTimes {
+    accessed: Option<SystemTime>,
+    modified: Option<SystemTime>,
+}
 
 impl FileTimes {
-    pub fn set_accessed(&mut self, _t: SystemTime) {}
-    pub fn set_modified(&mut self, _t: SystemTime) {}
+    pub fn set_accessed(&mut self, t: SystemTime) {
+        self.accessed = Some(t);
+    }
+
+    pub fn set_modified(&mut self, t: SystemTime) {
+        self.modified = Some(t);
+    }
+
+    fn to_update(self) -> io::Result<ask_io::fs::TimeUpdate> {
+        Ok(ask_io::fs::TimeUpdate {
+            accessed_ns: self.accessed.map(protocol_ns_from_system_time).transpose()?,
+            modified_ns: self.modified.map(protocol_ns_from_system_time).transpose()?,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -125,24 +142,15 @@ impl FileType {
     }
 }
 
-/// Path-addressed metadata, or the size-only projection an open `File` can
-/// answer from `FS_OP_OPEN`. `askfs` carries no creation
-/// timestamp, so `created()` stays unsupported while `modified()`/`accessed()`
-/// resolve whenever the attributes came from `stat` (docs/vfs-layout.md).
+/// Provider metadata for a path or open handle. `askfs` carries no creation
+/// timestamp, so `created()` stays unsupported.
 #[derive(Clone)]
 pub struct FileAttr {
     size: u64,
     mode: u32,
     is_dir: bool,
-    /// `None` for the open-handle projection, which has no timestamps on the
-    /// wire; `Some` once a metadata query supplied them.
-    times: Option<FileStatTimes>,
-}
-
-#[derive(Copy, Clone)]
-struct FileStatTimes {
-    accessed_sec: i64,
-    modified_sec: i64,
+    accessed_ns: i64,
+    modified_ns: i64,
 }
 
 /// The native metadata mode's owner-write bit.
@@ -154,16 +162,26 @@ const MODE_OWNER_WRITE: u32 = 0o200;
 /// `0777 & ~umask` default shells expect. `askfs` applies its own mask.
 const DEFAULT_DIR_MODE: u32 = 0o755;
 
-/// Native timestamps are signed nanoseconds from the Unix epoch; `SystemTime`
-/// is an unsigned offset from it, so a pre-epoch stamp subtracts instead.
-fn system_time_from_secs(secs: i64) -> SystemTime {
-    let magnitude = crate::time::Duration::from_secs(secs.unsigned_abs());
-    let shifted = if secs < 0 {
-        crate::sys::time::UNIX_EPOCH.checked_sub_duration(&magnitude)
+/// Native timestamps are signed nanoseconds from the Unix epoch.
+fn system_time_from_protocol_ns(nanoseconds: i64) -> SystemTime {
+    let offset = crate::time::Duration::from_nanos(nanoseconds.unsigned_abs());
+    let time = if nanoseconds < 0 {
+        crate::sys::time::UNIX_EPOCH.checked_sub_duration(&offset)
     } else {
-        crate::sys::time::UNIX_EPOCH.checked_add_duration(&magnitude)
+        crate::sys::time::UNIX_EPOCH.checked_add_duration(&offset)
     };
-    shifted.unwrap_or(crate::sys::time::UNIX_EPOCH)
+    // An `i64` nanosecond count spans about 292 years, inside `SystemTime`'s range.
+    time.unwrap_or(crate::sys::time::UNIX_EPOCH)
+}
+
+fn protocol_ns_from_system_time(time: SystemTime) -> io::Result<i64> {
+    let nanoseconds = match time.sub_time(&crate::sys::time::UNIX_EPOCH) {
+        Ok(after) => i128::try_from(after.as_nanos()).ok(),
+        Err(before) => i128::try_from(before.as_nanos()).ok().map(|n| -n),
+    };
+    nanoseconds.and_then(|n| i64::try_from(n).ok()).ok_or_else(|| {
+        io::const_error!(io::ErrorKind::InvalidInput, "fs: timestamp beyond the protocol range")
+    })
 }
 
 impl FileAttr {
@@ -172,10 +190,8 @@ impl FileAttr {
             size: metadata.size,
             mode: metadata.mode,
             is_dir: metadata.kind == ask_io::fs::NodeKind::Directory as u8,
-            times: Some(FileStatTimes {
-                accessed_sec: metadata.atime_ns / 1_000_000_000,
-                modified_sec: metadata.mtime_ns / 1_000_000_000,
-            }),
+            accessed_ns: metadata.atime_ns,
+            modified_ns: metadata.mtime_ns,
         }
     }
 
@@ -196,15 +212,11 @@ impl FileAttr {
     }
 
     pub fn modified(&self) -> io::Result<SystemTime> {
-        self.times
-            .map(|t| system_time_from_secs(t.modified_sec))
-            .ok_or_else(unsupported_err)
+        Ok(system_time_from_protocol_ns(self.modified_ns))
     }
 
     pub fn accessed(&self) -> io::Result<SystemTime> {
-        self.times
-            .map(|t| system_time_from_secs(t.accessed_sec))
-            .ok_or_else(unsupported_err)
+        Ok(system_time_from_protocol_ns(self.accessed_ns))
     }
 
     /// `askfs` stores a change time, not a creation time, so no value here
@@ -592,8 +604,17 @@ impl File {
         unsupported()
     }
 
-    pub fn set_times(&self, _times: FileTimes) -> io::Result<()> {
-        unsupported()
+    pub fn set_times(&self, times: FileTimes) -> io::Result<()> {
+        let update = times.to_update()?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut request = [0u8; ask_io::fs::FS_UTIMENS_HANDLE_REQUEST_LEN];
+        let payload =
+            ask_io::fs::encode_fs_utimens_handle_request(&mut request, self.handle, update);
+        let completion = inner.channel.call(ask_io::fs::OP_UTIMENS, payload)?;
+        if completion.result < 0 {
+            return Err(fs_error(completion.result, "fs: set times failed"));
+        }
+        Ok(())
     }
 
     pub fn lock(&self) -> io::Result<()> {
@@ -875,12 +896,37 @@ pub fn set_perm(_path: &Path, _perm: FilePermissions) -> io::Result<()> {
 
 pub use set_perm as set_perm_nofollow;
 
-pub fn set_times(_path: &Path, _times: FileTimes) -> io::Result<()> {
-    unsupported()
+pub fn set_times(path: &Path, times: FileTimes) -> io::Result<()> {
+    set_path_times(path, times, false)
 }
 
-pub fn set_times_nofollow(_path: &Path, _times: FileTimes) -> io::Result<()> {
-    unsupported()
+pub fn set_times_nofollow(path: &Path, times: FileTimes) -> io::Result<()> {
+    set_path_times(path, times, true)
+}
+
+/// The provider resolves the path and stores the requested fields in one
+/// transaction, so an omitted field is never read back and rewritten here.
+fn set_path_times(path: &Path, times: FileTimes, nofollow: bool) -> io::Result<()> {
+    let update = times.to_update()?;
+    let (provider_token, relative) = resolve_fs_path(path)?;
+    let completion = path_exchange(
+        provider_token,
+        ask_io::fs::OP_UTIMENS,
+        |request: &mut [u8; ask_io::fs::FS_UTIMENS_PATH_REQUEST_LEN], window| {
+            ask_io::fs::encode_fs_utimens_path_request(
+                request,
+                window,
+                relative.as_bytes(),
+                nofollow,
+                update,
+            )
+            .is_some()
+        },
+    )?;
+    if completion.result < 0 {
+        return Err(fs_error(completion.result, "fs: set times failed"));
+    }
+    Ok(())
 }
 
 pub fn canonicalize(_path: &Path) -> io::Result<PathBuf> {
