@@ -23,3 +23,12 @@ ASK applications use `askme::heap::reclaim` with explicit SDK heap selection.
 Host API/backing checks and cumulative ASK verification own efficacy claims;
 no efficacy is claimed for unsupported targets. The ASK toolchain contract,
 Book and provider-account evidence record the current proof boundaries.
+
+ASK's native provider releases caches at object/session retirement and
+terminal snapshot cleanup, then explicitly requests reclamation. Its cumulative
+KVM suite passes all 23 cases, including exact provider page/resource baselines
+after child death and quota/disconnect/refill. Stable client ownership avoids
+moving surviving records into otherwise disposable segments. This demonstrates
+cooperation between lifecycle owners and their allocator without a periodic
+timer; it does not promise arbitrary fragmentation recovery. Pressure and
+caller-page proof remain open, and no upstream submission has occurred.
