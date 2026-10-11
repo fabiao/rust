@@ -21,6 +21,15 @@ static HEAP: SyncUnsafeCell<SyncHeap> = SyncUnsafeCell::new(SyncHeap(
 ));
 static LOCK: Mutex = Mutex::new();
 
+pub fn reclaim(retain_bytes: usize) -> core::alloc::ReclaimResult {
+    // SAFETY: exclusive heap access preserves every live allocation.
+    if with_heap(|heap| unsafe { heap.trim(retain_bytes) }) {
+        core::alloc::ReclaimResult::Released
+    } else {
+        core::alloc::ReclaimResult::Unchanged
+    }
+}
+
 /// Runs `operation` with exclusive access to the heap.
 fn with_heap<T>(operation: impl FnOnce(&mut Heap) -> T) -> T {
     LOCK.lock();

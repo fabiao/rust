@@ -153,6 +153,16 @@ use crate::{hint, mem, ptr};
 #[derive_const(Clone, Default)]
 pub struct System;
 
+#[unstable(feature = "allocator_reclaim", issue = "none")]
+impl AllocatorReclaim for System {
+    fn reclaim(&self, retain_bytes: usize) -> ReclaimResult {
+        #[cfg(target_os = "ask")]
+        { imp::reclaim(retain_bytes) }
+        #[cfg(not(target_os = "ask"))]
+        { let _ = retain_bytes; ReclaimResult::Unsupported }
+    }
+}
+
 #[unstable(feature = "allocator_ext", issue = "163177", implied_by = "allocator_api")]
 unsafe impl core::alloc::AllocatorClone for System {}
 
