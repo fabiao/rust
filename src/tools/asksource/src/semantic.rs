@@ -84,6 +84,7 @@ fn location(tcx: TyCtxt<'_>, span: Span) -> Value {
     let start = map.lookup_byte_offset(span.lo());
     let end = map.lookup_byte_offset(span.hi());
     json!({"path": start.sf.name.prefer_local_unconditionally().to_string(),
+        "source_file_id": format!("{:?}", start.sf.stable_id),
         "span": [start.sf.original_relative_byte_pos(span.lo()).0,
                  end.sf.original_relative_byte_pos(span.hi()).0],
         "same_file": start.sf.start_pos == end.sf.start_pos})
@@ -105,6 +106,7 @@ fn origin(tcx: TyCtxt<'_>, span: Span) -> Value {
 
 fn definition(tcx: TyCtxt<'_>, id: rustc_hir::def_id::DefId) -> Value {
     json!({"crate": tcx.crate_name(id.krate).to_string(),
+        "path": tcx.def_path_str(id),
         "name": tcx.opt_item_name(id).map(|name| name.to_string()),
         "kind": format!("{:?}", tcx.def_kind(id)),
         "hash": format!("{:?}", tcx.def_path_hash(id)),
@@ -473,7 +475,9 @@ impl Capture {
                 if rustc_span::SourceFileHash::new_in_memory(file.src_hash.kind, compiler_bytes) != file.src_hash {
                     return Err(format!("compiler source changed after loading: {path}"));
                 }
-                sources.insert(path, json!({"kind": if binary { "binary" } else { "text" }, "sha256": digest(&raw), "normalized_sha256": digest(text.as_bytes())}));
+                sources.insert(path, json!({"kind": if binary { "binary" } else { "text" },
+                    "source_file_id": format!("{:?}", file.stable_id),
+                    "sha256": digest(&raw), "normalized_sha256": digest(text.as_bytes())}));
             }
         }
         let mut inputs = BTreeMap::new();
@@ -527,9 +531,17 @@ impl Capture {
 }
 
 pub fn run(args: &[String]) -> Result<(), String> {
-    if args.is_empty() {
-        return Err("capture requires the compiler path and its arguments".into());
-    }
+    use cargo::util::command_prelude::*;
+    let matches = Command::new("capture")
+        .arg(Arg::new("output").long("output").required(true).value_parser(value_parser!(PathBuf)))
+        .arg(Arg::new("request").long("request").requires("request-sha256").value_parser(value_parser!(PathBuf)))
+        .arg(Arg::new("request-sha256").long("request-sha256").requires("request"))
+        .arg(Arg::new("compiler").required(true).num_args(1..).last(true))
+        .try_get_matches_from(std::iter::once("capture").chain(args.iter().map(String::as_str)))
+        .map_err(|e| e.to_string())?;
+    let args: Vec<String> = matches.get_many::<String>("compiler").ok_or("missing compiler arguments")?
+        .cloned().collect();
+    let destination = matches.get_one::<PathBuf>("output").cloned().ok_or("missing capture output")?;
     let executable = std::env::current_exe().map_err(|e| e.to_string())?;
     let compiler_name = if cfg!(windows) { "rustc.exe" } else { "rustc" };
     let expected = fs::canonicalize(executable.with_file_name(compiler_name)).map_err(|e| e.to_string())?;
@@ -538,7 +550,6 @@ pub fn run(args: &[String]) -> Result<(), String> {
         return Err(format!("compiler {} does not match helper compiler {}; build the helper for the selected compiler",
                            requested.display(), expected.display()));
     }
-    let destination: PathBuf = std::env::var_os("ASK_SOURCE_CAPTURE").ok_or("missing ASK_SOURCE_CAPTURE destination")?.into();
     if !destination.is_absolute() {
         return Err("capture destination must be absolute".into());
     }
@@ -558,16 +569,15 @@ pub fn run(args: &[String]) -> Result<(), String> {
             }
         }
     }
-    let request = if let Some(path) = std::env::var_os("ASK_SOURCE_CAPTURE_REQUEST") {
+    let request = if let Some(path) = matches.get_one::<PathBuf>("request") {
         let bytes = fs::read(path).map_err(|e| e.to_string())?;
-        let expected = std::env::var("ASK_SOURCE_CAPTURE_REQUEST_SHA256")
-            .map_err(|_| "capture request requires the executor's fingerprint")?;
-        if digest(&bytes) != expected { return Err("capture request changed after executor selection".into()); }
+        let expected = matches.get_one::<String>("request-sha256").ok_or("missing capture request fingerprint")?;
+        if digest(&bytes) != *expected { return Err("capture request changed after executor selection".into()); }
         Some(serde_json::from_slice::<Value>(&bytes).map_err(|e| e.to_string())?)
     } else { None };
-    let mut capture = Capture { args: args.to_vec(), pending: None, error: None,
+    let mut capture = Capture { args: args.clone(), pending: None, error: None,
         loaded: Arc::new(Mutex::new(LoadedInputs::default())) };
-    rustc_driver::catch_fatal_errors(|| compiler_entrypoint(args, &mut capture))
+    rustc_driver::catch_fatal_errors(|| compiler_entrypoint(&args, &mut capture))
         .map_err(|_| "compiler refused capture".to_owned())?;
     if let Some(error) = capture.error {
         return Err(error);

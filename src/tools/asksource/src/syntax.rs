@@ -388,7 +388,15 @@ pub fn run() -> Result<(), String> {
         let mut token_spans = Vec::new();
         match source.get("context").and_then(Value::as_str).unwrap_or("file") {
             "file" => {
-                let file = syn::parse_file(text).map_err(|e| format!("{path}: {}: {e}", e.span().start().line))?;
+                let mut file = syn::parse_file(text).map_err(|e| format!("{path}: {}: {e}", e.span().start().line))?;
+                let byte_order_mark = '\u{feff}';
+                let prefix = usize::from(text.starts_with(byte_order_mark)) * byte_order_mark.len_utf8()
+                    + file.shebang.as_ref().map_or(0, String::len);
+                if prefix != 0 {
+                    // Syn removes this prefix before assigning spans; preserve its byte width.
+                    let normalized = " ".repeat(prefix) + &text[prefix..];
+                    file = syn::parse_file(&normalized).map_err(|e| format!("{path}: {e}"))?;
+                }
                 model.enter("file", file.span(), json!({"attrs": attributes(&file.attrs)}));
                 model.visit_file(&file);
                 model.leave();

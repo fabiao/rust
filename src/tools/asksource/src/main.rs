@@ -24,9 +24,10 @@ fn main() -> ExitCode {
     if args.get(1).is_some_and(|arg| arg == "asksource") { args.remove(1); }
     let result = match args.get(1).map(String::as_str) {
         Some("source") => syntax::run(),
+        Some("identity") => cargo_build::identity(),
         Some("build") => cargo_build::run(&args[1..]),
         Some("capture") => semantic::run(&args[2..]),
-        _ => Err("usage: cargo asksource build [Cargo build arguments] | cargo-asksource source | capture <rustc> <rustc arguments>".into()),
+        _ => Err("usage: cargo asksource build --capture-request <request> [Cargo options] | cargo-asksource source | capture --output <facts> -- <rustc> <arguments>".into()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

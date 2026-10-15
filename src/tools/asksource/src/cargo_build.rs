@@ -126,6 +126,8 @@ struct CaptureExecutor {
     directory: PathBuf,
     graph: Value,
     graph_sha256: String,
+    configuration_sha256: String,
+    cwd: PathBuf,
     graph_inputs: BTreeMap<PathBuf, String>,
     producer: Value,
     selected: BTreeSet<String>,
@@ -192,9 +194,16 @@ impl CaptureExecutor {
                     return None;
                 }
             }
-            let overrides = record.get("environment_overrides")?.as_array()?;
-            for (name, expected) in facts.get("environment_inputs")?.as_object()? {
-                if command.is_none() && overrides.iter().any(|item| item.as_str() == Some(name)) {
+            let overrides = record.get("environment_overrides")?.as_object()?;
+            let tracked = facts.get("environment_inputs")?.as_object()?;
+            if record.get("environment_inputs")? != &facts["environment_inputs"] {
+                return None;
+            }
+            if overrides.iter().any(|(name, hash)| tracked.get(name) != Some(hash)) {
+                return None;
+            }
+            for (name, expected) in tracked {
+                if command.is_none() && overrides.contains_key(name) {
                     // Cargo invalidates generated command environments through its normal fingerprints.
                     continue;
                 }
@@ -297,29 +306,39 @@ impl Executor for CaptureExecutor {
         } else {
             "cargo-asksource"
         });
-        let mut compiler_args =
-            vec![std::ffi::OsString::from("capture"), compiler.into_os_string()];
+        let mut compiler_args = vec![
+            std::ffi::OsString::from("capture"),
+            "--output".into(),
+            self.fact_path(&key).into_os_string(),
+            "--request".into(),
+            self.request_path.clone().into_os_string(),
+            "--request-sha256".into(),
+            crate::digest(&fs::read(&self.request_path)?).into(),
+            "--".into(),
+            compiler.into_os_string(),
+        ];
         compiler_args.extend(args.into_iter().cloned());
-        captured
-            .program(helper)
-            .args_replace(&compiler_args)
-            .env("ASK_SOURCE_CAPTURE", self.fact_path(&key))
-            .env("ASK_SOURCE_CAPTURE_REQUEST", &self.request_path)
-            .env(
-                "ASK_SOURCE_CAPTURE_REQUEST_SHA256",
-                crate::digest(&fs::read(&self.request_path)?),
-            );
+        captured.program(helper).args_replace(&compiler_args);
         let record_path = self.record_path(&key);
         if record_path.exists() {
             fs::remove_file(&record_path)?;
         }
         DefaultExecutor.exec(&captured, id, target, mode, stdout, stderr)?;
-        let overrides: Vec<_> = cmd.get_envs().keys().collect();
+        let facts = read_json(&self.fact_path(&key)).map_err(cargo::util::errors::internal)?;
+        let overrides: BTreeMap<_, _> = facts["environment_inputs"]
+            .as_object()
+            .ok_or_else(|| cargo::util::errors::internal("missing tracked compiler environment"))?
+            .iter()
+            .filter(|(name, _)| cmd.get_envs().contains_key(*name))
+            .map(|(name, hash)| (name.clone(), hash.clone()))
+            .collect();
         let record = json!({"request": self.request, "graph_sha256": self.graph_sha256, "producer": self.producer,
             "facts_sha256": crate::digest(&fs::read(self.fact_path(&key))?),
+            "environment_inputs": facts["environment_inputs"],
             "environment_overrides": overrides});
         publish(&record_path, &record).map_err(cargo::util::errors::internal)?;
         if !self.valid(&key, Some(cmd)) {
+            fs::remove_file(&record_path)?;
             return Err(cargo::util::errors::internal(
                 "compiler capture inputs changed during build",
             ));
@@ -329,10 +348,29 @@ impl Executor for CaptureExecutor {
 }
 
 pub fn run(arguments: &[String]) -> Result<(), String> {
-    let request_path = PathBuf::from(
-        std::env::var_os("ASK_SOURCE_CAPTURE_REQUEST")
-            .ok_or("build capture requires ASK_SOURCE_CAPTURE_REQUEST")?,
-    );
+    if arguments.get(1).is_some_and(|argument| argument == "--discovery-context") {
+        return restore_discovery(arguments);
+    }
+    let mut cli = build_command::cli()
+        .arg(
+            Arg::new("capture-request")
+                .long("capture-request")
+                .required(true)
+                .value_parser(value_parser!(PathBuf)),
+        )
+        .arg(Arg::new("verbose").short('v').long("verbose").action(ArgAction::Count))
+        .arg(Arg::new("quiet").short('q').long("quiet").action(ArgAction::SetTrue))
+        .arg(Arg::new("color").long("color").value_parser(["auto", "always", "never"]))
+        .arg(Arg::new("frozen").long("frozen").action(ArgAction::SetTrue))
+        .arg(Arg::new("locked").long("locked").action(ArgAction::SetTrue))
+        .arg(Arg::new("offline").long("offline").action(ArgAction::SetTrue))
+        .arg(Arg::new("unstable-features").short('Z').action(ArgAction::Append))
+        .arg(Arg::new("config").long("config").action(ArgAction::Append));
+    let args = cli.try_get_matches_from_mut(arguments).map_err(|e| e.to_string())?;
+    let request_path = args
+        .get_one::<PathBuf>("capture-request")
+        .cloned()
+        .ok_or("build capture requires --capture-request")?;
     let request = read_json(&request_path)?;
     let fields = request.as_object().ok_or("capture request must be an object")?;
     if fields.len() != 3
@@ -350,14 +388,12 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
     {
         return Err("capture requires absolute paths and an explicit selected graph context".into());
     }
-    for source in &sources {
-        if fs::canonicalize(source)
-            .map_err(|e| format!("owned source {}: {e}", source.display()))?
-            != *source
-        {
-            return Err(format!("owned source must use its canonical path: {}", source.display()));
-        }
-    }
+    let canonical_sources: BTreeSet<_> = sources
+        .iter()
+        .map(|source| {
+            fs::canonicalize(source).map_err(|e| format!("owned source {}: {e}", source.display()))
+        })
+        .collect::<Result<_, _>>()?;
     let cargo_exe =
         PathBuf::from(std::env::var_os("CARGO").ok_or(
             "invoke through cargo asksource build so Cargo supplies its actual executable",
@@ -371,19 +407,11 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
     {
         return Err("selected Cargo does not match embedded Cargo; rebuild asksource for the selected producer".into());
     }
+    let executable = std::env::current_exe().map_err(|e| e.to_string())?;
     let producer = json!({"path": cargo_exe,
+        "executor": executable, "executor_sha256": crate::digest(&fs::read(&executable).map_err(|e| e.to_string())?),
         "sha256": crate::digest(&fs::read(&cargo_exe).map_err(|e| e.to_string())?),
         "commit": embedded.commit_hash});
-    let mut cli = build_command::cli()
-        .arg(Arg::new("verbose").short('v').long("verbose").action(ArgAction::Count))
-        .arg(Arg::new("quiet").short('q').long("quiet").action(ArgAction::SetTrue))
-        .arg(Arg::new("color").long("color").value_parser(["auto", "always", "never"]))
-        .arg(Arg::new("frozen").long("frozen").action(ArgAction::SetTrue))
-        .arg(Arg::new("locked").long("locked").action(ArgAction::SetTrue))
-        .arg(Arg::new("offline").long("offline").action(ArgAction::SetTrue))
-        .arg(Arg::new("unstable-features").short('Z').action(ArgAction::Append))
-        .arg(Arg::new("config").long("config").action(ArgAction::Append));
-    let args = cli.try_get_matches_from_mut(arguments).map_err(|e| e.to_string())?;
     let mut gctx = GlobalContext::default().map_err(|e| e.to_string())?;
     let strings = |name: &str| -> Vec<String> {
         args.get_many::<String>(name).map(|values| values.cloned().collect()).unwrap_or_default()
@@ -440,19 +468,23 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
                 .map_err(|e| format!("Cargo graph input {}: {e}", path.display()))
         })
         .collect::<Result<_, _>>()?;
+    let configuration_sha256 =
+        crate::digest(&serde_json::to_vec(&strings("config")).map_err(|e| e.to_string())?);
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let graph_sha256 = crate::digest(
         json!({"graph": graph, "inputs": graph_inputs,
-        "configuration_arguments": strings("config")})
+        "configuration_sha256": configuration_sha256, "cwd": cwd})
         .to_string()
         .as_bytes(),
     );
     let mut selected = BTreeSet::new();
     let mut selected_by_base: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for unit in bcx
-        .unit_graph
-        .keys()
-        .filter(|unit| !unit.mode.is_run_custom_build())
-        .filter(|unit| unit.target.src_path().path().is_some_and(|path| sources.contains(path)))
+    for unit in
+        bcx.unit_graph.keys().filter(|unit| !unit.mode.is_run_custom_build()).filter(|unit| {
+            unit.target.src_path().path().is_some_and(|path| {
+                fs::canonicalize(path).is_ok_and(|path| canonical_sources.contains(&path))
+            })
+        })
     {
         let key =
             graph_snapshot.keys.get(unit).ok_or("selected unit has no semantic identity")?.clone();
@@ -478,6 +510,8 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
         directory,
         graph,
         graph_sha256,
+        configuration_sha256,
+        cwd,
         graph_inputs,
         producer,
         selected,
@@ -511,12 +545,55 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
             return Err(format!("missing or stale compiler facts for selected unit {key}"));
         }
         facts.insert(key, json!({"path": executor.fact_path(key),
-            "sha256": crate::digest(&fs::read(executor.fact_path(key)).map_err(|e| e.to_string())?)}));
+            "sha256": crate::digest(&fs::read(executor.fact_path(key)).map_err(|e| e.to_string())?),
+            "record": executor.record_path(key),
+            "record_sha256": crate::digest(&fs::read(executor.record_path(key)).map_err(|e| e.to_string())?)}));
     }
     publish(
         &snapshot,
         &json!({"complete": true, "request": executor.request,
-        "graph": executor.graph, "graph_inputs": executor.graph_inputs, "facts": facts, "cargo": cargo_exe,
+        "graph": executor.graph, "graph_inputs": executor.graph_inputs, "graph_sha256": executor.graph_sha256,
+        "configuration_sha256": executor.configuration_sha256, "cwd": executor.cwd,
+        "producer": executor.producer, "facts": facts, "cargo": cargo_exe,
         "cargo_sha256": crate::digest(&fs::read(&cargo_exe).map_err(|e| e.to_string())?)}),
     )
+}
+
+pub fn identity() -> Result<(), String> {
+    let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+    println!(
+        "{}",
+        json!({"path": executable,
+        "sha256": crate::digest(&fs::read(&executable).map_err(|e| e.to_string())?)})
+    );
+    Ok(())
+}
+
+fn restore_discovery(arguments: &[String]) -> Result<(), String> {
+    let context: Value = serde_json::from_str(arguments.get(2).ok_or("missing discovery context")?)
+        .map_err(|e| e.to_string())?;
+    let original = context["original"].as_str().ok_or("missing invocation PATH")?;
+    let injected = context["injected"].as_str().ok_or("missing discovery directory")?;
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    let expected = format!("{original}{separator}{injected}");
+    let actual = std::env::var("PATH").map_err(|e| e.to_string())?;
+    let positions: Vec<_> = actual
+        .match_indices(&expected)
+        .filter(|(start, matched)| {
+            (*start == 0 || actual.as_bytes().get(start - 1) == Some(&(separator as u8)))
+                && (*start + matched.len() == actual.len()
+                    || actual.as_bytes().get(*start + matched.len()) == Some(&(separator as u8)))
+        })
+        .collect();
+    let [(start, matched)] = positions.as_slice() else {
+        return Err("cannot restore invocation PATH after Cargo discovery; expose the matching helper on the ordinary command path".into());
+    };
+    let restored = format!("{}{original}{}", &actual[..*start], &actual[*start + matched.len()..]);
+    let status = Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
+        .arg("build")
+        .args(&arguments[3..])
+        .env("PATH", restored)
+        .status()
+        .map_err(|e| e.to_string())?;
+    std::process::exit(status.code().unwrap_or(1));
 }
