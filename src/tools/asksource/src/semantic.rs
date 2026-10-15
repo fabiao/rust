@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -11,6 +11,7 @@ use rustc_hir::intravisit::{self, Visitor};
 use rustc_interface::interface;
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_middle::ty::consts::ConstExt;
+use rustc_middle::mono::MonoItem;
 use rustc_span::Span;
 use serde_json::{Value, json};
 use crate::digest;
@@ -259,6 +260,63 @@ fn type_fact<'tcx>(tcx: TyCtxt<'tcx>, value: Ty<'tcx>) -> Value {
     fact
 }
 
+fn instance_fact<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::Instance<'tcx>) -> Value {
+    json!({"definition": definition(tcx, instance.def_id()),
+        "symbol": tcx.symbol_name(instance).name,
+        "arguments": instance.args.as_slice().iter().map(|arg| argument(tcx, *arg)).collect::<Vec<_>>()})
+}
+
+fn instantiated_storage<'tcx>(tcx: TyCtxt<'tcx>) -> Vec<Value> {
+    let mut nodes = Vec::new();
+    let mut visited = HashSet::new();
+    for unit in tcx.collect_and_partition_mono_items(()).codegen_units {
+        for (item, _) in unit.items_in_deterministic_order(tcx) {
+            let MonoItem::Fn(instance) = item else { continue };
+            if !visited.insert(instance) { continue; }
+            let body = tcx.instance_mir(instance.def);
+            let descriptor = instance_fact(tcx, instance);
+            for (local, declaration) in body.local_decls.iter_enumerated() {
+                let ty = match instance.try_instantiate_mir_and_normalize_erasing_regions(
+                    tcx, ty::TypingEnv::fully_monomorphized(), ty::EarlyBinder::bind(tcx, declaration.ty)) {
+                    Ok(value) => type_fact(tcx, value),
+                    Err(error) => json!({"inline_storage": {"kind": "unresolved", "error": format!("{error:?}")}}),
+                };
+                if ty["inline_storage"].is_null() { continue; }
+                let mut inlined = Vec::new();
+                let mut owner = instance.def_id();
+                let mut current = Some(declaration.source_info.scope);
+                while let Some(index) = current {
+                    let Some(scope) = body.source_scopes.get(index) else { break };
+                    if let Some((callee, call_site)) = scope.inlined {
+                        match instance.try_instantiate_mir_and_normalize_erasing_regions(
+                            tcx, ty::TypingEnv::fully_monomorphized(), ty::EarlyBinder::bind(tcx, callee)) {
+                            Ok(callee) => {
+                                if inlined.is_empty() { owner = callee.def_id(); }
+                                inlined.push(json!({"instance": instance_fact(tcx, callee), "origin": origin(tcx, call_site)}));
+                            }
+                            Err(error) => inlined.push(json!({"unresolved": format!("{error:?}")})),
+                        }
+                    }
+                    current = scope.parent_scope;
+                }
+                let names: Vec<_> = body.var_debug_info.iter().filter_map(|variable| {
+                    if let rustc_middle::mir::VarDebugInfoContents::Place(place) = &variable.value {
+                        if place.local == local && place.projection.is_empty() {
+                            return Some(json!({"name": variable.name.to_string(),
+                                "origin": origin(tcx, variable.source_info.span)}));
+                        }
+                    }
+                    None
+                }).collect();
+                nodes.push(json!({"kind": "instantiated_storage", "owner": definition(tcx, owner),
+                    "origin": origin(tcx, declaration.source_info.span), "instance": descriptor,
+                    "inlined": inlined, "names": names, "type": ty}));
+            }
+        }
+    }
+    nodes
+}
+
 fn resolution(tcx: TyCtxt<'_>, res: Res) -> Value {
     match res {
         Res::Def(kind, def) => json!({"kind": format!("{kind:?}"), "definition": definition(tcx, def),
@@ -448,6 +506,7 @@ impl Capture {
             facts.visit_body(tcx.hir_body_owned_by(owner));
             nodes.extend(facts.nodes);
         }
+        nodes.extend(instantiated_storage(tcx));
         let mut definitions = Vec::new();
         for id in tcx.iter_local_def_id() {
             let kind = tcx.def_kind(id);
@@ -475,8 +534,15 @@ impl Capture {
                 if rustc_span::SourceFileHash::new_in_memory(file.src_hash.kind, compiler_bytes) != file.src_hash {
                     return Err(format!("compiler source changed after loading: {path}"));
                 }
+                let mut exported_name = file.name.clone();
+                if let rustc_span::FileName::Real(name) = &mut exported_name {
+                    name.update_for_crate_metadata();
+                }
+                let exported_id = rustc_span::StableSourceFileId::from_filename_for_export(
+                    &exported_name, tcx.stable_crate_id(rustc_hir::def_id::LOCAL_CRATE));
                 sources.insert(path, json!({"kind": if binary { "binary" } else { "text" },
                     "source_file_id": format!("{:?}", file.stable_id),
+                    "exported_source_file_id": format!("{exported_id:?}"),
                     "sha256": digest(&raw), "normalized_sha256": digest(text.as_bytes())}));
             }
         }
