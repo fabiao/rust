@@ -1217,6 +1217,13 @@ impl Config {
         };
 
         let local_rebuild = build_local_rebuild.unwrap_or(false);
+        let snapshot_tool_build = build_rustc.is_some()
+            && !flags_include_default_paths
+            && !flags_paths.is_empty()
+            && flags_paths.iter().all(|path| {
+                path.starts_with("src/tools")
+                    && !path.components().any(|part| part == std::path::Component::ParentDir)
+            });
 
         let check_stage0 = |kind: &str| {
             if local_rebuild {
@@ -1231,7 +1238,7 @@ impl Config {
 
         // Now check that the selected stage makes sense, and if not, print an error and end
         match (stage, &flags_cmd) {
-            (0, Subcommand::Build { .. }) => {
+            (0, Subcommand::Build { .. }) if !snapshot_tool_build => {
                 check_stage0("build");
             }
             (0, Subcommand::Check { .. }) => {

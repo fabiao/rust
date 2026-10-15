@@ -801,6 +801,7 @@ impl<'a> Builder<'a> {
                 llvm::Sanitizers,
                 tool::Rustfmt,
                 tool::Cargofmt,
+                tool::AskSource,
                 tool::Ssc2ComparatorCheck,
                 tool::Miri,
                 tool::CargoMiri,

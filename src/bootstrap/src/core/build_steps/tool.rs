@@ -150,6 +150,14 @@ impl Step for ToolBuild {
         if !self.allow_features.is_empty() {
             cargo.allow_features(self.allow_features);
         }
+        if self.mode == Mode::ToolBootstrap
+            && self.allow_features.split(',').any(|feature| feature == "rustc_private")
+        {
+            let libdir = builder
+                .rustc_snapshot_sysroot()
+                .join(builder.sysroot_libdir_relative(self.build_compiler));
+            cargo.rustflag(&format!("-Lnative={}", libdir.display()));
+        }
 
         cargo.args(self.cargo_args);
 
@@ -1378,6 +1386,10 @@ impl RustcPrivateCompilers {
     /// Create compilers for a `rustc_private` tool with the given `stage` and for the given
     /// `target`.
     pub fn new(builder: &Builder<'_>, stage: u32, target: TargetSelection) -> Self {
+        if stage == 0 {
+            let compiler = builder.compiler(0, target);
+            return Self { build_compiler: compiler, target_compiler: compiler };
+        }
         let build_compiler = Self::build_compiler_from_stage(builder, stage);
 
         // This is the compiler we'll link to
@@ -1447,6 +1459,7 @@ macro_rules! tool_rustc_extended {
             stable: $stable:expr
             $( , add_bins_to_sysroot: $add_bins_to_sysroot:expr )?
             $( , cargo_args: $cargo_args:expr )?
+            $( , snapshot_features: $snapshot_features:expr )?
             $( , )?
         }
     ) => {
@@ -1497,6 +1510,12 @@ macro_rules! tool_rustc_extended {
                     $path,
                     None $( .or(Some(&$add_bins_to_sysroot)) )?,
                     None $( .or(Some($cargo_args)) )?,
+                    {
+                        #[allow(unused_mut)]
+                        let mut features: &[&'static str] = &[];
+                        $( features = &$snapshot_features; )?
+                        features
+                    },
                 )
             }
 
@@ -1541,18 +1560,20 @@ fn build_extended_rustc_tool(
     path: &'static str,
     add_bins_to_sysroot: Option<&[&str]>,
     cargo_args: Option<&[&'static str]>,
+    snapshot_features: &[&'static str],
 ) -> ToolBuildResult {
     let target = compilers.target();
     let build_compiler = compilers.build_compiler;
+    let snapshot = compilers.target_compiler.stage == 0;
     let ToolBuildResult { tool_path, artifacts, .. } = builder.ensure(ToolBuild {
         build_compiler,
         target,
         tool: tool_name,
-        mode: Mode::ToolRustcPrivate,
+        mode: if snapshot { Mode::ToolBootstrap } else { Mode::ToolRustcPrivate },
         path,
-        extra_features: Vec::new(),
+        extra_features: if snapshot { snapshot_features.iter().map(|feature| String::from(*feature)).collect() } else { Vec::new() },
         source_type: SourceType::InTree,
-        allow_features: "",
+        allow_features: if snapshot { "rustc_private" } else { "" },
         cargo_args: cargo_args.unwrap_or_default().iter().map(|s| String::from(*s)).collect(),
         artifact_kind: ToolArtifactKind::Binary,
     });
@@ -1561,7 +1582,12 @@ fn build_extended_rustc_tool(
     if let Some(add_bins_to_sysroot) = add_bins_to_sysroot
         && !add_bins_to_sysroot.is_empty()
     {
-        let bindir = builder.sysroot(target_compiler).join("bin");
+        let sysroot = if snapshot {
+            builder.rustc_snapshot_sysroot().to_path_buf()
+        } else {
+            builder.sysroot(target_compiler).to_path_buf()
+        };
+        let bindir = sysroot.join("bin");
         t!(fs::create_dir_all(&bindir));
 
         for add_bin in add_bins_to_sysroot {
@@ -1594,6 +1620,14 @@ tool_rustc_extended!(Clippy {
     tool_name: "clippy-driver",
     stable: true,
     add_bins_to_sysroot: ["clippy-driver"]
+});
+tool_rustc_extended!(AskSource {
+    path: "src/tools/asksource",
+    tool_name: "asksource",
+    stable: false,
+    add_bins_to_sysroot: ["asksource"],
+    cargo_args: &["--config", "profile.release.strip=\"debuginfo\""],
+    snapshot_features: ["snapshot-driver"]
 });
 tool_rustc_extended!(Ssc2ComparatorCheck {
     path: "src/tools/ssc2-comparator-check",

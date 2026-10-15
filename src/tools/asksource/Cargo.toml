@@ -1,0 +1,19 @@
+[package]
+name = "asksource"
+version = "0.0.0"
+edition = "2024"
+
+[[bin]]
+name = "asksource"
+test = false
+doctest = false
+
+[features]
+snapshot-driver = []
+
+[dependencies]
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
+serde_json = "1"
+sha2 = "=0.10.9"
+syn = { version = "3", features = ["full", "visit"] }
