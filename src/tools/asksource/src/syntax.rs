@@ -3,8 +3,9 @@ use std::io::{self, Read};
 use proc_macro2::{Span, TokenStream, TokenTree};
 use quote::ToTokens;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
+use crate::digest;
 use syn::spanned::Spanned;
+use syn::ext::IdentExt;
 use syn::visit::{self, Visit};
 
 fn range(span: Span) -> Value {
@@ -46,11 +47,11 @@ fn meta(value: &syn::Meta) -> Value {
 
 fn use_tree(tree: &syn::UseTree) -> Value {
     match tree {
-        syn::UseTree::Path(node) => json!({"kind": "path", "name": node.ident.to_string(),
+        syn::UseTree::Path(node) => json!({"kind": "path", "name": node.ident.unraw().to_string(),
                                          "tree": use_tree(&node.tree)}),
-        syn::UseTree::Name(node) => json!({"kind": "name", "name": node.ident.to_string()}),
-        syn::UseTree::Rename(node) => json!({"kind": "rename", "name": node.ident.to_string(),
-                                           "alias": node.rename.to_string()}),
+        syn::UseTree::Name(node) => json!({"kind": "name", "name": node.ident.unraw().to_string()}),
+        syn::UseTree::Rename(node) => json!({"kind": "rename", "name": node.ident.unraw().to_string(),
+                                           "alias": node.rename.unraw().to_string()}),
         syn::UseTree::Glob(_) => json!({"kind": "glob"}),
         syn::UseTree::Group(node) => json!({"kind": "group", "items":
             node.items.iter().map(use_tree).collect::<Vec<_>>()}),
@@ -90,36 +91,39 @@ macro_rules! node_visit {
 impl<'ast> Visit<'ast> for Model {
     fn visit_item(&mut self, item: &'ast syn::Item) {
         let (kind, data) = match item {
-            syn::Item::Const(n) => ("constant", json!({"name": n.ident.to_string(),
+            syn::Item::Const(n) => ("constant", json!({"name": n.ident.unraw().to_string(),
                 "attrs": attributes(&n.attrs), "type": range(n.ty.span()), "value": range(n.expr.span())})),
-            syn::Item::Static(n) => ("static", json!({"name": n.ident.to_string(),
+            syn::Item::Static(n) => ("static", json!({"name": n.ident.unraw().to_string(),
                 "attrs": attributes(&n.attrs), "type": range(n.ty.span()), "value": range(n.expr.span())})),
-            syn::Item::Mod(n) => ("module", json!({"name": n.ident.to_string(),
+            syn::Item::Mod(n) => ("module", json!({"name": n.ident.unraw().to_string(),
                 "attrs": attributes(&n.attrs), "inline": n.content.is_some(),
                 "body": n.content.as_ref().map(|(brace, _)| range(brace.span.join()))})),
             syn::Item::Use(n) => ("use", json!({"attrs": attributes(&n.attrs),
                 "absolute": n.leading_colon.is_some(), "tree": use_tree(&n.tree)})),
-            syn::Item::Struct(n) => ("struct", json!({"name": n.ident.to_string(),
+            syn::Item::Struct(n) => ("struct", json!({"name": n.ident.unraw().to_string(),
                 "attrs": attributes(&n.attrs), "fields": range(n.fields.span()),
                 "tuple": matches!(n.fields, syn::Fields::Unnamed(_))})),
-            syn::Item::Enum(n) => ("enum", json!({"name": n.ident.to_string(), "attrs": attributes(&n.attrs),
+            syn::Item::Enum(n) => ("enum", json!({"name": n.ident.unraw().to_string(), "attrs": attributes(&n.attrs),
                 "body": range(n.brace_token.span.join())})),
-            syn::Item::Trait(n) => ("trait", json!({"name": n.ident.to_string(), "attrs": attributes(&n.attrs),
+            syn::Item::Trait(n) => ("trait", json!({"name": n.ident.unraw().to_string(), "attrs": attributes(&n.attrs),
                 "body": range(n.brace_token.span.join())})),
-            syn::Item::Type(n) => ("alias", json!({"name": n.ident.to_string(), "attrs": attributes(&n.attrs),
+            syn::Item::Type(n) => ("alias", json!({"name": n.ident.unraw().to_string(), "attrs": attributes(&n.attrs),
                 "type": range(n.ty.span())})),
-            syn::Item::Fn(n) => ("function", json!({"name": n.sig.ident.to_string(),
+            syn::Item::Fn(n) => ("function", json!({"name": n.sig.ident.unraw().to_string(),
                 "attrs": attributes(&n.attrs), "header": range(n.sig.span()), "body": range(n.block.span())})),
-            syn::Item::Impl(n) => ("impl", json!({"name": tokens(&n.self_ty), "self_type": range(n.self_ty.span()),
+            syn::Item::Impl(n) => ("impl", json!({"name": match n.self_ty.as_ref() {
+                syn::Type::Path(path) if path.qself.is_none() => path.path.segments.last().map(|segment| segment.ident.unraw().to_string()),
+                _ => None,
+            }, "self_type": range(n.self_ty.span()),
                 "attrs": attributes(&n.attrs), "trait": n.trait_.as_ref().map(|(path, _)| tokens(path)),
                 "body": range(n.brace_token.span.join())})),
-            syn::Item::Macro(n) => ("item_macro", json!({"name": n.ident.as_ref().map(ToString::to_string),
+            syn::Item::Macro(n) => ("item_macro", json!({"name": n.ident.as_ref().map(|name| name.unraw().to_string()),
                 "attrs": attributes(&n.attrs)})),
-            syn::Item::ExternCrate(n) => ("extern_crate", json!({"name": n.ident.to_string(),
-                "attrs": attributes(&n.attrs), "alias": n.rename.as_ref().map(|(_, name)| name.to_string())})),
+            syn::Item::ExternCrate(n) => ("extern_crate", json!({"name": n.ident.unraw().to_string(),
+                "attrs": attributes(&n.attrs), "alias": n.rename.as_ref().map(|(_, name)| name.unraw().to_string())})),
             syn::Item::ForeignMod(n) => ("foreign", json!({"attrs": attributes(&n.attrs)})),
-            syn::Item::TraitAlias(n) => ("trait_alias", json!({"name": n.ident.to_string(), "attrs": attributes(&n.attrs)})),
-            syn::Item::Union(n) => ("union", json!({"name": n.ident.to_string(), "attrs": attributes(&n.attrs)})),
+            syn::Item::TraitAlias(n) => ("trait_alias", json!({"name": n.ident.unraw().to_string(), "attrs": attributes(&n.attrs)})),
+            syn::Item::Union(n) => ("union", json!({"name": n.ident.unraw().to_string(), "attrs": attributes(&n.attrs)})),
             syn::Item::Verbatim(n) => ("opaque_item", json!({"tokens": n.to_string()})),
             _ => ("unsupported_item", json!({})),
         };
@@ -130,11 +134,11 @@ impl<'ast> Visit<'ast> for Model {
 
     fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
         let (kind, data) = match item {
-            syn::ImplItem::Const(n) => ("constant", json!({"name": n.ident.to_string(),
+            syn::ImplItem::Const(n) => ("constant", json!({"name": n.ident.unraw().to_string(),
                 "attrs": attributes(&n.attrs), "type": range(n.ty.span()), "value": range(n.expr.span())})),
-            syn::ImplItem::Type(n) => ("alias", json!({"name": n.ident.to_string(),
+            syn::ImplItem::Type(n) => ("alias", json!({"name": n.ident.unraw().to_string(),
                 "attrs": attributes(&n.attrs), "type": range(n.ty.span())})),
-            syn::ImplItem::Fn(n) => ("function", json!({"name": n.sig.ident.to_string(),
+            syn::ImplItem::Fn(n) => ("function", json!({"name": n.sig.ident.unraw().to_string(),
                 "attrs": attributes(&n.attrs), "header": range(n.sig.span()), "body": range(n.block.span())})),
             syn::ImplItem::Macro(n) => ("item_macro", json!({"attrs": attributes(&n.attrs)})),
             _ => ("opaque_item", json!({})),
@@ -146,12 +150,12 @@ impl<'ast> Visit<'ast> for Model {
 
     fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
         let (kind, data) = match item {
-            syn::TraitItem::Const(n) => ("constant", json!({"name": n.ident.to_string(),
+            syn::TraitItem::Const(n) => ("constant", json!({"name": n.ident.unraw().to_string(),
                 "attrs": attributes(&n.attrs), "type": range(n.ty.span()),
                 "value": n.default.as_ref().map(|(_, expr)| range(expr.span()))})),
-            syn::TraitItem::Type(n) => ("alias", json!({"name": n.ident.to_string(), "attrs": attributes(&n.attrs),
+            syn::TraitItem::Type(n) => ("alias", json!({"name": n.ident.unraw().to_string(), "attrs": attributes(&n.attrs),
                 "type": n.default.as_ref().map(|(_, ty)| range(ty.span()))})),
-            syn::TraitItem::Fn(n) => ("function", json!({"name": n.sig.ident.to_string(), "attrs": attributes(&n.attrs),
+            syn::TraitItem::Fn(n) => ("function", json!({"name": n.sig.ident.unraw().to_string(), "attrs": attributes(&n.attrs),
                 "header": range(n.sig.span()), "body": n.default.as_ref().map(|body| range(body.span()))})),
             syn::TraitItem::Macro(n) => ("item_macro", json!({"attrs": attributes(&n.attrs)})),
             _ => ("opaque_item", json!({})),
@@ -170,14 +174,14 @@ impl<'ast> Visit<'ast> for Model {
     }
 
     fn visit_field(&mut self, node: &'ast syn::Field) {
-        self.enter("field", node.span(), json!({"name": node.ident.as_ref().map(ToString::to_string),
+        self.enter("field", node.span(), json!({"name": node.ident.as_ref().map(|name| name.unraw().to_string()),
             "attrs": attributes(&node.attrs), "type": range(node.ty.span())}));
         visit::visit_field(self, node);
         self.leave();
     }
 
     fn visit_variant(&mut self, node: &'ast syn::Variant) {
-        self.enter("variant", node.span(), json!({"name": node.ident.to_string(), "attrs": attributes(&node.attrs)}));
+        self.enter("variant", node.span(), json!({"name": node.ident.unraw().to_string(), "attrs": attributes(&node.attrs)}));
         visit::visit_variant(self, node);
         self.leave();
     }
@@ -188,7 +192,7 @@ impl<'ast> Visit<'ast> for Model {
             syn::Expr::Repeat(n) => ("repeat", json!({"extent": range(n.len.span()), "value": range(n.expr.span()), "attrs": attributes(&n.attrs)})),
             syn::Expr::Path(n) => ("value_path", json!({"path": tokens(&n.path), "qualified": n.qself.is_some(), "attrs": attributes(&n.attrs)})),
             syn::Expr::Call(n) => ("call", json!({"callee": range(n.func.span()), "attrs": attributes(&n.attrs)})),
-            syn::Expr::MethodCall(n) => ("method", json!({"name": n.method.to_string(), "receiver": range(n.receiver.span()), "attrs": attributes(&n.attrs)})),
+            syn::Expr::MethodCall(n) => ("method", json!({"name": n.method.unraw().to_string(), "receiver": range(n.receiver.span()), "attrs": attributes(&n.attrs)})),
             syn::Expr::Field(n) => ("field_access", json!({"name": tokens(&n.member), "receiver": range(n.base.span()), "attrs": attributes(&n.attrs)})),
             syn::Expr::Binary(n) => ("binary", json!({"operator": tokens(&n.op), "left": range(n.left.span()), "right": range(n.right.span()), "attrs": attributes(&n.attrs)})),
             syn::Expr::Lit(n) => ("literal", json!({"value": tokens(&n.lit), "integer": matches!(n.lit, syn::Lit::Int(_)), "attrs": attributes(&n.attrs)})),
@@ -232,7 +236,7 @@ impl<'ast> Visit<'ast> for Model {
     }
 
     fn visit_type(&mut self, node: &'ast syn::Type) {
-        let (kind, data) = match node {
+        let (kind, mut data) = match node {
             syn::Type::Array(n) => ("array_type", json!({"extent": range(n.len.span()), "element": range(n.elem.span())})),
             syn::Type::Path(n) => ("type_path", json!({"path": tokens(&n.path), "qualified": n.qself.is_some()})),
             syn::Type::Reference(n) => ("type_reference", json!({"type": range(n.elem.span())})),
@@ -250,6 +254,23 @@ impl<'ast> Visit<'ast> for Model {
             syn::Type::Verbatim(n) => ("opaque_type", json!({"tokens": n.to_string()})),
             _ => ("unsupported_type", json!({})),
         };
+        data["attrs"] = attributes(match node {
+            syn::Type::Array(node) => &node.attrs,
+            syn::Type::Path(node) => &node.attrs,
+            syn::Type::Reference(node) => &node.attrs,
+            syn::Type::FnPtr(node) => &node.attrs,
+            syn::Type::Group(node) => &node.attrs,
+            syn::Type::ImplTrait(node) => &node.attrs,
+            syn::Type::Infer(node) => &node.attrs,
+            syn::Type::Never(node) => &node.attrs,
+            syn::Type::Paren(node) => &node.attrs,
+            syn::Type::Ptr(node) => &node.attrs,
+            syn::Type::Slice(node) => &node.attrs,
+            syn::Type::TraitObject(node) => &node.attrs,
+            syn::Type::Tuple(node) => &node.attrs,
+            syn::Type::Macro(node) => &node.attrs,
+            _ => &[],
+        });
         self.enter(kind, node.span(), data);
         visit::visit_type(self, node);
         self.leave();
@@ -257,7 +278,7 @@ impl<'ast> Visit<'ast> for Model {
 
     fn visit_pat(&mut self, node: &'ast syn::Pat) {
         let (kind, data) = match node {
-            syn::Pat::Ident(n) => ("pattern_ident", json!({"name": n.ident.to_string(), "by_ref": n.by_ref.is_some(), "attrs": attributes(&n.attrs)})),
+            syn::Pat::Ident(n) => ("pattern_ident", json!({"name": n.ident.unraw().to_string(), "by_ref": n.by_ref.is_some(), "attrs": attributes(&n.attrs)})),
             syn::Pat::Type(n) => ("pattern_type", json!({"type": range(n.ty.span()), "pattern": range(n.pat.span()), "attrs": attributes(&n.attrs)})),
             syn::Pat::Slice(n) => ("pattern_slice", json!({"attrs": attributes(&n.attrs)})),
             syn::Pat::Tuple(n) => ("pattern_tuple", json!({"attrs": attributes(&n.attrs)})),
@@ -288,14 +309,28 @@ impl<'ast> Visit<'ast> for Model {
     }
 
     fn visit_const_param(&mut self, node: &'ast syn::ConstParam) {
-        self.enter("const_parameter", node.span(), json!({"name": node.ident.to_string(), "attrs": attributes(&node.attrs),
+        self.enter("const_parameter", node.span(), json!({"name": node.ident.unraw().to_string(), "attrs": attributes(&node.attrs),
             "default": node.default.as_ref().map(|(_, expr)| range(expr.span()))}));
         visit::visit_const_param(self, node);
         self.leave();
     }
 
+    fn visit_path(&mut self, node: &'ast syn::Path) {
+        self.enter("path", node.span(), json!({"absolute": node.leading_colon.is_some(),
+            "segments": node.segments.iter().map(|segment| json!({
+                "name": segment.ident.unraw().to_string(), "span": range(segment.span()),
+                "arguments": match segment.arguments {
+                    syn::PathArguments::None => "none",
+                    syn::PathArguments::AngleBracketed(_) => "angle",
+                    syn::PathArguments::Parenthesized(_) => "parenthesized",
+                },
+            })).collect::<Vec<_>>()}));
+        visit::visit_path(self, node);
+        self.leave();
+    }
+
     fn visit_type_param(&mut self, node: &'ast syn::TypeParam) {
-        self.enter("type_parameter", node.span(), json!({"name": node.ident.to_string(), "attrs": attributes(&node.attrs)}));
+        self.enter("type_parameter", node.span(), json!({"name": node.ident.unraw().to_string(), "attrs": attributes(&node.attrs)}));
         visit::visit_type_param(self, node);
         self.leave();
     }
@@ -372,7 +407,7 @@ pub fn run() -> Result<(), String> {
             }
             other => return Err(format!("{path}: unsupported context {other}")),
         }
-        output.push(json!({"path": path, "sha256": format!("{:x}", Sha256::digest(text.as_bytes())),
+        output.push(json!({"path": path, "sha256": digest(text.as_bytes()),
                           "nodes": model.nodes, "tokens": token_spans}));
     }
     let response = json!({"complete": true, "sources": output});

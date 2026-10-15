@@ -1,6 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use rustc_span::source_map::{FileLoader, RealFileLoader};
 
 use rustc_driver::Compilation;
 use rustc_hir::def::{DefKind, Res};
@@ -10,15 +13,67 @@ use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_middle::ty::consts::ConstExt;
 use rustc_span::Span;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
+use crate::digest;
 
 #[cfg(feature = "snapshot-driver")]
 use rustc_driver::run_compiler as compiler_entrypoint;
 #[cfg(not(feature = "snapshot-driver"))]
 use rustc_driver::compiler_entrypoint;
 
-fn digest(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+#[derive(Default)]
+struct LoadedInputs {
+    files: BTreeMap<PathBuf, String>,
+    binary: BTreeSet<PathBuf>,
+    exists: BTreeMap<PathBuf, bool>,
+    error: Option<String>,
+}
+
+struct RecordingLoader {
+    inner: Box<dyn FileLoader + Send + Sync>,
+    inputs: Arc<Mutex<LoadedInputs>>,
+}
+
+impl RecordingLoader {
+    fn record(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        let path = std::path::absolute(path)?;
+        let hash = digest(bytes);
+        let mut inputs = self.inputs.lock().map_err(|_| std::io::Error::other("input recorder poisoned"))?;
+        if inputs.files.get(&path).is_some_and(|previous| previous != &hash) {
+            return Err(std::io::Error::other(format!("compiler input changed between reads: {}", path.display())));
+        }
+        inputs.files.insert(path, hash);
+        Ok(())
+    }
+}
+
+impl FileLoader for RecordingLoader {
+    fn file_exists(&self, path: &Path) -> bool {
+        let exists = self.inner.file_exists(path);
+        if let (Ok(path), Ok(mut inputs)) = (std::path::absolute(path), self.inputs.lock()) {
+            if inputs.exists.insert(path.clone(), exists).is_some_and(|previous| previous != exists) {
+                inputs.error = Some(format!("compiler input existence changed between queries: {}", path.display()));
+            }
+        }
+        exists
+    }
+
+    fn read_file(&self, path: &Path) -> std::io::Result<String> {
+        let text = self.inner.read_file(path)?;
+        self.record(path, text.as_bytes())?;
+        Ok(text)
+    }
+
+    fn read_binary_file(&self, path: &Path) -> std::io::Result<Arc<[u8]>> {
+        let bytes = self.inner.read_binary_file(path)?;
+        self.record(path, &bytes)?;
+        self.inputs.lock().map_err(|_| std::io::Error::other("input recorder poisoned"))?
+            .binary.insert(std::path::absolute(path)?);
+        Ok(bytes)
+    }
+
+    fn current_directory(&self) -> std::io::Result<PathBuf> {
+        self.inner.current_directory()
+    }
 }
 
 fn location(tcx: TyCtxt<'_>, span: Span) -> Value {
@@ -78,14 +133,14 @@ fn argument<'tcx>(tcx: TyCtxt<'tcx>, arg: ty::GenericArg<'tcx>) -> Value {
     }
 }
 
-fn type_fact<'tcx>(tcx: TyCtxt<'tcx>, value: Ty<'tcx>) -> Value {
+fn type_identity<'tcx>(tcx: TyCtxt<'tcx>, value: Ty<'tcx>) -> Value {
     match value.kind() {
-        ty::Array(element, extent) => json!({"kind": "array", "element": type_fact(tcx, *element),
+        ty::Array(element, extent) => json!({"kind": "array", "element": type_identity(tcx, *element),
                                            "extent": constant(tcx, *extent)}),
-        ty::Slice(element) => json!({"kind": "slice", "element": type_fact(tcx, *element)}),
-        ty::Ref(_, element, _) => json!({"kind": "reference", "element": type_fact(tcx, *element)}),
-        ty::RawPtr(element, _) => json!({"kind": "pointer", "element": type_fact(tcx, *element)}),
-        ty::Tuple(elements) => json!({"kind": "tuple", "elements": elements.as_slice().iter().map(|ty| type_fact(tcx, *ty)).collect::<Vec<_>>()}),
+        ty::Slice(element) => json!({"kind": "slice", "element": type_identity(tcx, *element)}),
+        ty::Ref(_, element, _) => json!({"kind": "reference", "element": type_identity(tcx, *element)}),
+        ty::RawPtr(element, _) => json!({"kind": "pointer", "element": type_identity(tcx, *element)}),
+        ty::Tuple(elements) => json!({"kind": "tuple", "elements": elements.as_slice().iter().map(|ty| type_identity(tcx, *ty)).collect::<Vec<_>>()}),
         ty::Adt(def, args) => json!({"kind": "adt", "definition": definition(tcx, def.did()),
             "arguments": args.as_slice().iter().map(|arg| argument(tcx, *arg)).collect::<Vec<_>>()}),
         ty::FnDef(def, args) => json!({"kind": "function", "definition": definition(tcx, *def),
@@ -102,6 +157,61 @@ fn type_fact<'tcx>(tcx: TyCtxt<'tcx>, value: Ty<'tcx>) -> Value {
         }
         _ => json!({"kind": "scalar_or_other", "display": value.to_string()}),
     }
+}
+
+fn inline_storage<'tcx>(tcx: TyCtxt<'tcx>, value: Ty<'tcx>, ancestors: &mut Vec<Ty<'tcx>>) -> Value {
+    if ancestors.contains(&value) {
+        return json!({"kind": "unresolved_cycle", "type": type_identity(tcx, value)});
+    }
+    ancestors.push(value);
+    let storage = match value.kind() {
+        ty::Array(element, extent) => json!({"kind": "array", "extent": constant(tcx, *extent),
+            "element": inline_storage(tcx, *element, ancestors)}),
+        ty::Tuple(elements) => {
+            let members: Vec<_> = elements.as_slice().iter().enumerate().filter_map(|(index, element)| {
+                let storage = inline_storage(tcx, *element, ancestors);
+                (!storage.is_null()).then(|| json!({"index": index, "storage": storage}))
+            }).collect();
+            if members.is_empty() { Value::Null } else { json!({"kind": "tuple", "members": members}) }
+        }
+        ty::Adt(adt, args) => {
+            let mut fields = Vec::new();
+            for variant in adt.variants().iter() {
+                for field in &variant.fields {
+                    let input = field.ty(tcx, args);
+                    let field_type = match tcx.try_normalize_erasing_regions(
+                        ty::TypingEnv::non_body_analysis(tcx, field.did), input) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            fields.push(json!({"definition": definition(tcx, field.did),
+                                "storage": {"kind": "unresolved", "error": format!("{error:?}")}}));
+                            continue;
+                        }
+                    };
+                    let storage = inline_storage(tcx, field_type, ancestors);
+                    if !storage.is_null() {
+                        fields.push(json!({"variant": definition(tcx, variant.def_id),
+                            "definition": definition(tcx, field.did), "type": type_identity(tcx, field_type),
+                            "storage": storage}));
+                    }
+                }
+            }
+            if fields.is_empty() { Value::Null } else {
+                json!({"kind": "adt", "definition": definition(tcx, adt.did()), "fields": fields})
+            }
+        }
+        ty::Param(_) | ty::Alias(..) | ty::Infer(_) | ty::Error(_) =>
+            json!({"kind": "unresolved", "type": type_identity(tcx, value)}),
+        _ => Value::Null,
+    };
+    ancestors.pop();
+    storage
+}
+
+fn type_fact<'tcx>(tcx: TyCtxt<'tcx>, value: Ty<'tcx>) -> Value {
+    let mut fact = type_identity(tcx, value);
+    fact["inline_storage"] = inline_storage(tcx, value, &mut Vec::new());
+    fact
 }
 
 fn resolution(tcx: TyCtxt<'_>, res: Res) -> Value {
@@ -132,6 +242,15 @@ impl<'tcx> Facts<'tcx> {
 }
 
 impl<'tcx> Visitor<'tcx> for Facts<'tcx> {
+    fn visit_local(&mut self, local: &'tcx rustc_hir::LetStmt<'tcx>) {
+        let mut fact = self.node(local.hir_id, local.span, "local");
+        fact["pattern"] = origin(self.tcx, local.pat.span);
+        fact["initializer"] = local.init.map(|expr| origin(self.tcx, expr.span)).unwrap_or(Value::Null);
+        fact["else"] = local.els.map(|block| origin(self.tcx, block.span)).unwrap_or(Value::Null);
+        self.nodes.push(fact);
+        intravisit::walk_local(self, local);
+    }
+
     fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
         use rustc_hir::ExprKind;
         let kind = match expr.kind {
@@ -149,8 +268,31 @@ impl<'tcx> Visitor<'tcx> for Facts<'tcx> {
             ExprKind::Path(ref path) => {
                 fact["resolution"] = resolution(self.tcx, self.typeck.qpath_res(path, expr.hir_id));
             }
-            ExprKind::Struct(path, ..) => {
-                fact["resolution"] = resolution(self.tcx, self.typeck.qpath_res(path, expr.hir_id));
+            ExprKind::Call(callee, arguments) => {
+                fact["callee"] = origin(self.tcx, callee.span);
+                fact["operands"] = json!(arguments.iter().map(|arg| origin(self.tcx, arg.span)).collect::<Vec<_>>());
+            }
+            ExprKind::MethodCall(_, receiver, arguments, _) => {
+                fact["receiver"] = origin(self.tcx, receiver.span);
+                fact["operands"] = json!(arguments.iter().map(|arg| origin(self.tcx, arg.span)).collect::<Vec<_>>());
+            }
+            ExprKind::Struct(path, fields, ..) => {
+                let resolved = self.typeck.qpath_res(path, expr.hir_id);
+                fact["resolution"] = resolution(self.tcx, resolved);
+                let mut assignments = Vec::new();
+                for field in fields {
+                    let mut assignment = json!({"origin": origin(self.tcx, field.span),
+                        "value": origin(self.tcx, field.expr.span)});
+                    if let ty::Adt(adt, _) = self.typeck.expr_ty(expr).kind() {
+                        if let Some(index) = self.typeck.opt_field_index(field.hir_id) {
+                            if let Some(definition_field) = adt.variant_of_res(resolved).fields.get(index) {
+                                assignment["definition"] = definition(self.tcx, definition_field.did);
+                            }
+                        }
+                    }
+                    assignments.push(assignment);
+                }
+                fact["fields"] = json!(assignments);
             }
             ExprKind::Field(base, _) => {
                 let typeck = self.typeck;
@@ -224,11 +366,19 @@ impl<'tcx> Visitor<'tcx> for ItemReferences<'tcx> {
 
 struct Capture {
     args: Vec<String>,
-    pending: Option<Vec<u8>>,
+    pending: Option<Value>,
+    loaded: Arc<Mutex<LoadedInputs>>,
     error: Option<String>,
 }
 
 impl rustc_driver::Callbacks for Capture {
+    fn config(&mut self, config: &mut interface::Config) {
+        config.file_loader = Some(Box::new(RecordingLoader {
+            inner: config.file_loader.take().unwrap_or_else(|| Box::new(RealFileLoader)),
+            inputs: Arc::clone(&self.loaded),
+        }));
+    }
+
     fn after_analysis<'tcx>(&mut self, _compiler: &interface::Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
         tcx.dcx().abort_if_errors();
         match self.collect(tcx) {
@@ -243,7 +393,7 @@ impl rustc_driver::Callbacks for Capture {
 }
 
 impl Capture {
-    fn collect(&self, tcx: TyCtxt<'_>) -> Result<Vec<u8>, String> {
+    fn collect(&self, tcx: TyCtxt<'_>) -> Result<Value, String> {
         let mut nodes = Vec::new();
         let mut items = ItemReferences { tcx, nodes: Vec::new() };
         tcx.hir_visit_all_item_likes_in_crate(&mut items);
@@ -274,10 +424,13 @@ impl Capture {
             if let Some(text) = &file.src {
                 let path = file.name.prefer_local_unconditionally().to_string();
                 let raw = fs::read(&path).map_err(|e| format!("cannot fingerprint compiler source {path}: {e}"))?;
-                if rustc_span::SourceFileHash::new_in_memory(file.src_hash.kind, &raw) != file.src_hash {
+                let binary = std::str::from_utf8(&raw).is_err() && self.loaded.lock()
+                    .map_err(|_| "input recorder poisoned")?.binary.contains(&std::path::absolute(&path).map_err(|e| e.to_string())?);
+                let compiler_bytes = if binary { &[][..] } else { raw.as_slice() };
+                if rustc_span::SourceFileHash::new_in_memory(file.src_hash.kind, compiler_bytes) != file.src_hash {
                     return Err(format!("compiler source changed after loading: {path}"));
                 }
-                sources.insert(path, json!({"sha256": digest(&raw), "normalized_sha256": digest(text.as_bytes())}));
+                sources.insert(path, json!({"kind": if binary { "binary" } else { "text" }, "sha256": digest(&raw), "normalized_sha256": digest(text.as_bytes())}));
             }
         }
         let mut inputs = BTreeMap::new();
@@ -288,17 +441,45 @@ impl Capture {
         }
         let mut environment = BTreeMap::new();
         for (name, value) in tcx.sess.env_depinfo.borrow().iter() {
-            environment.insert(name.as_str().to_owned(), value.map(|v| v.as_str().to_owned()));
+            environment.insert(name.as_str().to_owned(), value.map(|v| digest(v.as_str().as_bytes())));
         }
         let executable = std::env::current_exe().map_err(|e| e.to_string())?;
         let helper_hash = digest(&fs::read(&executable).map_err(|e| e.to_string())?);
         let compiler_hash = digest(&fs::read(self.args.first().ok_or("missing compiler")?).map_err(|e| e.to_string())?);
-        let response = json!({"complete": true, "arguments": self.args, "sources": sources,
+        let mut artifacts = BTreeMap::new();
+        for &krate in tcx.crates(()).iter() {
+            let source = tcx.used_crate_source(krate);
+            for path in source.paths().chain(source.sdylib_interface.iter()) {
+                let path = fs::canonicalize(path).map_err(|e| e.to_string())?;
+                let hash = digest(&fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?);
+                artifacts.insert(path, hash);
+            }
+        }
+        let sysroot = fs::canonicalize(tcx.sess.opts.sysroot.path()).map_err(|e| e.to_string())?;
+        let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+        let outputs = tcx.output_filenames(());
+        let mut output_paths = Vec::new();
+        for (kind, _) in outputs.outputs.iter() {
+            if *kind == rustc_session::config::OutputType::Exe {
+                for &crate_type in tcx.crate_types() {
+                    let output = rustc_session::output::out_filename(tcx.sess, crate_type, outputs,
+                        tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE));
+                    if output.is_stdout() { return Err("capture requires file-backed compiler outputs".into()); }
+                    output_paths.push(std::path::absolute(output.as_path()).map_err(|e| e.to_string())?);
+                }
+            } else {
+                let output = outputs.path(*kind);
+                if output.is_stdout() { return Err("capture requires file-backed compiler outputs".into()); }
+                output_paths.push(std::path::absolute(output.as_path()).map_err(|e| e.to_string())?);
+            }
+        }
+        let response = json!({"complete": true, "output_paths": output_paths, "arguments": self.args, "sources": sources,
+            "cwd": cwd, "sysroot": sysroot, "dependency_artifacts": artifacts,
             "cfg": tcx.sess.config.iter().map(|(name, value)| json!([name.as_str(), value.map(|v| v.as_str().to_owned())])).collect::<Vec<_>>(),
             "helper_sha256": helper_hash, "compiler_sha256": compiler_hash,
             "file_inputs": inputs, "environment_inputs": environment,
             "definitions": definitions, "nodes": nodes});
-        serde_json::to_vec(&response).map_err(|e| e.to_string())
+        Ok(response)
     }
 }
 
@@ -315,13 +496,75 @@ pub fn run(args: &[String]) -> Result<(), String> {
                            requested.display(), expected.display()));
     }
     let destination: PathBuf = std::env::var_os("ASK_SOURCE_CAPTURE").ok_or("missing ASK_SOURCE_CAPTURE destination")?.into();
-    let mut capture = Capture { args: args.to_vec(), pending: None, error: None };
+    if !destination.is_absolute() {
+        return Err("capture destination must be absolute".into());
+    }
+    let mut tool_inputs = BTreeMap::new();
+    for path in [&executable, &requested] {
+        tool_inputs.insert(path.clone(), digest(&fs::read(path).map_err(|e| e.to_string())?));
+    }
+    let root = expected.parent().and_then(Path::parent).ok_or("compiler has no sysroot")?;
+    for directory in [root.join("lib"), root.join("bin")] {
+        for entry in fs::read_dir(&directory).map_err(|e| format!("{}: {e}", directory.display()))? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if entry.path().is_file() && (name.starts_with("librustc_driver-") || name.starts_with("rustc_driver-")) {
+                let path = entry.path();
+                tool_inputs.insert(path.clone(), digest(&fs::read(&path).map_err(|e| e.to_string())?));
+            }
+        }
+    }
+    let request = if let Some(path) = std::env::var_os("ASK_SOURCE_CAPTURE_REQUEST") {
+        let bytes = fs::read(path).map_err(|e| e.to_string())?;
+        let expected = std::env::var("ASK_SOURCE_CAPTURE_REQUEST_SHA256")
+            .map_err(|_| "capture request requires the wrapper's fingerprint")?;
+        if digest(&bytes) != expected { return Err("capture request changed after wrapper selection".into()); }
+        Some(serde_json::from_slice::<Value>(&bytes).map_err(|e| e.to_string())?)
+    } else { None };
+    let mut capture = Capture { args: args.to_vec(), pending: None, error: None,
+        loaded: Arc::new(Mutex::new(LoadedInputs::default())) };
     rustc_driver::catch_fatal_errors(|| compiler_entrypoint(args, &mut capture))
         .map_err(|_| "compiler refused capture".to_owned())?;
     if let Some(error) = capture.error {
         return Err(error);
     }
-    let bytes = capture.pending.ok_or("compiler invocation produced no analysis facts")?;
+    let mut facts = capture.pending.ok_or("compiler invocation produced no analysis facts")?;
+    for (path, hash) in &tool_inputs {
+        if digest(&fs::read(path).map_err(|e| e.to_string())?) != *hash {
+            return Err(format!("compiler/helper input changed during capture: {}", path.display()));
+        }
+    }
+    facts["tool_inputs"] = serde_json::to_value(tool_inputs).map_err(|e| e.to_string())?;
+    facts["capture_request"] = serde_json::to_value(request).map_err(|e| e.to_string())?;
+    let output_paths: Vec<PathBuf> = serde_json::from_value(facts["output_paths"].take()).map_err(|e| e.to_string())?;
+    let mut output_artifacts = BTreeMap::new();
+    for path in output_paths {
+        output_artifacts.insert(path.clone(), digest(&fs::read(&path).map_err(|e| format!("compiler output {}: {e}", path.display()))?));
+    }
+    facts["output_artifacts"] = serde_json::to_value(output_artifacts).map_err(|e| e.to_string())?;
+    let loaded = capture.loaded.lock().map_err(|_| "input recorder poisoned")?;
+    if let Some(error) = &loaded.error { return Err(error.clone()); }
+    for (path, hash) in &loaded.files {
+        let current = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        if digest(&current) != *hash {
+            return Err(format!("compiler input changed after loading: {}", path.display()));
+        }
+    }
+    for (path, existed) in &loaded.exists {
+        if path.exists() != *existed {
+            return Err(format!("compiler input existence changed: {}", path.display()));
+        }
+    }
+    let artifacts = facts["dependency_artifacts"].as_object().ok_or("missing dependency artifacts")?;
+    for (path, hash) in artifacts {
+        if digest(&fs::read(path).map_err(|e| format!("{path}: {e}"))?) != hash.as_str().ok_or("invalid artifact hash")? {
+            return Err(format!("compiler dependency changed after analysis: {path}"));
+        }
+    }
+    facts["loaded_inputs"] = serde_json::to_value(&loaded.files).map_err(|e| e.to_string())?;
+    facts["input_existence"] = serde_json::to_value(&loaded.exists).map_err(|e| e.to_string())?;
+    let bytes = serde_json::to_vec(&facts).map_err(|e| e.to_string())?;
     let temporary = destination.with_extension("partial");
     fs::write(&temporary, bytes).map_err(|e| format!("{}: {e}", temporary.display()))?;
     fs::rename(&temporary, &destination).map_err(|e| format!("{}: {e}", destination.display()))
