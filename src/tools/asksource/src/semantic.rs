@@ -147,6 +147,8 @@ fn type_identity<'tcx>(tcx: TyCtxt<'tcx>, value: Ty<'tcx>) -> Value {
             "bound_variables": format!("{:?}", args.bound_vars()),
             "arguments": args.skip_binder().as_slice().iter().map(|arg| argument(tcx, *arg)).collect::<Vec<_>>()}),
         ty::Param(param) => json!({"kind": "parameter", "index": param.index, "name": param.name.to_string()}),
+        ty::Closure(def, _) | ty::CoroutineClosure(def, _) | ty::Coroutine(def, _) =>
+            json!({"kind": "closure_or_coroutine", "definition": definition(tcx, *def)}),
         ty::Alias(kind, alias) => {
             let def = match alias.kind {
                 ty::AliasTyKind::Projection { def_id } | ty::AliasTyKind::Inherent { def_id } |
@@ -200,9 +202,50 @@ fn inline_storage<'tcx>(tcx: TyCtxt<'tcx>, value: Ty<'tcx>, ancestors: &mut Vec<
                 json!({"kind": "adt", "definition": definition(tcx, adt.did()), "fields": fields})
             }
         }
-        ty::Param(_) | ty::Alias(..) | ty::Infer(_) | ty::Error(_) =>
-            json!({"kind": "unresolved", "type": type_identity(tcx, value)}),
-        _ => Value::Null,
+        ty::Closure(def, args) | ty::CoroutineClosure(def, args) => {
+            let upvars = match value.kind() {
+                ty::Closure(..) => args.as_closure().tupled_upvars_ty(),
+                _ => args.as_coroutine_closure().tupled_upvars_ty(),
+            };
+            let storage = inline_storage(tcx, upvars, ancestors);
+            if storage.is_null() { Value::Null } else {
+                let captures: Vec<_> = def.as_local().into_iter().flat_map(|id| tcx.closure_captures(id))
+                    .map(|capture| json!({"place": capture.to_string(tcx),
+                        "binding": location(tcx, capture.var_ident.span),
+                        "mode": format!("{:?}", capture.info.capture_kind)})).collect();
+                json!({"kind": "closure", "definition": definition(tcx, *def),
+                    "captures": captures, "storage": storage})
+            }
+        }
+        ty::Coroutine(def, args) => {
+            let captures = inline_storage(tcx, args.as_coroutine().tupled_upvars_ty(), ancestors);
+            match tcx.coroutine_layout(*def, args) {
+                Ok(layout) => {
+                    let fields: Vec<_> = layout.field_tys.iter().filter_map(|field| {
+                        let input = ty::EarlyBinder::bind(tcx, field.ty).instantiate(tcx, args);
+                        let storage = match tcx.try_normalize_erasing_regions(
+                            ty::TypingEnv::non_body_analysis(tcx, *def), input) {
+                            Ok(value) => inline_storage(tcx, value, ancestors),
+                            Err(error) => json!({"kind": "unresolved", "error": format!("{error:?}")}),
+                        };
+                        (!storage.is_null()).then(|| json!({"origin": origin(tcx, field.source_info.span),
+                            "name": field.debuginfo_name.map(|name| name.to_string()), "storage": storage}))
+                    }).collect();
+                    if fields.is_empty() && captures.is_null() { Value::Null } else {
+                        json!({"kind": "coroutine", "definition": definition(tcx, *def),
+                            "captures": captures, "saved_fields": fields})
+                    }
+                }
+                Err(error) => json!({"kind": "unresolved", "error": format!("{error:?}")}),
+            }
+        }
+        ty::Pat(inner, _) => inline_storage(tcx, *inner, ancestors),
+        ty::UnsafeBinder(bound) => inline_storage(tcx,
+            tcx.instantiate_bound_regions_with_erased((*bound).into()), ancestors),
+        ty::Bool | ty::Char | ty::Int(_) | ty::Uint(_) | ty::Float(_) | ty::Str |
+        ty::Slice(_) | ty::RawPtr(..) | ty::Ref(..) | ty::FnDef(..) | ty::FnPtr(..) |
+        ty::Never => Value::Null,
+        _ => json!({"kind": "unresolved", "type": type_identity(tcx, value)}),
     };
     ancestors.pop();
     storage
