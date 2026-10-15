@@ -518,8 +518,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let request = if let Some(path) = std::env::var_os("ASK_SOURCE_CAPTURE_REQUEST") {
         let bytes = fs::read(path).map_err(|e| e.to_string())?;
         let expected = std::env::var("ASK_SOURCE_CAPTURE_REQUEST_SHA256")
-            .map_err(|_| "capture request requires the wrapper's fingerprint")?;
-        if digest(&bytes) != expected { return Err("capture request changed after wrapper selection".into()); }
+            .map_err(|_| "capture request requires the executor's fingerprint")?;
+        if digest(&bytes) != expected { return Err("capture request changed after executor selection".into()); }
         Some(serde_json::from_slice::<Value>(&bytes).map_err(|e| e.to_string())?)
     } else { None };
     let mut capture = Capture { args: args.to_vec(), pending: None, error: None,

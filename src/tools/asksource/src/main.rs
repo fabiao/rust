@@ -9,7 +9,8 @@ extern crate rustc_session;
 
 mod syntax;
 mod semantic;
-mod wrapper;
+mod cargo_build;
+use cargo::util::command_prelude;
 
 use std::process::ExitCode;
 use sha2::{Digest, Sha256};
@@ -19,12 +20,13 @@ pub(crate) fn digest(bytes: &[u8]) -> String {
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().collect();
+    if args.get(1).is_some_and(|arg| arg == "asksource") { args.remove(1); }
     let result = match args.get(1).map(String::as_str) {
         Some("source") => syntax::run(),
+        Some("build") => cargo_build::run(&args[1..]),
         Some("capture") => semantic::run(&args[2..]),
-        Some(_) if std::env::var_os("ASK_SOURCE_CAPTURE_REQUEST").is_some() => wrapper::run(&args[1..]),
-        _ => Err("usage: asksource source | capture <rustc> <rustc arguments>".into()),
+        _ => Err("usage: cargo asksource build [Cargo build arguments] | cargo-asksource source | capture <rustc> <rustc arguments>".into()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

@@ -81,6 +81,10 @@ impl Step for ToolBuild {
         let mut tool = self.tool;
         let path = self.path;
 
+        if path == "src/tools/asksource" {
+            builder.sess.require_submodule("src/tools/cargo", None);
+        }
+
         match self.mode {
             Mode::ToolRustcPrivate => {
                 // FIXME: remove this, it's only needed for download-rustc...
@@ -147,6 +151,10 @@ impl Step for ToolBuild {
             apply_pgo(builder, &mut cargo, self.build_compiler, pgo_config);
         }
 
+        if path == "src/tools/asksource" {
+            // Embedded Cargo dependencies select specialization under bootstrap's compiler.
+            cargo.allow_features("min_specialization,specialization");
+        }
         if !self.allow_features.is_empty() {
             cargo.allow_features(self.allow_features);
         }
@@ -1573,7 +1581,7 @@ fn build_extended_rustc_tool(
         path,
         extra_features: if snapshot { snapshot_features.iter().map(|feature| String::from(*feature)).collect() } else { Vec::new() },
         source_type: SourceType::InTree,
-        allow_features: if snapshot { "rustc_private" } else { "" },
+        allow_features: if snapshot || path == "src/tools/asksource" { "rustc_private" } else { "" },
         cargo_args: cargo_args.unwrap_or_default().iter().map(|s| String::from(*s)).collect(),
         artifact_kind: ToolArtifactKind::Binary,
     });
@@ -1593,6 +1601,12 @@ fn build_extended_rustc_tool(
         for add_bin in add_bins_to_sysroot {
             let bin_destination = bindir.join(exe(add_bin, target_compiler.host));
             builder.copy_link(&tool_path, &bin_destination, FileType::Executable);
+        }
+        if path == "src/tools/asksource" && !builder.config.dry_run() {
+            let retired = bindir.join(exe("asksource", target_compiler.host));
+            if retired.exists() {
+                t!(fs::remove_file(retired));
+            }
         }
 
         // Return a path into the bin dir.
@@ -1623,9 +1637,9 @@ tool_rustc_extended!(Clippy {
 });
 tool_rustc_extended!(AskSource {
     path: "src/tools/asksource",
-    tool_name: "asksource",
+    tool_name: "cargo-asksource",
     stable: false,
-    add_bins_to_sysroot: ["asksource"],
+    add_bins_to_sysroot: ["cargo-asksource"],
     cargo_args: &["--config", "profile.release.strip=\"debuginfo\""],
     snapshot_features: ["snapshot-driver"]
 });

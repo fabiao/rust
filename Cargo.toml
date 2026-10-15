@@ -1,7 +1,6 @@
 [workspace]
 resolver = "2"
 members = [
-  "src/tools/asksource",
 # tidy-alphabetical-start
   "compiler/rustc",
   "src/build_helper",
@@ -53,6 +52,7 @@ members = [
 ]
 
 exclude = [
+  "src/tools/asksource",
   "build",
   "compiler/rustc_codegen_cranelift",
   "compiler/rustc_codegen_gcc",
