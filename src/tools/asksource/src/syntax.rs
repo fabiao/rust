@@ -92,6 +92,7 @@ impl<'ast> Visit<'ast> for Model {
     fn visit_item(&mut self, item: &'ast syn::Item) {
         let (kind, data) = match item {
             syn::Item::Const(n) => ("constant", json!({"name": n.ident.unraw().to_string(),
+                "visibility": tokens(&n.vis),
                 "attrs": attributes(&n.attrs), "type": range(n.ty.span()), "value": range(n.expr.span())})),
             syn::Item::Static(n) => ("static", json!({"name": n.ident.unraw().to_string(),
                 "attrs": attributes(&n.attrs), "type": range(n.ty.span()), "value": range(n.expr.span())})),
@@ -195,7 +196,9 @@ impl<'ast> Visit<'ast> for Model {
             syn::Expr::MethodCall(n) => ("method", json!({"name": n.method.unraw().to_string(), "receiver": range(n.receiver.span()), "attrs": attributes(&n.attrs)})),
             syn::Expr::Field(n) => ("field_access", json!({"name": tokens(&n.member), "receiver": range(n.base.span()), "attrs": attributes(&n.attrs)})),
             syn::Expr::Binary(n) => ("binary", json!({"operator": tokens(&n.op), "left": range(n.left.span()), "right": range(n.right.span()), "attrs": attributes(&n.attrs)})),
-            syn::Expr::Lit(n) => ("literal", json!({"value": tokens(&n.lit), "integer": matches!(n.lit, syn::Lit::Int(_)), "attrs": attributes(&n.attrs)})),
+            syn::Expr::Lit(n) => ("literal", json!({"value": tokens(&n.lit), "integer": matches!(n.lit, syn::Lit::Int(_)),
+                "integer_digits": match &n.lit { syn::Lit::Int(value) => Some(value.base10_digits()), _ => None },
+                "attrs": attributes(&n.attrs)})),
             syn::Expr::Struct(n) => ("constructor", json!({"path": tokens(&n.path), "qualified": n.qself.is_some(), "attrs": attributes(&n.attrs)})),
             syn::Expr::Macro(n) => ("expr_macro", json!({"attrs": attributes(&n.attrs)})),
             syn::Expr::Cast(n) => ("cast", json!({"value": range(n.expr.span()), "type": range(n.ty.span()), "attrs": attributes(&n.attrs)})),
@@ -350,7 +353,15 @@ impl<'ast> Visit<'ast> for Model {
         self.leave();
     }
 
-    node_visit!(visit_block, Block, "block");
+    fn visit_block(&mut self, node: &'ast syn::Block) {
+        let tail = match node.stmts.last() {
+            Some(syn::Stmt::Expr(value, None)) => Some(range(value.span())),
+            _ => None,
+        };
+        self.enter("block", node.span(), json!({"statements": node.stmts.len(), "tail": tail}));
+        visit::visit_block(self, node);
+        self.leave();
+    }
     node_visit!(visit_arm, Arm, "arm");
     node_visit!(visit_signature, Signature, "signature");
     node_visit!(visit_generics, Generics, "generics");
