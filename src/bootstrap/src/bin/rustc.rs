@@ -28,6 +28,32 @@ use shim_utils::{
 #[path = "../utils/proc_macro_deps.rs"]
 mod proc_macro_deps;
 
+#[path = "../../../tools/asksource/src/bootstrap_config.rs"]
+mod asksource_config;
+
+fn asksource_cargo_release(command: &mut ArgFileCommand) -> Result<(), String> {
+    let Some(producers) = env::var_os(asksource_config::environment::CARGO_RELEASES) else {
+        return Ok(());
+    };
+    if env::var("CARGO_PKG_NAME").as_deref() != Ok("cargo") {
+        return Ok(());
+    }
+    let producers = producers.to_str().ok_or("embedded Cargo metadata is not UTF-8")?;
+    let producers: serde_json::Value = serde_json::from_str(producers).map_err(|e| e.to_string())?;
+    let version = env::var("CARGO_PKG_VERSION").map_err(|e| e.to_string())?;
+    let producer = producers.get(&version)
+        .ok_or_else(|| format!("missing embedded Cargo release metadata for {version}"))?;
+    let release = producer.get("release").and_then(serde_json::Value::as_str)
+        .ok_or("missing embedded Cargo release")?;
+    let channel = producer.get("channel").and_then(serde_json::Value::as_str)
+        .ok_or("missing embedded Cargo channel")?;
+    if !matches!(channel, "stable" | "beta" | "nightly" | "dev") || release.is_empty() {
+        return Err("invalid embedded Cargo release/channel metadata".into());
+    }
+    command.env("CFG_RELEASE", release).env("CFG_RELEASE_CHANNEL", channel);
+    Ok(())
+}
+
 fn main() {
     let orig_args = collect_args();
     let mut args = orig_args.clone();
@@ -114,6 +140,10 @@ fn main() {
         _ => ArgFileCommand::new(rustc_driver),
     };
     cmd.args(&args).env(dylib_path_var(), env::join_paths(&dylib_path).unwrap());
+    if let Err(error) = asksource_cargo_release(&mut cmd) {
+        eprintln!("rustc shim: {error}");
+        std::process::exit(1);
+    }
 
     if let Some(crate_name) = crate_name
         && let Some(target) = env::var_os("RUSTC_TIME")

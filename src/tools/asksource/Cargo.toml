@@ -15,6 +15,8 @@ snapshot-driver = []
 [dependencies]
 cargo = { path = "../cargo" }
 cargo-util = { path = "../cargo/crates/cargo-util" }
+cargo-bootstrap = { package = "cargo", git = "https://github.com/rust-lang/cargo", rev = "3d7cf6e937d6127d0f49881bf689c560b36d35c4" }
+cargo-util-bootstrap = { package = "cargo-util", git = "https://github.com/rust-lang/cargo", rev = "3d7cf6e937d6127d0f49881bf689c560b36d35c4" }
 color-print = "0.3.7"
 hex = "0.4.3"
 proc-macro2 = { version = "1", features = ["span-locations"] }
@@ -25,3 +27,11 @@ syn = { version = "3", features = ["full", "visit"] }
 
 [workspace]
 resolver = "2"
+
+[package.metadata.cargo-producers."0.101.0"]
+release = "1.100.0-beta.1"
+channel = "beta"
+
+[package.metadata.cargo-producers."0.102.0"]
+release = "1.101.0-nightly"
+channel = "nightly"

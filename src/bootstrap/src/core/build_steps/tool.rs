@@ -27,6 +27,9 @@ use crate::core::session::{FileType, Mode};
 use crate::utils::exec::{BootstrapCommand, command};
 use crate::utils::helpers::{self, add_dylib_path, exe, t};
 
+#[path = "../../../../tools/asksource/src/bootstrap_config.rs"]
+mod asksource_config;
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum SourceType {
     InTree,
@@ -154,6 +157,17 @@ impl Step for ToolBuild {
         if path == "src/tools/asksource" {
             // Embedded Cargo dependencies select specialization under bootstrap's compiler.
             cargo.allow_features("min_specialization,specialization");
+            let manifest = t!(fs::read_to_string(builder.src.join(path).join("Cargo.toml")));
+            let manifest: toml::Value = t!(toml::from_str(&manifest));
+            let producers = manifest.get("package")
+                .and_then(|value| value.get("metadata"))
+                .and_then(|value| value.get("cargo-producers"))
+                .expect("asksource requires exact embedded Cargo release metadata");
+            let producers = t!(serde_json::to_string(producers));
+            use sha2::Digest;
+            let identity = format!("{:x}", sha2::Sha256::digest(producers.as_bytes()));
+            cargo.rustflag(&format!("--cfg=ask_source_cargo_releases=\"{identity}\""));
+            cargo.env(asksource_config::environment::CARGO_RELEASES, producers);
         }
         if !self.allow_features.is_empty() {
             cargo.allow_features(self.allow_features);

@@ -10,7 +10,6 @@ extern crate rustc_session;
 mod syntax;
 mod semantic;
 mod cargo_build;
-use cargo::util::command_prelude;
 
 use std::process::ExitCode;
 use sha2::{Digest, Sha256};

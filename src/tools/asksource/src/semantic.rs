@@ -468,6 +468,7 @@ impl<'tcx> Visitor<'tcx> for ItemReferences<'tcx> {
 }
 
 struct Capture {
+    standard: rustc_driver::TimePassesCallbacks,
     args: Vec<String>,
     pending: Option<Value>,
     loaded: Arc<Mutex<LoadedInputs>>,
@@ -476,6 +477,7 @@ struct Capture {
 
 impl rustc_driver::Callbacks for Capture {
     fn config(&mut self, config: &mut interface::Config) {
+        self.standard.config(config);
         config.file_loader = Some(Box::new(RecordingLoader {
             inner: config.file_loader.take().unwrap_or_else(|| Box::new(RealFileLoader)),
             inputs: Arc::clone(&self.loaded),
@@ -484,7 +486,7 @@ impl rustc_driver::Callbacks for Capture {
 
     fn after_analysis<'tcx>(&mut self, _compiler: &interface::Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
         tcx.dcx().abort_if_errors();
-        match self.collect(tcx) {
+        match rustc_middle::ty::print::with_no_trimmed_paths!(self.collect(tcx)) {
             Ok(bytes) => self.pending = Some(bytes),
             Err(error) => {
                 self.error = Some(error);
@@ -641,7 +643,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         if digest(&bytes) != *expected { return Err("capture request changed after executor selection".into()); }
         Some(serde_json::from_slice::<Value>(&bytes).map_err(|e| e.to_string())?)
     } else { None };
-    let mut capture = Capture { args: args.clone(), pending: None, error: None,
+    let mut capture = Capture { standard: rustc_driver::TimePassesCallbacks::default(), args: args.clone(), pending: None, error: None,
         loaded: Arc::new(Mutex::new(LoadedInputs::default())) };
     rustc_driver::catch_fatal_errors(|| compiler_entrypoint(&args, &mut capture))
         .map_err(|_| "compiler refused capture".to_owned())?;
