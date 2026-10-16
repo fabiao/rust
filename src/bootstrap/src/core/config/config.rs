@@ -90,6 +90,8 @@ pub const RUSTC_IF_UNCHANGED_ALLOWED_PATHS: &[&str] = &[
 pub(crate) struct Config {
     pub change_id: Option<ChangeId>,
     pub bypass_bootstrap_lock: bool,
+    pub ask_source_request: Option<PathBuf>,
+    pub ask_source_run: Option<String>,
     pub ccache: Option<String>,
     pub sde: Option<PathBuf>,
     /// Call `Session::ninja` instead of this.
@@ -390,6 +392,8 @@ impl Config {
             incremental: flags_incremental,
             config: flags_config,
             build_dir: flags_build_dir,
+            ask_source_request: flags_ask_source_request,
+            ask_source_run: flags_ask_source_run,
             build: flags_build,
             host: flags_host,
             target: flags_target,
@@ -1477,6 +1481,8 @@ NOTE: Please add `--stage 2` to your command line, or if you're sure you want to
             in_tree_gcc_info,
             in_tree_llvm_info,
             include_default_paths: flags_include_default_paths,
+            ask_source_request: flags_ask_source_request,
+            ask_source_run: flags_ask_source_run,
             incremental: flags_incremental || rust_incremental == Some(true),
             jobs: Some(threads_from_config(flags_jobs.or(build_jobs).unwrap_or(0))),
             json_output: flags_json_output,

@@ -40,6 +40,9 @@ mod step_stack;
 #[cfg(test)]
 mod tests;
 
+#[path = "../../../../tools/asksource/src/bootstrap.rs"]
+mod asksource;
+
 /// Builds and performs different [`Self::kind`]s of stuff and actions, taking
 /// into account build configuration from e.g. bootstrap.toml.
 pub(crate) struct Builder<'a> {
@@ -57,6 +60,7 @@ pub(crate) struct Builder<'a> {
     /// A cache of outputs of [`Step`]s so we can avoid running steps we already
     /// ran.
     cache: Cache,
+    pub(crate) source_capture: asksource::Capture,
 
     /// A stack of [`Step`]s to run before we can run this builder. The output
     /// of steps is cached in [`Self::cache`].
@@ -1098,6 +1102,7 @@ impl<'a> Builder<'a> {
             top_stage: sess.config.stage,
             kind,
             cache: Cache::new(),
+            source_capture: Default::default(),
             stack: RefCell::new(Vec::new()),
             time_spent_on_dependencies: Cell::new(Duration::new(0, 0)),
             paths,
@@ -1135,7 +1140,15 @@ impl<'a> Builder<'a> {
     }
 
     pub fn execute_cli(&self) {
+        if let Err(error) = self.source_capture.prepare(self) {
+            eprintln!("SDK source capture: {error}");
+            crate::utils::helpers::exit_process(1);
+        }
         self.run_step_descriptions(&Builder::get_step_descriptions(self.kind), &self.paths);
+        if let Err(error) = self.source_capture.finish(self) {
+            eprintln!("SDK source capture: {error}");
+            crate::utils::helpers::exit_process(1);
+        }
     }
 
     /// Run all default documentation steps to build documentation.

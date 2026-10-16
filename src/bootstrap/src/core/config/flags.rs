@@ -65,6 +65,13 @@ pub struct Flags {
     /// Build directory, overrides `build.build-dir` in `bootstrap.toml`
     pub build_dir: Option<PathBuf>,
 
+    #[arg(global = true, long, requires = "ask_source_run", value_hint = clap::ValueHint::FilePath, value_name = "FILE")]
+    /// Capture the selected SDK std graphs after helper provisioning
+    pub ask_source_request: Option<PathBuf>,
+    #[arg(global = true, long, requires = "ask_source_request")]
+    /// Invocation token echoed by the completed SDK capture collection
+    pub ask_source_run: Option<String>,
+
     #[arg(global = true, long, value_hint = clap::ValueHint::Other, value_name = "BUILD")]
     /// host target of the stage0 compiler
     pub build: Option<String>,

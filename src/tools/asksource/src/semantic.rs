@@ -528,13 +528,16 @@ impl Capture {
         let mut sources = BTreeMap::new();
         for file in tcx.sess.source_map().files().iter() {
             if let Some(text) = &file.src {
-                let path = file.name.prefer_local_unconditionally().to_string();
-                let raw = fs::read(&path).map_err(|e| format!("cannot fingerprint compiler source {path}: {e}"))?;
-                let binary = std::str::from_utf8(&raw).is_err() && self.loaded.lock()
-                    .map_err(|_| "input recorder poisoned")?.binary.contains(&std::path::absolute(&path).map_err(|e| e.to_string())?);
+                let name = file.name.prefer_local_unconditionally().to_string();
+                let generated = !matches!(file.name, rustc_span::FileName::Real(_));
+                let raw = if generated { text.as_bytes().to_vec() } else {
+                    fs::read(&name).map_err(|e| format!("cannot fingerprint compiler source {name}: {e}"))?
+                };
+                let binary = !generated && std::str::from_utf8(&raw).is_err() && self.loaded.lock()
+                    .map_err(|_| "input recorder poisoned")?.binary.contains(&std::path::absolute(&name).map_err(|e| e.to_string())?);
                 let compiler_bytes = if binary { &[][..] } else { raw.as_slice() };
-                if rustc_span::SourceFileHash::new_in_memory(file.src_hash.kind, compiler_bytes) != file.src_hash {
-                    return Err(format!("compiler source changed after loading: {path}"));
+                if !generated && rustc_span::SourceFileHash::new_in_memory(file.src_hash.kind, compiler_bytes) != file.src_hash {
+                    return Err(format!("compiler source changed after loading: {name}"));
                 }
                 let mut exported_name = file.name.clone();
                 if let rustc_span::FileName::Real(name) = &mut exported_name {
@@ -542,10 +545,14 @@ impl Capture {
                 }
                 let exported_id = rustc_span::StableSourceFileId::from_filename_for_export(
                     &exported_name, tcx.stable_crate_id(rustc_hir::def_id::LOCAL_CRATE));
-                sources.insert(path, json!({"kind": if binary { "binary" } else { "text" },
-                    "source_file_id": format!("{:?}", file.stable_id),
-                    "exported_source_file_id": format!("{exported_id:?}"),
-                    "sha256": digest(&raw), "normalized_sha256": digest(text.as_bytes())}));
+                let id = format!("{:?}", file.stable_id);
+                let record = json!({"kind": if generated { "generated" } else if binary { "binary" } else { "text" },
+                    "name": name, "path": if generated { None } else { Some(name.as_str()) },
+                    "text": if generated { Some(text.as_str()) } else { None },
+                    "compiler_hash": file.src_hash.to_string(),
+                    "source_file_id": id, "exported_source_file_id": format!("{exported_id:?}"),
+                    "sha256": digest(&raw), "normalized_sha256": digest(text.as_bytes())});
+                if sources.insert(id, record).is_some() { return Err("duplicate compiler source identity".into()); }
             }
         }
         let mut inputs = BTreeMap::new();

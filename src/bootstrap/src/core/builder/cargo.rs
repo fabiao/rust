@@ -203,6 +203,10 @@ impl Cargo {
         self.mode
     }
 
+    pub(crate) fn target(&self) -> TargetSelection {
+        self.target
+    }
+
     pub(crate) fn into_cmd(self) -> BootstrapCommand {
         self.into()
     }

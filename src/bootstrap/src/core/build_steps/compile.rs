@@ -2825,6 +2825,8 @@ pub fn stream_cargo(
     tail_args: Vec<String>,
     cb: &mut dyn FnMut(CargoMessage<'_>),
 ) -> bool {
+    let capture = (cargo.mode() == Mode::Std && cargo.kind() == Kind::Build)
+        .then(|| (cargo.compiler(), cargo.target()));
     let mut cmd = cargo.into_cmd();
 
     // Instruct Cargo to give us json messages on stdout, critically leaving
@@ -2844,6 +2846,12 @@ pub fn stream_cargo(
         cmd.arg(arg);
     }
 
+    if let Some((compiler, target)) = capture {
+        if let Err(error) = builder.source_capture.record(&cmd, compiler.stage, &compiler.host.to_string(), &target.to_string()) {
+            eprintln!("SDK source capture: {error}");
+            helpers::exit_process(1);
+        }
+    }
     builder.do_if_verbose(|| println!("running: {cmd:?}"));
 
     let streaming_command = cmd.stream_capture_stdout(&builder.config.exec_ctx);

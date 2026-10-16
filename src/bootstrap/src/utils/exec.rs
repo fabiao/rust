@@ -73,6 +73,17 @@ pub(crate) struct CommandFingerprint {
 }
 
 impl CommandFingerprint {
+    pub(crate) fn command(&self) -> Command {
+        let mut command = Command::new(&self.program);
+        command.args(&self.args);
+        for (name, value) in &self.envs {
+            if let Some(value) = value { command.env(name, value); }
+            else { command.env_remove(name); }
+        }
+        if let Some(cwd) = &self.cwd { command.current_dir(cwd); }
+        command
+    }
+
     #[cfg(feature = "tracing")]
     pub(crate) fn program_name(&self) -> String {
         Path::new(&self.program)
