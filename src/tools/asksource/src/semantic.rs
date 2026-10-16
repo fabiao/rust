@@ -604,6 +604,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         .arg(Arg::new("output").long("output").required(true).value_parser(value_parser!(PathBuf)))
         .arg(Arg::new("request").long("request").requires("request-sha256").value_parser(value_parser!(PathBuf)))
         .arg(Arg::new("request-sha256").long("request-sha256").requires("request"))
+        .arg(Arg::new("launcher").long("launcher").requires("request"))
         .arg(Arg::new("compiler").required(true).num_args(1..).last(true))
         .try_get_matches_from(std::iter::once("capture").chain(args.iter().map(String::as_str)))
         .map_err(|e| e.to_string())?;
@@ -641,8 +642,24 @@ pub fn run(args: &[String]) -> Result<(), String> {
         let bytes = fs::read(path).map_err(|e| e.to_string())?;
         let expected = matches.get_one::<String>("request-sha256").ok_or("missing capture request fingerprint")?;
         if digest(&bytes) != *expected { return Err("capture request changed after executor selection".into()); }
-        Some(serde_json::from_slice::<Value>(&bytes).map_err(|e| e.to_string())?)
+        tool_inputs.insert(fs::canonicalize(path).map_err(|e| e.to_string())?, expected.clone());
+        Some({
+            let request = serde_json::from_slice::<Value>(&bytes).map_err(|e| e.to_string())?;
+            crate::launcher::validate_request(&request)?;
+            request
+        })
     } else { None };
+    let launcher = matches.get_one::<String>("launcher").map(|value| serde_json::from_str::<Value>(value))
+        .transpose().map_err(|e| e.to_string())?.unwrap_or(Value::Null);
+    if !launcher.is_null() {
+        crate::launcher::validate(&launcher, request.as_ref().ok_or("launcher capture requires a request")?)?;
+        tool_inputs.insert(PathBuf::from(launcher["program"].as_str().ok_or("missing launcher program")?),
+            launcher["sha256"].as_str().ok_or("missing launcher hash")?.to_owned());
+        for (name, hash) in launcher["response_files"].as_object().ok_or("missing launcher response inputs")? {
+            tool_inputs.insert(PathBuf::from(name), hash.as_str().ok_or("missing response hash")?.to_owned());
+        }
+    }
+    let effective_environment = crate::launcher::environment(&Default::default())?;
     let mut capture = Capture { standard: rustc_driver::TimePassesCallbacks::default(), args: args.clone(), pending: None, error: None,
         loaded: Arc::new(Mutex::new(LoadedInputs::default())) };
     rustc_driver::catch_fatal_errors(|| compiler_entrypoint(&args, &mut capture))
@@ -656,6 +673,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
             return Err(format!("compiler/helper input changed during capture: {}", path.display()));
         }
     }
+    facts["compiler_realpath"] = json!(requested);
+    facts["launcher"] = launcher;
+    facts["effective_environment"] = effective_environment;
     facts["tool_inputs"] = serde_json::to_value(tool_inputs).map_err(|e| e.to_string())?;
     facts["capture_request"] = serde_json::to_value(request).map_err(|e| e.to_string())?;
     let output_paths: Vec<PathBuf> = serde_json::from_value(facts["output_paths"].take()).map_err(|e| e.to_string())?;

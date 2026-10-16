@@ -31,6 +31,9 @@ mod proc_macro_deps;
 #[path = "../../../tools/asksource/src/bootstrap_config.rs"]
 mod asksource_config;
 
+#[path = "../../../tools/asksource/src/launcher.rs"]
+mod asksource_launcher;
+
 fn asksource_cargo_release(command: &mut ArgFileCommand) -> Result<(), String> {
     let Some(producers) = env::var_os(asksource_config::environment::CARGO_RELEASES) else {
         return Ok(());
@@ -54,8 +57,46 @@ fn asksource_cargo_release(command: &mut ArgFileCommand) -> Result<(), String> {
     Ok(())
 }
 
+fn asksource_capture(args: &mut Vec<std::ffi::OsString>) -> Result<Option<serde_json::Value>, String> {
+    let mut capture = None;
+    let mut retained = Vec::new();
+    for arg in args.drain(..) {
+        if let Some(payload) = arg.to_str().and_then(|arg| arg.strip_prefix(asksource_launcher::control::PREFIX)) {
+            if capture.is_some() { return Err("duplicate capture control".into()); }
+            capture = Some(serde_json::from_str::<serde_json::Value>(payload).map_err(|e| e.to_string())?);
+        } else { retained.push(arg); }
+    }
+    *args = retained;
+    if let Some(capture) = &capture {
+        for name in ["output", "request", "request_sha256"] {
+            if capture[name].as_str().is_none() { return Err(format!("missing capture {name}")); }
+        }
+        let request_bytes = std::fs::read(capture["request"].as_str().ok_or("missing capture request")?)
+            .map_err(|e| e.to_string())?;
+        if asksource_launcher::digest(&request_bytes) != capture["request_sha256"] {
+            return Err("capture request changed before shim dispatch".into());
+        }
+        let request = serde_json::from_slice(&request_bytes).map_err(|e| e.to_string())?;
+        let launcher = &capture["launcher"];
+        asksource_launcher::validate(launcher, &request)?;
+        let actual = asksource_launcher::snapshot(&env::current_exe().map_err(|e| e.to_string())?,
+            &[], &env::current_dir().map_err(|e| e.to_string())?, &Default::default())?;
+        let arguments: Vec<_> = args.iter().map(|arg| arg.to_str().ok_or("shim argument is not UTF-8"))
+            .collect::<Result<_, _>>()?;
+        if launcher["program"] != actual["program"] || launcher["cwd"] != actual["cwd"]
+            || launcher["environment"] != actual["environment"] || launcher["arguments"] != serde_json::json!(arguments) {
+            return Err("compiler shim invocation changed before dispatch".into());
+        }
+    }
+    Ok(capture)
+}
+
 fn main() {
-    let orig_args = collect_args();
+    let mut orig_args = collect_args();
+    let capture = match asksource_capture(&mut orig_args) {
+        Ok(capture) => capture,
+        Err(error) => { eprintln!("rustc shim: {error}"); std::process::exit(1); }
+    };
     let mut args = orig_args.clone();
 
     let stage = parse_rustc_stage();
@@ -131,14 +172,28 @@ fn main() {
         }
     }
 
-    let mut cmd = match env::var_os("RUSTC_WRAPPER_REAL") {
+    let mut cmd = if let Some(capture) = &capture {
+        if env::var_os("RUSTC_WRAPPER_REAL").is_some_and(|value| !value.is_empty()) || is_clippy {
+            eprintln!("rustc shim: capture requires final compiler ownership; nested wrappers are unsupported");
+            std::process::exit(1);
+        }
+        let compiler = PathBuf::from(&rustc_driver);
+        let resolved = std::fs::canonicalize(&compiler).expect("capture compiler unavailable");
+        let helper = resolved.with_file_name(if cfg!(windows) { "cargo-asksource.exe" } else { "cargo-asksource" });
+        let mut cmd = ArgFileCommand::new(helper);
+        cmd.arg("capture").arg("--output").arg(capture["output"].as_str().expect("capture output"))
+            .arg("--request").arg(capture["request"].as_str().expect("capture request"))
+            .arg("--request-sha256").arg(capture["request_sha256"].as_str().expect("capture request hash"))
+            .arg("--launcher").arg(capture["launcher"].to_string()).arg("--").arg(compiler);
+        cmd
+    } else { match env::var_os("RUSTC_WRAPPER_REAL") {
         Some(wrapper) if !wrapper.is_empty() => {
             let mut cmd = ArgFileCommand::new(wrapper);
             cmd.arg(rustc_driver);
             cmd
         }
         _ => ArgFileCommand::new(rustc_driver),
-    };
+    } };
     cmd.args(&args).env(dylib_path_var(), env::join_paths(&dylib_path).unwrap());
     if let Err(error) = asksource_cargo_release(&mut cmd) {
         eprintln!("rustc shim: {error}");

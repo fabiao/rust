@@ -12,6 +12,12 @@ use self::cargo_util::ProcessBuilder;
 use serde_json::{Value, json};
 
 
+fn launcher_environment(command: &ProcessBuilder) -> Result<BTreeMap<String, Option<std::ffi::OsString>>, String> {
+    command.build_command().get_envs().map(|(name, value)| {
+        Ok((name.to_str().ok_or("launcher environment key is not UTF-8")?.to_owned(), value.map(ToOwned::to_owned)))
+    }).collect()
+}
+
 fn build_cli() -> cargo::util::command_prelude::Command {
     subcommand("build")
         .about("Compile a local package and all of its dependencies")
@@ -184,6 +190,7 @@ impl CaptureExecutor {
 
     fn valid(&self, key: &str, command: Option<&ProcessBuilder>) -> bool {
         let validate = || -> Option<()> {
+            if read_json(&self.request_path).ok()? != self.request { return None; }
             for (path, hash) in &self.graph_inputs {
                 if crate::digest(&fs::read(path).ok()?) != *hash {
                     return None;
@@ -205,6 +212,9 @@ impl CaptureExecutor {
                 return None;
             }
             let cwd = Path::new(facts.get("cwd")?.as_str()?);
+            let compiler = Path::new(facts.get("arguments")?.as_array()?.first()?.as_str()?);
+            let compiler = if compiler.is_absolute() { compiler.to_path_buf() } else { cwd.join(compiler) };
+            if fs::canonicalize(compiler).ok()?.to_str()? != facts.get("compiler_realpath")?.as_str()? { return None; }
             for field in [
                 "loaded_inputs",
                 "dependency_artifacts",
@@ -231,6 +241,32 @@ impl CaptureExecutor {
                 {
                     return None;
                 }
+            }
+            if !facts.get("launcher")?.is_null() {
+                let launcher = &facts["launcher"];
+                crate::launcher::validate(launcher, &self.request).ok()?;
+                if let Some(command) = command {
+                    let args = command.get_args().cloned().collect::<Vec<_>>();
+                    if crate::launcher::snapshot(Path::new(command.get_program()), &args,
+                        command.get_cwd().unwrap_or(&self.cwd), &launcher_environment(command).ok()?).ok()? != *launcher { return None; }
+                } else {
+                    let mut current = crate::launcher::environment(&Default::default()).ok()?;
+                    let current = current.as_object_mut()?;
+                    let original = launcher["environment"].as_object()?;
+                    for name in record["launcher_overrides"].as_array()? {
+                        let name = name.as_str()?;
+                        if let Some(value) = original.get(name) { current.insert(name.to_owned(), value.clone()); }
+                        else { current.remove(name); }
+                    }
+                    if current != original { return None; }
+                }
+                let effective = facts["effective_environment"].as_object()?;
+                let tracked = facts["environment_inputs"].as_object()?;
+                if record["environment_inputs"] != facts["environment_inputs"] { return None; }
+                for (name, expected) in tracked {
+                    if effective.get(&crate::launcher::environment_key(name)).unwrap_or(&Value::Null) != expected { return None; }
+                }
+                return Some(());
             }
             let overrides = record.get("environment_overrides")?.as_object()?;
             let tracked = facts.get("environment_inputs")?.as_object()?;
@@ -344,19 +380,24 @@ impl Executor for CaptureExecutor {
         } else {
             "cargo-asksource"
         });
-        let mut compiler_args = vec![
-            std::ffi::OsString::from("capture"),
-            "--output".into(),
-            self.fact_path(&key).into_os_string(),
-            "--request".into(),
-            self.request_path.clone().into_os_string(),
-            "--request-sha256".into(),
-            crate::digest(&fs::read(&self.request_path)?).into(),
-            "--".into(),
-            compiler.into_os_string(),
-        ];
-        compiler_args.extend(args.into_iter().cloned());
-        captured.program(helper).args_replace(&compiler_args);
+        let shim = self.request["compiler_shims"].get(compiler.to_string_lossy().as_ref());
+        if shim.is_some() {
+            let launcher = crate::launcher::snapshot(&compiler, &args.iter().map(|arg| (*arg).clone()).collect::<Vec<_>>(),
+                cmd.get_cwd().unwrap_or(&self.cwd), &launcher_environment(cmd).map_err(cargo::util::errors::internal)?).map_err(cargo::util::errors::internal)?;
+            crate::launcher::validate(&launcher, &self.request).map_err(cargo::util::errors::internal)?;
+            let capture = json!({"output": self.fact_path(&key), "request": self.request_path,
+                "request_sha256": crate::digest(&fs::read(&self.request_path)?), "launcher": launcher});
+            captured.arg(format!("{}{}", crate::launcher::control::PREFIX, capture));
+        } else {
+            let mut compiler_args = vec![
+                std::ffi::OsString::from("capture"), "--output".into(), self.fact_path(&key).into_os_string(),
+                "--request".into(), self.request_path.clone().into_os_string(),
+                "--request-sha256".into(), crate::digest(&fs::read(&self.request_path)?).into(),
+                "--".into(), cmd.get_program().clone(),
+            ];
+            compiler_args.extend(args.into_iter().cloned());
+            captured.program(helper).args_replace(&compiler_args);
+        }
         let record_path = self.record_path(&key);
         if record_path.exists() {
             fs::remove_file(&record_path)?;
@@ -373,7 +414,8 @@ impl Executor for CaptureExecutor {
         let record = json!({"request": self.request, "graph_sha256": self.graph_sha256, "producer": self.producer,
             "facts_sha256": crate::digest(&fs::read(self.fact_path(&key))?),
             "environment_inputs": facts["environment_inputs"],
-            "environment_overrides": overrides});
+            "environment_overrides": overrides,
+            "launcher_overrides": launcher_environment(cmd).map_err(cargo::util::errors::internal)?.keys().map(|name| crate::launcher::environment_key(name)).collect::<Vec<_>>()});
         publish(&record_path, &record).map_err(cargo::util::errors::internal)?;
         if !self.valid(&key, Some(cmd)) {
             fs::remove_file(&record_path)?;
@@ -410,12 +452,7 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
         .cloned()
         .ok_or("build capture requires --capture-request")?;
     let request = read_json(&request_path)?;
-    let fields = request.as_object().ok_or("capture request must be an object")?;
-    if fields.len() != 3
-        || fields.keys().any(|key| !matches!(key.as_str(), "directory" | "sources" | "graph"))
-    {
-        return Err("capture request requires only directory, sources and graph".into());
-    }
+    crate::launcher::validate_request(&request)?;
     let directory =
         PathBuf::from(request["directory"].as_str().ok_or("missing capture directory")?);
     let sources: BTreeSet<PathBuf> =
@@ -425,6 +462,27 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
         || request["graph"].as_object().is_none_or(|graph| graph.is_empty())
     {
         return Err("capture requires absolute paths and an explicit selected graph context".into());
+    }
+    fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+    let capture_lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(directory.join("capture.lock"))
+        .map_err(|e| e.to_string())?;
+    capture_lock.lock().map_err(|e| format!("cannot lock selected capture directory: {e}"))?;
+    let snapshot = directory.join("build.json");
+    if snapshot.exists() {
+        fs::remove_file(&snapshot).map_err(|e| e.to_string())?;
+    }
+    let shims = request["compiler_shims"].as_object().ok_or("missing explicit compiler_shims map")?;
+    for (name, hash) in shims {
+        let path = Path::new(name);
+        if !path.is_absolute() || fs::canonicalize(path).map_err(|e| e.to_string())? != path
+            || hash.as_str() != Some(crate::digest(&fs::read(path).map_err(|e| e.to_string())?).as_str()) {
+            return Err(format!("invalid or stale compiler shim identity: {name}"));
+        }
     }
     let canonical_sources: BTreeSet<_> = sources
         .iter()
@@ -533,19 +591,6 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
             graph_snapshot.keys.get(unit).ok_or("selected unit has no semantic identity")?.clone();
         selected.insert(key.clone());
         selected_by_base.entry(base_key(unit)).or_default().insert(key);
-    }
-    fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
-    let capture_lock = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(directory.join("capture.lock"))
-        .map_err(|e| e.to_string())?;
-    capture_lock.lock().map_err(|e| format!("cannot lock selected capture directory: {e}"))?;
-    let snapshot = directory.join("build.json");
-    if snapshot.exists() {
-        fs::remove_file(&snapshot).map_err(|e| e.to_string())?;
     }
     let executor = Arc::new(CaptureExecutor {
         request,

@@ -133,7 +133,6 @@ dependencies = [
  "cargo-util 0.2.33",
  "cargo-util 0.2.33 (git+https://github.com/rust-lang/cargo?rev=3d7cf6e937d6127d0f49881bf689c560b36d35c4)",
  "color-print",
- "hex",
  "proc-macro2",
  "quote",
  "serde_json",

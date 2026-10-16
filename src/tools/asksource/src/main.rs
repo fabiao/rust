@@ -9,17 +9,20 @@ extern crate rustc_session;
 
 mod syntax;
 mod semantic;
+mod launcher;
 mod cargo_build;
 
 use std::process::ExitCode;
-use sha2::{Digest, Sha256};
-
-pub(crate) fn digest(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
-}
+pub(crate) use launcher::digest;
 
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().collect();
+    if args.len() == 2 && let Some(path) = args[1].strip_prefix('@') {
+        match std::fs::read_to_string(path) {
+            Ok(text) => args = std::iter::once(args[0].clone()).chain(text.lines().map(str::to_owned)).collect(),
+            Err(error) => { eprintln!("asksource: argument file {path}: {error}"); return ExitCode::FAILURE; }
+        }
+    }
     if args.get(1).is_some_and(|arg| arg == "asksource") { args.remove(1); }
     let result = match args.get(1).map(String::as_str) {
         Some("source") => syntax::run(),
