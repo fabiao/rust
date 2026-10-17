@@ -8,11 +8,15 @@ use std::process::Command;
 use serde_json::{Value, json};
 
 use crate::core::builder::{Builder, Kind};
+use crate::core::session::Mode;
 use crate::utils::exec::{BootstrapCommand, CommandFingerprint};
 
 #[allow(dead_code, reason = "shared with the compiler shim and installed source helper")]
 #[path = "launcher.rs"]
 mod launcher;
+
+#[path = "bootstrap_config.rs"]
+mod config;
 
 #[derive(Default)]
 pub(crate) struct Capture {
@@ -123,14 +127,24 @@ impl Capture {
         stage: u32,
         host: &str,
         target: &str,
+        mode: Mode,
     ) -> Result<(), String> {
         let mut run = self.run.borrow_mut();
         let Some(run) = run.as_mut() else {
             return Ok(());
         };
         let fingerprint = command.fingerprint();
+        let mode = match mode {
+            Mode::Std => config::build_mode::STD,
+            Mode::Rustc => config::build_mode::RUSTC,
+            Mode::Codegen => config::build_mode::CODEGEN,
+            Mode::ToolBootstrap => config::build_mode::TOOL_BOOTSTRAP,
+            Mode::ToolTarget => config::build_mode::TOOL_TARGET,
+            Mode::ToolStd => config::build_mode::TOOL_STD,
+            Mode::ToolRustcPrivate => config::build_mode::TOOL_RUSTC_PRIVATE,
+        };
         let context = json!({"invocation": command_context(&fingerprint.command())?,
-            "stage": stage, "compiler_host": host, "target": target, "mode": "std"});
+            "stage": stage, "compiler_host": host, "target": target, "mode": mode});
         let key = launcher::digest(&serde_json::to_vec(&context).map_err(|e| e.to_string())?);
         run.prepared.insert(key, (fingerprint, context));
         Ok(())
@@ -142,7 +156,7 @@ impl Capture {
             return Ok(());
         };
         if run.prepared.is_empty() {
-            return Err("no SDK std build commands were selected".into());
+            return Err("no SDK Cargo build commands were selected".into());
         }
         let mut builds = BTreeMap::new();
         let mut covered = BTreeSet::new();
@@ -219,8 +233,8 @@ impl Capture {
             copy_context(&original, &mut capture);
             capture.env("PATH", injected_path);
             builder.info(&format!(
-                "Capturing SDK std graph: stage{} {}",
-                context["stage"], context["target"]
+                "Capturing SDK {} graph: stage{} {}",
+                context["mode"], context["stage"], context["target"]
             ));
             if !BootstrapCommand::from(capture).allow_failure().run(&builder.config.exec_ctx) {
                 return Err(format!("SDK capture failed for {}", context["target"]));
@@ -244,7 +258,7 @@ impl Capture {
             let source = source.as_str().ok_or("invalid SDK source root")?;
             if !covered.contains(&fs::canonicalize(source).map_err(|e| e.to_string())?) {
                 return Err(format!(
-                    "requested owned root is absent from selected SDK std graphs: {source}"
+                    "requested owned root is absent from selected SDK Cargo graphs: {source}"
                 ));
             }
         }

@@ -66,7 +66,7 @@ pub struct Flags {
     pub build_dir: Option<PathBuf>,
 
     #[arg(global = true, long, requires = "ask_source_run", value_hint = clap::ValueHint::FilePath, value_name = "FILE")]
-    /// Capture the selected SDK std graphs after helper provisioning
+    /// Capture the selected SDK Cargo graphs after helper provisioning
     pub ask_source_request: Option<PathBuf>,
     #[arg(global = true, long, requires = "ask_source_request")]
     /// Invocation token echoed by the completed SDK capture collection
