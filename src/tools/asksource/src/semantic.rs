@@ -363,10 +363,33 @@ impl<'tcx> Visitor<'tcx> for Facts<'tcx, '_> {
             ExprKind::Struct(..) => "constructor",
             ExprKind::Repeat(..) => "repeat",
             ExprKind::Array(..) => "array_value",
+            ExprKind::Binary(..) => "binary",
+            ExprKind::Unary(..) => "unary",
+            ExprKind::Lit(..) => "literal",
+            ExprKind::Cast(..) => "cast",
+            ExprKind::Type(..) => "type_ascription",
+            ExprKind::DropTemps(..) => "drop_temps",
             _ => "expression",
         };
         let mut fact = self.node(expr.hir_id, expr.span, kind);
         match expr.kind {
+            ExprKind::Binary(operator, left, right) => {
+                fact["operator"] = json!(operator.node.as_str());
+                fact["operands"] = json!([origin(self.tcx, left.span), origin(self.tcx, right.span)]);
+            }
+            ExprKind::Unary(operator, operand) => {
+                fact["operator"] = json!(operator.as_str());
+                fact["operands"] = json!([origin(self.tcx, operand.span)]);
+            }
+            ExprKind::Lit(literal) => {
+                fact["integer_digits"] = match literal.node {
+                    rustc_ast::LitKind::Int(value, _) => json!(value.get().to_string()),
+                    _ => Value::Null,
+                };
+            }
+            ExprKind::Cast(operand, _) | ExprKind::Type(operand, _) | ExprKind::DropTemps(operand) => {
+                fact["operands"] = json!([origin(self.tcx, operand.span)]);
+            }
             ExprKind::Path(ref path) => {
                 fact["resolution"] = resolution(self.tcx, self.typeck.qpath_res(path, expr.hir_id));
             }
@@ -397,6 +420,7 @@ impl<'tcx> Visitor<'tcx> for Facts<'tcx, '_> {
                 fact["fields"] = json!(assignments);
             }
             ExprKind::Field(base, _) => {
+                fact["receiver"] = origin(self.tcx, base.span);
                 let typeck = self.typeck;
                 if let Some(index) = typeck.opt_field_index(expr.hir_id) {
                     if let ty::Adt(adt, _) = typeck.expr_ty_adjusted(base).kind() {
