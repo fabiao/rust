@@ -359,6 +359,11 @@ impl<'tcx> Visitor<'tcx> for Facts<'tcx, '_> {
     fn visit_local(&mut self, local: &'tcx rustc_hir::LetStmt<'tcx>) {
         let mut fact = self.node(local.hir_id, local.span, "local");
         fact["pattern"] = node_reference(self.tcx, local.pat.hir_id, local.pat.span);
+        let mut bindings = Vec::new();
+        local.pat.each_binding(|_, id, span, _| {
+            bindings.push(node_reference(self.tcx, id, span));
+        });
+        fact["bindings"] = json!(bindings);
         fact["initializer"] = local.init.map(|expr| node_reference(self.tcx, expr.hir_id, expr.span)).unwrap_or(Value::Null);
         fact["else"] = local.els.map(|block| node_reference(self.tcx, block.hir_id, block.span)).unwrap_or(Value::Null);
         self.nodes.push(fact);
