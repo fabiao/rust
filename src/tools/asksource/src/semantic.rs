@@ -130,7 +130,7 @@ fn constant<'tcx>(tcx: TyCtxt<'tcx>, value: ty::Const<'tcx>) -> Value {
 
 fn argument<'tcx>(tcx: TyCtxt<'tcx>, arg: ty::GenericArg<'tcx>) -> Value {
     match arg.kind() {
-        ty::GenericArgKind::Type(ty) => type_fact(tcx, ty),
+        ty::GenericArgKind::Type(ty) => type_identity(tcx, ty),
         ty::GenericArgKind::Const(value) => json!({"kind": "const", "constant": constant(tcx, value)}),
         ty::GenericArgKind::Lifetime(_) => json!({"kind": "lifetime"}),
     }
