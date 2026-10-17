@@ -24,7 +24,7 @@ fn attributes(attrs: &[syn::Attribute]) -> Value {
 }
 
 fn meta(value: &syn::Meta) -> Value {
-    match value {
+    let mut data = match value {
         syn::Meta::Path(path) => json!({"kind": "path", "path": tokens(path)}),
         syn::Meta::NameValue(value) => {
             let string = match &value.value {
@@ -42,7 +42,11 @@ fn meta(value: &syn::Meta) -> Value {
             json!({"kind": "list", "path": tokens(&list.path),
                    "children": children, "tokens": list.tokens.to_string()})
         }
-    }
+    };
+    data["builtin"] = json!(value.path().get_ident().is_some_and(|name| {
+        rustc_feature::is_builtin_attr_name(rustc_span::Symbol::intern(&name.unraw().to_string()))
+    }));
+    data
 }
 
 fn use_tree(tree: &syn::UseTree) -> Value {
@@ -387,6 +391,10 @@ fn token_ranges(stream: TokenStream, output: &mut Vec<Value>) {
 }
 
 pub fn run() -> Result<(), String> {
+    rustc_span::create_default_session_globals_then(run_with_session)
+}
+
+fn run_with_session() -> Result<(), String> {
     let mut input = String::new();
     io::stdin().read_to_string(&mut input).map_err(|e| e.to_string())?;
     let request: Value = serde_json::from_str(&input).map_err(|e| e.to_string())?;

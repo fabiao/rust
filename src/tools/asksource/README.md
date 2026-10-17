@@ -52,13 +52,19 @@ attribute metadata. It records:
 - Types, generic arguments, parameters, array types, and repeat extents.
 - Expressions, operators, calls, receivers, field access, and constructors.
 - Patterns, local declarations, initializers, blocks, and returned block tails.
-- Attributes and conditional syntax, including alternatives for later filtering.
+- Attributes, compiler-owned builtin classification, and conditional alternatives.
 - Token ranges, literal markers, source hashes, and parent relationships.
 
 Spans refer to UTF-8 byte offsets in the supplied text. File parsing preserves
 the coordinate space of byte-order marks and shebang prefixes. The Python reader
 converts byte spans to character spans when needed and preserves source bytes and
 line endings when loading files.
+Attribute classification uses the linked compiler's builtin registry. The reader
+unwraps Rust's `unsafe(...)` attribute syntax and retains unresolved expansion
+requirements for custom attributes and derives. Those requirements name the
+declaration owner, complete character/byte spans, and inherited cfg conditions.
+Each configured view starts from the original source; filtering one configuration
+cannot erase an alternative needed by another.
 
 Parsing establishes syntax, not name resolution or successful compilation. For
 example, an identifier pattern alone cannot prove that it introduces a binding
@@ -98,8 +104,12 @@ or nodes across builds. The reader binds references to their snapshot and checks
 uniqueness, graph closure, owner agreement, and full source/expansion provenance.
 Origin-only links are rejected; they cannot substitute for a missing handle.
 An imported source projection can carry additional defining-unit provenance;
-its handles still belong to the compiler unit that produced the graph. Matching
-caller and imported views of that unit can resolve each other's graph links.
+its handles still belong to the compiler unit that produced the graph. Graph
+links resolve across files in that unit's validated stream, including
+links from an imported definition to its caller. A compact index retains native
+handles, byte offsets and record hashes; lookup reads one record and checks its
+identity. Source-relative spans accompany only records belonging to that source
+projection. No whole-crate record tree is retained for graph lookup.
 
 ### Native Cargo graph capture
 
