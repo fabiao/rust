@@ -198,6 +198,7 @@ impl CaptureExecutor {
             }
             let record = read_json(&self.record_path(key)).ok()?;
             let facts = read_json(&self.fact_path(key)).ok()?;
+            crate::records::validate(&facts, &self.fact_path(key)).ok()?;
             if record.get("request")? != &self.request
                 || record.get("graph_sha256")?.as_str()? != self.graph_sha256
                 || record.get("producer")? != &self.producer

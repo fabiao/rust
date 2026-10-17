@@ -9,6 +9,7 @@ extern crate rustc_session;
 
 mod syntax;
 mod semantic;
+mod records;
 mod launcher;
 mod cargo_build;
 #[path = "bootstrap_config.rs"]

@@ -15,6 +15,7 @@ use rustc_middle::mono::MonoItem;
 use rustc_span::Span;
 use serde_json::{Value, json};
 use crate::digest;
+use crate::records::{self, Writer as RecordWriter};
 
 #[cfg(feature = "snapshot-driver")]
 use rustc_driver::run_compiler as compiler_entrypoint;
@@ -164,17 +165,18 @@ fn type_identity<'tcx>(tcx: TyCtxt<'tcx>, value: Ty<'tcx>) -> Value {
     }
 }
 
-fn inline_storage<'tcx>(tcx: TyCtxt<'tcx>, value: Ty<'tcx>, ancestors: &mut Vec<Ty<'tcx>>) -> Value {
+fn inline_storage<'tcx>(tcx: TyCtxt<'tcx>, value: Ty<'tcx>, typing_env: ty::TypingEnv<'tcx>,
+    ancestors: &mut Vec<Ty<'tcx>>) -> Value {
     if ancestors.contains(&value) {
         return json!({"kind": "unresolved_cycle", "type": type_identity(tcx, value)});
     }
     ancestors.push(value);
     let storage = match value.kind() {
         ty::Array(element, extent) => json!({"kind": "array", "extent": constant(tcx, *extent),
-            "element": inline_storage(tcx, *element, ancestors)}),
+            "element": inline_storage(tcx, *element, typing_env, ancestors)}),
         ty::Tuple(elements) => {
             let members: Vec<_> = elements.as_slice().iter().enumerate().filter_map(|(index, element)| {
-                let storage = inline_storage(tcx, *element, ancestors);
+                let storage = inline_storage(tcx, *element, typing_env, ancestors);
                 (!storage.is_null()).then(|| json!({"index": index, "storage": storage}))
             }).collect();
             if members.is_empty() { Value::Null } else { json!({"kind": "tuple", "members": members}) }
@@ -184,8 +186,7 @@ fn inline_storage<'tcx>(tcx: TyCtxt<'tcx>, value: Ty<'tcx>, ancestors: &mut Vec<
             for variant in adt.variants().iter() {
                 for field in &variant.fields {
                     let input = field.ty(tcx, args);
-                    let field_type = match tcx.try_normalize_erasing_regions(
-                        ty::TypingEnv::non_body_analysis(tcx, field.did), input) {
+                    let field_type = match tcx.try_normalize_erasing_regions(typing_env, input) {
                         Ok(value) => value,
                         Err(error) => {
                             fields.push(json!({"definition": definition(tcx, field.did),
@@ -193,7 +194,7 @@ fn inline_storage<'tcx>(tcx: TyCtxt<'tcx>, value: Ty<'tcx>, ancestors: &mut Vec<
                             continue;
                         }
                     };
-                    let storage = inline_storage(tcx, field_type, ancestors);
+                    let storage = inline_storage(tcx, field_type, typing_env, ancestors);
                     if !storage.is_null() {
                         fields.push(json!({"variant": definition(tcx, variant.def_id),
                             "definition": definition(tcx, field.did), "type": type_identity(tcx, field_type),
@@ -210,7 +211,7 @@ fn inline_storage<'tcx>(tcx: TyCtxt<'tcx>, value: Ty<'tcx>, ancestors: &mut Vec<
                 ty::Closure(..) => args.as_closure().tupled_upvars_ty(),
                 _ => args.as_coroutine_closure().tupled_upvars_ty(),
             };
-            let storage = inline_storage(tcx, upvars, ancestors);
+            let storage = inline_storage(tcx, upvars, typing_env, ancestors);
             if storage.is_null() { Value::Null } else {
                 let captures: Vec<_> = def.as_local().into_iter().flat_map(|id| tcx.closure_captures(id))
                     .map(|capture| json!({"place": capture.to_string(tcx),
@@ -221,14 +222,13 @@ fn inline_storage<'tcx>(tcx: TyCtxt<'tcx>, value: Ty<'tcx>, ancestors: &mut Vec<
             }
         }
         ty::Coroutine(def, args) => {
-            let captures = inline_storage(tcx, args.as_coroutine().tupled_upvars_ty(), ancestors);
+            let captures = inline_storage(tcx, args.as_coroutine().tupled_upvars_ty(), typing_env, ancestors);
             match tcx.coroutine_layout(*def, args) {
                 Ok(layout) => {
                     let fields: Vec<_> = layout.field_tys.iter().filter_map(|field| {
                         let input = ty::EarlyBinder::bind(tcx, field.ty).instantiate(tcx, args);
-                        let storage = match tcx.try_normalize_erasing_regions(
-                            ty::TypingEnv::non_body_analysis(tcx, *def), input) {
-                            Ok(value) => inline_storage(tcx, value, ancestors),
+                        let storage = match tcx.try_normalize_erasing_regions(typing_env, input) {
+                            Ok(value) => inline_storage(tcx, value, typing_env, ancestors),
                             Err(error) => json!({"kind": "unresolved", "error": format!("{error:?}")}),
                         };
                         (!storage.is_null()).then(|| json!({"origin": origin(tcx, field.source_info.span),
@@ -242,9 +242,9 @@ fn inline_storage<'tcx>(tcx: TyCtxt<'tcx>, value: Ty<'tcx>, ancestors: &mut Vec<
                 Err(error) => json!({"kind": "unresolved", "error": format!("{error:?}")}),
             }
         }
-        ty::Pat(inner, _) => inline_storage(tcx, *inner, ancestors),
+        ty::Pat(inner, _) => inline_storage(tcx, *inner, typing_env, ancestors),
         ty::UnsafeBinder(bound) => inline_storage(tcx,
-            tcx.instantiate_bound_regions_with_erased((*bound).into()), ancestors),
+            tcx.instantiate_bound_regions_with_erased((*bound).into()), typing_env, ancestors),
         ty::Bool | ty::Char | ty::Int(_) | ty::Uint(_) | ty::Float(_) | ty::Str |
         ty::Slice(_) | ty::RawPtr(..) | ty::Ref(..) | ty::FnDef(..) | ty::FnPtr(..) |
         ty::Never => Value::Null,
@@ -254,9 +254,9 @@ fn inline_storage<'tcx>(tcx: TyCtxt<'tcx>, value: Ty<'tcx>, ancestors: &mut Vec<
     storage
 }
 
-fn type_fact<'tcx>(tcx: TyCtxt<'tcx>, value: Ty<'tcx>) -> Value {
+fn type_fact<'tcx>(tcx: TyCtxt<'tcx>, value: Ty<'tcx>, typing_env: ty::TypingEnv<'tcx>) -> Value {
     let mut fact = type_identity(tcx, value);
-    fact["inline_storage"] = inline_storage(tcx, value, &mut Vec::new());
+    fact["inline_storage"] = inline_storage(tcx, value, typing_env, &mut Vec::new());
     fact
 }
 
@@ -266,8 +266,7 @@ fn instance_fact<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::Instance<'tcx>) -> Value
         "arguments": instance.args.as_slice().iter().map(|arg| argument(tcx, *arg)).collect::<Vec<_>>()})
 }
 
-fn instantiated_storage<'tcx>(tcx: TyCtxt<'tcx>) -> Vec<Value> {
-    let mut nodes = Vec::new();
+fn instantiated_storage<'tcx>(tcx: TyCtxt<'tcx>, nodes: &mut RecordWriter) {
     let mut visited = HashSet::new();
     for unit in tcx.collect_and_partition_mono_items(()).codegen_units {
         for (item, _) in unit.items_in_deterministic_order(tcx) {
@@ -278,7 +277,7 @@ fn instantiated_storage<'tcx>(tcx: TyCtxt<'tcx>) -> Vec<Value> {
             for (local, declaration) in body.local_decls.iter_enumerated() {
                 let ty = match instance.try_instantiate_mir_and_normalize_erasing_regions(
                     tcx, ty::TypingEnv::fully_monomorphized(), ty::EarlyBinder::bind(tcx, declaration.ty)) {
-                    Ok(value) => type_fact(tcx, value),
+                    Ok(value) => type_fact(tcx, value, ty::TypingEnv::fully_monomorphized()),
                     Err(error) => json!({"inline_storage": {"kind": "unresolved", "error": format!("{error:?}")}}),
                 };
                 if ty["inline_storage"].is_null() { continue; }
@@ -314,7 +313,6 @@ fn instantiated_storage<'tcx>(tcx: TyCtxt<'tcx>) -> Vec<Value> {
             }
         }
     }
-    nodes
 }
 
 fn resolution(tcx: TyCtxt<'_>, res: Res) -> Value {
@@ -327,24 +325,25 @@ fn resolution(tcx: TyCtxt<'_>, res: Res) -> Value {
     }
 }
 
-struct Facts<'tcx> {
+struct Facts<'tcx, 'records> {
     tcx: TyCtxt<'tcx>,
     typeck: &'tcx ty::TypeckResults<'tcx>,
-    nodes: Vec<Value>,
+    nodes: &'records mut RecordWriter,
 }
 
-impl<'tcx> Facts<'tcx> {
+impl<'tcx> Facts<'tcx, '_> {
     fn node(&self, id: rustc_hir::HirId, span: Span, kind: &str) -> Value {
         let tcx = self.tcx;
         let typeck = self.typeck;
         json!({"kind": kind, "owner": definition(tcx, id.owner.def_id.to_def_id()), "origin": origin(tcx, span),
-            "type": typeck.node_type_opt(id).map(|ty| type_fact(tcx, ty)),
+            "type": typeck.node_type_opt(id).map(|value|
+                type_fact(tcx, value, ty::TypingEnv::post_analysis(tcx, id.owner.def_id))),
             "arguments": typeck.node_args_opt(id).map(|args| args.as_slice().iter().map(|arg| argument(tcx, *arg)).collect::<Vec<_>>()),
             "selected_definition": typeck.type_dependent_def_id(id).map(|def| definition(tcx, def))})
     }
 }
 
-impl<'tcx> Visitor<'tcx> for Facts<'tcx> {
+impl<'tcx> Visitor<'tcx> for Facts<'tcx, '_> {
     fn visit_local(&mut self, local: &'tcx rustc_hir::LetStmt<'tcx>) {
         let mut fact = self.node(local.hir_id, local.span, "local");
         fact["pattern"] = origin(self.tcx, local.pat.span);
@@ -442,12 +441,12 @@ impl<'tcx> Visitor<'tcx> for Facts<'tcx> {
     }
 }
 
-struct ItemReferences<'tcx> {
+struct ItemReferences<'tcx, 'records> {
     tcx: TyCtxt<'tcx>,
-    nodes: Vec<Value>,
+    nodes: &'records mut RecordWriter,
 }
 
-impl<'tcx> Visitor<'tcx> for ItemReferences<'tcx> {
+impl<'tcx> Visitor<'tcx> for ItemReferences<'tcx, '_> {
     fn visit_ty(&mut self, ty: &'tcx rustc_hir::Ty<'tcx, rustc_hir::AmbigArg>) {
         let mut fact = json!({"kind": "type_site", "origin": origin(self.tcx, ty.span)});
         if let rustc_hir::TyKind::Path(rustc_hir::QPath::Resolved(_, path)) = ty.kind {
@@ -471,6 +470,8 @@ struct Capture {
     standard: rustc_driver::TimePassesCallbacks,
     args: Vec<String>,
     pending: Option<Value>,
+    nodes: RecordWriter,
+    definitions: RecordWriter,
     loaded: Arc<Mutex<LoadedInputs>>,
     error: Option<String>,
 }
@@ -498,32 +499,32 @@ impl rustc_driver::Callbacks for Capture {
 }
 
 impl Capture {
-    fn collect(&self, tcx: TyCtxt<'_>) -> Result<Value, String> {
-        let mut nodes = Vec::new();
-        let mut items = ItemReferences { tcx, nodes: Vec::new() };
+    fn collect(&mut self, tcx: TyCtxt<'_>) -> Result<Value, String> {
+        let mut items = ItemReferences { tcx, nodes: &mut self.nodes };
         tcx.hir_visit_all_item_likes_in_crate(&mut items);
-        nodes.extend(items.nodes);
+        self.nodes.check()?;
         for owner in tcx.hir_body_owners() {
-            let mut facts = Facts { tcx, typeck: tcx.typeck(owner), nodes: Vec::new() };
+            let mut facts = Facts { tcx, typeck: tcx.typeck(owner), nodes: &mut self.nodes };
             facts.visit_body(tcx.hir_body_owned_by(owner));
-            nodes.extend(facts.nodes);
+            self.nodes.check()?;
         }
-        nodes.extend(instantiated_storage(tcx));
-        let mut definitions = Vec::new();
+        instantiated_storage(tcx, &mut self.nodes);
+        self.nodes.check()?;
         for id in tcx.iter_local_def_id() {
             let kind = tcx.def_kind(id);
             let ty = if matches!(kind, DefKind::Const | DefKind::Static { .. } | DefKind::AssocConst |
                 DefKind::TyAlias | DefKind::Field | DefKind::Struct | DefKind::Enum | DefKind::Union) {
                 let input = tcx.type_of(id).instantiate_identity();
                 match tcx.try_normalize_erasing_regions(ty::TypingEnv::non_body_analysis(tcx, id), input) {
-                    Ok(value) => Some(type_fact(tcx, value)),
+                    Ok(value) => Some(type_fact(tcx, value, ty::TypingEnv::non_body_analysis(tcx, id))),
                     Err(error) => Some(json!({"kind": "unresolved", "error": format!("{error:?}")})),
                 }
             } else {
                 None
             };
-            definitions.push(json!({"definition": definition(tcx, id.to_def_id()), "kind": format!("{kind:?}"),
+            self.definitions.push(json!({"definition": definition(tcx, id.to_def_id()), "kind": format!("{kind:?}"),
                 "origin": origin(tcx, tcx.def_span(id)), "type": ty}));
+            self.definitions.check()?;
         }
         let mut sources = BTreeMap::new();
         for file in tcx.sess.source_map().files().iter() {
@@ -599,8 +600,7 @@ impl Capture {
             "cwd": cwd, "sysroot": sysroot, "dependency_artifacts": artifacts,
             "cfg": tcx.sess.config.iter().map(|(name, value)| json!([name.as_str(), value.map(|v| v.as_str().to_owned())])).collect::<Vec<_>>(),
             "helper_sha256": helper_hash, "compiler_sha256": compiler_hash,
-            "file_inputs": inputs, "environment_inputs": environment,
-            "definitions": definitions, "nodes": nodes});
+            "file_inputs": inputs, "environment_inputs": environment});
         Ok(response)
     }
 }
@@ -629,6 +629,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
     if !destination.is_absolute() {
         return Err("capture destination must be absolute".into());
     }
+    let lock = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+        .open(destination.with_extension("lock")).map_err(|e| e.to_string())?;
+    lock.lock().map_err(|e| e.to_string())?;
     let mut tool_inputs = BTreeMap::new();
     for path in [&executable, &requested] {
         tool_inputs.insert(path.clone(), digest(&fs::read(path).map_err(|e| e.to_string())?));
@@ -668,6 +671,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
     }
     let effective_environment = crate::launcher::environment(&Default::default())?;
     let mut capture = Capture { standard: rustc_driver::TimePassesCallbacks::default(), args: args.clone(), pending: None, error: None,
+        nodes: RecordWriter::new(&destination, records::field::NODES)?,
+        definitions: RecordWriter::new(&destination, records::field::DEFINITIONS)?,
         loaded: Arc::new(Mutex::new(LoadedInputs::default())) };
     rustc_driver::catch_fatal_errors(|| compiler_entrypoint(&args, &mut capture))
         .map_err(|_| "compiler refused capture".to_owned())?;
@@ -712,6 +717,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
     }
     facts["loaded_inputs"] = serde_json::to_value(&loaded.files).map_err(|e| e.to_string())?;
     facts["input_existence"] = serde_json::to_value(&loaded.exists).map_err(|e| e.to_string())?;
+    facts[records::field::NODES] = capture.nodes.finish()?;
+    facts[records::field::DEFINITIONS] = capture.definitions.finish()?;
     let bytes = serde_json::to_vec(&facts).map_err(|e| e.to_string())?;
     let temporary = destination.with_extension("partial");
     fs::write(&temporary, bytes).map_err(|e| format!("{}: {e}", temporary.display()))?;
