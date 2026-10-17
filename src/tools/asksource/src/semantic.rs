@@ -320,9 +320,14 @@ fn resolution(tcx: TyCtxt<'_>, res: Res) -> Value {
         Res::Def(kind, def) => json!({"kind": format!("{kind:?}"), "definition": definition(tcx, def),
                                     "origin": origin(tcx, tcx.def_span(def))}),
         Res::Local(id) => json!({"kind": "local", "owner": definition(tcx, id.owner.def_id.to_def_id()),
-            "origin": origin(tcx, tcx.hir_span(id))}),
+            "reference": node_reference(tcx, id, tcx.hir_span(id))}),
         _ => json!({"kind": format!("{res:?}")}),
     }
+}
+
+fn node_reference(tcx: TyCtxt<'_>, id: rustc_hir::HirId, span: Span) -> Value {
+    json!({"local_id": id.local_id.as_u32(),
+        "owner": definition(tcx, id.owner.def_id.to_def_id()), "origin": origin(tcx, span)})
 }
 
 struct Facts<'tcx, 'records> {
@@ -335,7 +340,8 @@ impl<'tcx> Facts<'tcx, '_> {
     fn node(&self, id: rustc_hir::HirId, span: Span, kind: &str) -> Value {
         let tcx = self.tcx;
         let typeck = self.typeck;
-        json!({"kind": kind, "owner": definition(tcx, id.owner.def_id.to_def_id()), "origin": origin(tcx, span),
+        json!({"kind": kind, "local_id": id.local_id.as_u32(),
+            "owner": definition(tcx, id.owner.def_id.to_def_id()), "origin": origin(tcx, span),
             "type": typeck.node_type_opt(id).map(|value|
                 type_fact(tcx, value, ty::TypingEnv::post_analysis(tcx, id.owner.def_id))),
             "arguments": typeck.node_args_opt(id).map(|args| args.as_slice().iter().map(|arg| argument(tcx, *arg)).collect::<Vec<_>>()),
@@ -344,11 +350,17 @@ impl<'tcx> Facts<'tcx, '_> {
 }
 
 impl<'tcx> Visitor<'tcx> for Facts<'tcx, '_> {
+    fn visit_block(&mut self, block: &'tcx rustc_hir::Block<'tcx>) {
+        let fact = self.node(block.hir_id, block.span, "block");
+        self.nodes.push(fact);
+        intravisit::walk_block(self, block);
+    }
+
     fn visit_local(&mut self, local: &'tcx rustc_hir::LetStmt<'tcx>) {
         let mut fact = self.node(local.hir_id, local.span, "local");
-        fact["pattern"] = origin(self.tcx, local.pat.span);
-        fact["initializer"] = local.init.map(|expr| origin(self.tcx, expr.span)).unwrap_or(Value::Null);
-        fact["else"] = local.els.map(|block| origin(self.tcx, block.span)).unwrap_or(Value::Null);
+        fact["pattern"] = node_reference(self.tcx, local.pat.hir_id, local.pat.span);
+        fact["initializer"] = local.init.map(|expr| node_reference(self.tcx, expr.hir_id, expr.span)).unwrap_or(Value::Null);
+        fact["else"] = local.els.map(|block| node_reference(self.tcx, block.hir_id, block.span)).unwrap_or(Value::Null);
         self.nodes.push(fact);
         intravisit::walk_local(self, local);
     }
@@ -375,11 +387,11 @@ impl<'tcx> Visitor<'tcx> for Facts<'tcx, '_> {
         match expr.kind {
             ExprKind::Binary(operator, left, right) => {
                 fact["operator"] = json!(operator.node.as_str());
-                fact["operands"] = json!([origin(self.tcx, left.span), origin(self.tcx, right.span)]);
+                fact["operands"] = json!([node_reference(self.tcx, left.hir_id, left.span), node_reference(self.tcx, right.hir_id, right.span)]);
             }
             ExprKind::Unary(operator, operand) => {
                 fact["operator"] = json!(operator.as_str());
-                fact["operands"] = json!([origin(self.tcx, operand.span)]);
+                fact["operands"] = json!([node_reference(self.tcx, operand.hir_id, operand.span)]);
             }
             ExprKind::Lit(literal) => {
                 fact["integer_digits"] = match literal.node {
@@ -388,18 +400,18 @@ impl<'tcx> Visitor<'tcx> for Facts<'tcx, '_> {
                 };
             }
             ExprKind::Cast(operand, _) | ExprKind::Type(operand, _) | ExprKind::DropTemps(operand) => {
-                fact["operands"] = json!([origin(self.tcx, operand.span)]);
+                fact["operands"] = json!([node_reference(self.tcx, operand.hir_id, operand.span)]);
             }
             ExprKind::Path(ref path) => {
                 fact["resolution"] = resolution(self.tcx, self.typeck.qpath_res(path, expr.hir_id));
             }
             ExprKind::Call(callee, arguments) => {
-                fact["callee"] = origin(self.tcx, callee.span);
-                fact["operands"] = json!(arguments.iter().map(|arg| origin(self.tcx, arg.span)).collect::<Vec<_>>());
+                fact["callee"] = node_reference(self.tcx, callee.hir_id, callee.span);
+                fact["operands"] = json!(arguments.iter().map(|arg| node_reference(self.tcx, arg.hir_id, arg.span)).collect::<Vec<_>>());
             }
             ExprKind::MethodCall(_, receiver, arguments, _) => {
-                fact["receiver"] = origin(self.tcx, receiver.span);
-                fact["operands"] = json!(arguments.iter().map(|arg| origin(self.tcx, arg.span)).collect::<Vec<_>>());
+                fact["receiver"] = node_reference(self.tcx, receiver.hir_id, receiver.span);
+                fact["operands"] = json!(arguments.iter().map(|arg| node_reference(self.tcx, arg.hir_id, arg.span)).collect::<Vec<_>>());
             }
             ExprKind::Struct(path, fields, ..) => {
                 let resolved = self.typeck.qpath_res(path, expr.hir_id);
@@ -407,7 +419,7 @@ impl<'tcx> Visitor<'tcx> for Facts<'tcx, '_> {
                 let mut assignments = Vec::new();
                 for field in fields {
                     let mut assignment = json!({"origin": origin(self.tcx, field.span),
-                        "value": origin(self.tcx, field.expr.span)});
+                        "value": node_reference(self.tcx, field.expr.hir_id, field.expr.span)});
                     if let ty::Adt(adt, _) = self.typeck.expr_ty(expr).kind() {
                         if let Some(index) = self.typeck.opt_field_index(field.hir_id) {
                             if let Some(definition_field) = adt.variant_of_res(resolved).fields.get(index) {
@@ -420,7 +432,7 @@ impl<'tcx> Visitor<'tcx> for Facts<'tcx, '_> {
                 fact["fields"] = json!(assignments);
             }
             ExprKind::Field(base, _) => {
-                fact["receiver"] = origin(self.tcx, base.span);
+                fact["receiver"] = node_reference(self.tcx, base.hir_id, base.span);
                 let typeck = self.typeck;
                 if let Some(index) = typeck.opt_field_index(expr.hir_id) {
                     if let ty::Adt(adt, _) = typeck.expr_ty_adjusted(base).kind() {
@@ -442,7 +454,7 @@ impl<'tcx> Visitor<'tcx> for Facts<'tcx, '_> {
             rustc_hir::PatKind::Binding(_, id, name, _) => {
                 fact["role"] = json!("binding");
                 fact["name"] = json!(name.name.to_string());
-                fact["binding_origin"] = origin(self.tcx, self.tcx.hir_span(id));
+                fact["binding_reference"] = node_reference(self.tcx, id, self.tcx.hir_span(id));
                 fact["binding_mode"] = json!(format!("{:?}", self.typeck.pat_binding_modes().get(pat.hir_id)));
             }
             rustc_hir::PatKind::Struct(ref path, ..) | rustc_hir::PatKind::TupleStruct(ref path, ..) => {
@@ -481,7 +493,7 @@ impl<'tcx> Visitor<'tcx> for ItemReferences<'tcx, '_> {
     }
 
     fn visit_const_arg(&mut self, arg: &'tcx rustc_hir::ConstArg<'tcx, rustc_hir::AmbigArg>) {
-        let mut fact = json!({"kind": "const_argument", "origin": origin(self.tcx, arg.span)});
+        let mut fact = json!({"kind": "const_argument", "origin": node_reference(self.tcx, arg.hir_id, arg.span)});
         if let rustc_hir::ConstArgKind::Path(rustc_hir::QPath::Resolved(_, path)) = arg.kind {
             fact["resolution"] = resolution(self.tcx, path.res);
         }
