@@ -1,22 +1,28 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde_json::{Value, json};
 
 use crate::core::builder::{Builder, Kind};
+use crate::core::config::DryRun;
 use crate::core::session::Mode;
 use crate::utils::exec::{BootstrapCommand, CommandFingerprint};
+
+use sdk::{command_context, read_json};
 
 #[allow(dead_code, reason = "shared with the compiler shim and installed source helper")]
 #[path = "launcher.rs"]
 mod launcher;
 
 #[path = "bootstrap_config.rs"]
+#[allow(dead_code, reason = "shared SDK capture configuration")]
 mod config;
+
+#[path = "sdk.rs"]
+#[allow(dead_code, reason = "shared by the Python frontend helper and Rust bootstrap collector")]
+mod sdk;
 
 #[derive(Default)]
 pub(crate) struct Capture {
@@ -30,40 +36,8 @@ struct Run {
     request: Value,
     directory: PathBuf,
     _lock: File,
+    frontend: Value,
     prepared: BTreeMap<String, (CommandFingerprint, Value)>,
-}
-
-fn read_json(path: &Path) -> Result<Value, String> {
-    serde_json::from_slice(&fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?)
-        .map_err(|e| format!("{}: {e}", path.display()))
-}
-
-fn command_context(command: &Command) -> Result<Value, String> {
-    let overlays = command
-        .get_envs()
-        .map(|(name, value)| {
-            Ok((
-                name.to_str().ok_or("non-UTF-8 Cargo environment key")?.to_owned(),
-                value.map(ToOwned::to_owned),
-            ))
-        })
-        .collect::<Result<_, String>>()?;
-    launcher::snapshot(
-        Path::new(command.get_program()),
-        &command.get_args().map(ToOwned::to_owned).collect::<Vec<_>>(),
-        command.get_current_dir().unwrap_or(&std::env::current_dir().map_err(|e| e.to_string())?),
-        &overlays,
-    )
-}
-
-fn effective_env(command: &Command, name: &str) -> Option<OsString> {
-    command
-        .get_envs()
-        .find(|(key, _)| {
-            launcher::environment_key(&key.to_string_lossy()) == launcher::environment_key(name)
-        })
-        .map(|(_, value)| value.map(ToOwned::to_owned))
-        .unwrap_or_else(|| std::env::var_os(name))
 }
 
 impl Capture {
@@ -74,7 +48,7 @@ impl Capture {
         if builder.kind != Kind::Build {
             return Err("--ask-source-request requires a build".into());
         }
-        if builder.config.dry_run() {
+        if matches!(builder.config.get_dry_run(), DryRun::UserSelected) {
             return Ok(());
         }
         let invocation = builder
@@ -109,10 +83,16 @@ impl Capture {
         if complete.exists() {
             fs::remove_file(complete).map_err(|e| e.to_string())?;
         }
+        let request_sha256 = launcher::digest(&bytes);
+        let frontend = sdk::completed_frontend(&directory, &invocation, &request_path, &request_sha256)?;
+        if builder.config.dry_run() {
+            return Ok(());
+        }
         *self.run.borrow_mut() = Some(Run {
             invocation,
             request_path,
-            request_sha256: launcher::digest(&bytes),
+            request_sha256,
+            frontend,
             request,
             directory,
             _lock: lock,
@@ -155,104 +135,30 @@ impl Capture {
         let Some(run) = state.take() else {
             return Ok(());
         };
-        if run.prepared.is_empty() {
-            return Err("no SDK Cargo build commands were selected".into());
+        let frontend = sdk::completed_frontend(&run.directory, &run.invocation,
+            &run.request_path, &run.request_sha256)?;
+        if frontend != run.frontend {
+            return Err("frontend receipt changed during SDK provisioning".into());
         }
-        let mut builds = BTreeMap::new();
+        let frontend_context = frontend["context"].clone();
+        let frontend_key = launcher::digest(&serde_json::to_vec(&frontend_context).map_err(|e| e.to_string())?);
+        let mut builds = BTreeMap::from([(frontend_key.clone(), frontend)]);
         let mut covered = BTreeSet::new();
         for (key, (fingerprint, context)) in &run.prepared {
             let original = fingerprint.command();
-            if command_context(&original)? != context["invocation"] {
-                return Err("prepared SDK Cargo inputs changed during provisioning".into());
-            }
-            let arguments: Vec<_> = original.get_args().collect();
-            if arguments.first().is_none_or(|arg| arg.to_str() != Some("build")) {
-                return Err("SDK capture requires the original Cargo build command".into());
-            }
-            let compiler = PathBuf::from(
-                effective_env(&original, "RUSTC_REAL").ok_or("missing SDK compiler selection")?,
-            );
-            let compiler = fs::canonicalize(&compiler).map_err(|e| e.to_string())?;
-            let helper = compiler.with_file_name(if cfg!(windows) {
-                "cargo-asksource.exe"
-            } else {
-                "cargo-asksource"
-            });
-            let helper_sha256 = launcher::digest(
-                &fs::read(&helper)
-                    .map_err(|e| format!("provision matching helper {}: {e}", helper.display()))?,
-            );
-            let shim = fs::canonicalize(PathBuf::from(
-                effective_env(&original, "RUSTC_WRAPPER").ok_or("missing bootstrap shim")?,
-            ))
-            .map_err(|e| e.to_string())?;
-            let shim_sha256 = launcher::digest(&fs::read(&shim).map_err(|e| e.to_string())?);
-            let directory = run.directory.join(key);
-            fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
-            let request_path = directory.join("request.json");
-            let request = json!({"directory": directory, "sources": run.request["sources"],
-                "graph": {"selected": run.request["graph"], "bootstrap": context, "seed_sha256": run.request_sha256},
-                "compiler_shims": {(shim.to_str().ok_or("non-UTF-8 shim path")?): shim_sha256}});
-            let request_bytes = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
-            fs::write(&request_path, &request_bytes).map_err(|e| e.to_string())?;
-            let original_path =
-                effective_env(&original, "PATH").ok_or("Cargo discovery requires PATH")?;
-            let original_path =
-                original_path.to_str().ok_or("Cargo discovery PATH is not UTF-8")?;
-            let helper_directory = helper.parent().ok_or("helper has no parent")?;
-            let mut paths: Vec<_> = std::env::split_paths(original_path).collect();
-            paths.push(helper_directory.to_path_buf());
-            let injected_path = std::env::join_paths(paths).map_err(|e| e.to_string())?;
-            let identity = fingerprint.command();
-            // Identity uses the same producer and context, replacing only its Cargo subcommand.
-            let mut identity_args = Command::new(identity.get_program());
-            identity_args.args(["asksource", "identity"]);
-            copy_context(&identity, &mut identity_args);
-            identity_args.env("PATH", &injected_path);
-            let identity = identity_args.output().map_err(|e| e.to_string())?;
-            if !identity.status.success() {
-                return Err(format!(
-                    "cannot discover SDK source helper: {}",
-                    String::from_utf8_lossy(&identity.stderr)
-                ));
-            }
-            let identity: Value =
-                serde_json::from_slice(&identity.stdout).map_err(|e| e.to_string())?;
-            if identity["sha256"] != helper_sha256
-                || identity["path"].as_str().is_none_or(|path| Path::new(path) != helper)
-            {
-                return Err("Cargo discovered a different SDK source helper".into());
-            }
-            let mut capture = Command::new(original.get_program());
-            capture
-                .args(["asksource", "build", "--discovery-context"])
-                .arg(json!({"original": original_path, "injected": helper_directory}).to_string())
-                .arg("--capture-request")
-                .arg(&request_path)
-                .args(arguments.iter().skip(1));
-            copy_context(&original, &mut capture);
-            capture.env("PATH", injected_path);
-            builder.info(&format!(
-                "Capturing SDK {} graph: stage{} {}",
-                context["mode"], context["stage"], context["target"]
-            ));
-            if !BootstrapCommand::from(capture).allow_failure().run(&builder.config.exec_ctx) {
-                return Err(format!("SDK capture failed for {}", context["target"]));
-            }
-            let path = directory.join("build.json");
-            let document = read_json(&path)?;
-            if document["complete"] != true || document["request"] != request {
-                return Err("SDK capture omitted its complete native graph".into());
-            }
+            builder.info(&format!("Capturing SDK {} graph: stage{} {}",
+                context["mode"], context["stage"], context["target"]));
+            let descriptor = sdk::capture(&original, context, &run.request,
+                &run.request_sha256, &run.directory)?;
+            builds.insert(key.clone(), descriptor);
+        }
+        for descriptor in builds.values() {
+            let document = read_json(Path::new(descriptor["path"].as_str().ok_or("missing SDK native graph")?))?;
             for (unit, _) in document["facts"].as_object().ok_or("missing SDK unit facts")? {
                 let source = document["graph"]["units"][unit]["unit"]["target"]["src_path"]
-                    .as_str()
-                    .ok_or("missing SDK unit root")?;
+                    .as_str().ok_or("missing SDK unit root")?;
                 covered.insert(fs::canonicalize(source).map_err(|e| e.to_string())?);
             }
-            builds.insert(key.clone(), json!({"path": path, "sha256": launcher::digest(&fs::read(&path).map_err(|e| e.to_string())?),
-                "request_path": request_path, "request_sha256": launcher::digest(&request_bytes), "context": context,
-                "compiler": compiler, "helper": helper, "helper_sha256": helper_sha256}));
         }
         for source in run.request["sources"].as_array().ok_or("missing SDK source roots")? {
             let source = source.as_str().ok_or("invalid SDK source root")?;
@@ -267,8 +173,9 @@ impl Capture {
         {
             return Err("SDK seed changed during capture".into());
         }
-        let contexts: BTreeMap<_, _> =
-            run.prepared.iter().map(|(key, (_, context))| (key, context)).collect();
+        let mut contexts: BTreeMap<_, _> =
+            run.prepared.iter().map(|(key, (_, context))| (key.clone(), context.clone())).collect();
+        contexts.insert(frontend_key, frontend_context);
         let document = json!({"complete": true, "invocation": run.invocation, "request": run.request, "request_path": run.request_path,
             "request_sha256": run.request_sha256, "contexts": contexts, "builds": builds});
         let partial = run.directory.join("builds.partial");
@@ -276,18 +183,5 @@ impl Capture {
             .map_err(|e| e.to_string())?;
         fs::rename(partial, run.directory.join("builds.json")).map_err(|e| e.to_string())?;
         Ok(())
-    }
-}
-
-fn copy_context(source: &Command, destination: &mut Command) {
-    for (name, value) in source.get_envs() {
-        if let Some(value) = value {
-            destination.env(name, value);
-        } else {
-            destination.env_remove(name);
-        }
-    }
-    if let Some(cwd) = source.get_current_dir() {
-        destination.current_dir(cwd);
     }
 }

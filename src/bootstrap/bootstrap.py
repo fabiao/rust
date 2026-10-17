@@ -552,6 +552,9 @@ class FakeArgs:
         self.build = ""
         self.build_dir = ""
         self.clean = False
+        self.ask_source_request = None
+        self.ask_source_run = None
+        self.dry_run = False
         self.verbose = False
         self.json_output = False
         self.color = "auto"
@@ -571,6 +574,7 @@ class RustBuild(object):
 
         self.config_toml = config_toml
 
+        self.args = args
         self.clean = args.clean
         self.json_output = args.json_output
         self.verbose = args.verbose
@@ -1060,6 +1064,14 @@ class RustBuild(object):
         args = self.build_bootstrap_cmd(env)
         # Run this from the source directory so cargo finds .cargo/config
         run(args, env=env, verbose=self.verbose, cwd=self.rust_root)
+        if self.args.ask_source_request and not self.args.dry_run:
+            if not self.args.ask_source_run:
+                raise Exception("frontend capture requires --ask-source-run")
+            helper = os.path.join(os.path.dirname(os.path.realpath(env["RUSTC"])),
+                                  "cargo-asksource" + EXE_SUFFIX)
+            run([helper, "sdk-frontend", os.path.realpath(self.args.ask_source_request),
+                 self.args.ask_source_run, self.build, "--"] + args,
+                env=env, verbose=self.verbose, cwd=self.rust_root)
 
         if "GITHUB_ACTIONS" in env:
             print("::endgroup::")
@@ -1304,6 +1316,9 @@ def parse_args(args):
     parser.add_argument("--build")
     parser.add_argument("--color", choices=["always", "never", "auto"])
     parser.add_argument("--clean", action="store_true")
+    parser.add_argument("--ask-source-request")
+    parser.add_argument("--ask-source-run")
+    parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--json-output", action="store_true")
     parser.add_argument(
         "--warnings", choices=["deny", "warn", "default"], default="default"

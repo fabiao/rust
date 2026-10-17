@@ -11,6 +11,11 @@ mod syntax;
 mod semantic;
 mod launcher;
 mod cargo_build;
+#[path = "bootstrap_config.rs"]
+#[allow(dead_code, reason = "shared SDK capture configuration")]
+mod config;
+#[allow(dead_code, reason = "shared by the Python frontend helper and Rust bootstrap collector")]
+mod sdk;
 
 use std::process::ExitCode;
 pub(crate) use launcher::digest;
@@ -28,6 +33,7 @@ fn main() -> ExitCode {
         Some("source") => syntax::run(),
         Some("identity") => cargo_build::identity(),
         Some("build") => cargo_build::run(&args[1..]),
+        Some("sdk-frontend") => sdk::frontend(&args[2..]),
         Some("capture") => semantic::run(&args[2..]),
         _ => Err("usage: cargo asksource build --capture-request <request> [Cargo options] | cargo-asksource source | capture --output <facts> -- <rustc> <arguments>".into()),
     };

@@ -5,6 +5,7 @@ pub mod environment {
 
 pub mod build_mode {
     // Stable context names describe the prepared bootstrap Cargo command.
+    pub const FRONTEND: &str = "frontend";
     pub const STD: &str = "std";
     pub const RUSTC: &str = "rustc";
     pub const CODEGEN: &str = "codegen";
@@ -14,7 +15,7 @@ pub mod build_mode {
     pub const TOOL_RUSTC_PRIVATE: &str = "tool-rustc-private";
 
     const _: () = {
-        let names = [STD, RUSTC, CODEGEN, TOOL_BOOTSTRAP, TOOL_TARGET, TOOL_STD, TOOL_RUSTC_PRIVATE];
+        let names = [FRONTEND, STD, RUSTC, CODEGEN, TOOL_BOOTSTRAP, TOOL_TARGET, TOOL_STD, TOOL_RUSTC_PRIVATE];
         let mut left = 0;
         while left < names.len() {
             let mut right = left + 1;
