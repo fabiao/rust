@@ -493,7 +493,7 @@ impl<'tcx> Visitor<'tcx> for ItemReferences<'tcx, '_> {
     }
 
     fn visit_const_arg(&mut self, arg: &'tcx rustc_hir::ConstArg<'tcx, rustc_hir::AmbigArg>) {
-        let mut fact = json!({"kind": "const_argument", "origin": node_reference(self.tcx, arg.hir_id, arg.span)});
+        let mut fact = json!({"kind": "const_argument", "origin": origin(self.tcx, arg.span)});
         if let rustc_hir::ConstArgKind::Path(rustc_hir::QPath::Resolved(_, path)) = arg.kind {
             fact["resolution"] = resolution(self.tcx, path.res);
         }
