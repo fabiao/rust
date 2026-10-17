@@ -145,11 +145,9 @@ fn main() -> ExitCode {
     reject_forbidden_target_features(&args);
     reject_unstable_flags(&args);
 
-    // `rustc_driver::run_compiler` itself drops `args[0]` (the program
-    // name) internally, so the compiler's own args start at `args[1]` —
-    // pass the full `args`, not `&args[1..]`.
+    // The driver discards the program name; retain it in the argument vector.
     let mut callbacks = Ssc2ComparatorCalls { budget };
-    match rustc_driver::catch_fatal_errors(|| rustc_driver::run_compiler(&args, &mut callbacks)) {
+    match rustc_driver::catch_fatal_errors(|| rustc_driver::compiler_entrypoint(&args, &mut callbacks)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(_) => ExitCode::FAILURE,
     }
