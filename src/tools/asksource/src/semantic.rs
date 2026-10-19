@@ -7,10 +7,11 @@ use rustc_span::source_map::{FileLoader, RealFileLoader};
 
 use rustc_driver::Compilation;
 use rustc_hir::def::{DefKind, Res};
+use rustc_hir::def_id::LocalDefId;
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::pat_util::EnumerateAndAdjustIterator;
 use rustc_interface::interface;
-use rustc_middle::ty::{self, Ty, TyCtxt};
+use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt};
 use rustc_middle::ty::consts::ConstExt;
 use rustc_middle::mono::MonoItem;
 use rustc_span::Span;
@@ -267,13 +268,35 @@ fn instance_fact<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::Instance<'tcx>) -> Value
         "arguments": instance.args.as_slice().iter().map(|arg| argument(tcx, *arg)).collect::<Vec<_>>()})
 }
 
-fn instantiated_storage<'tcx>(tcx: TyCtxt<'tcx>, nodes: &mut RecordWriter) {
+fn source_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::Instance<'tcx>,
+    instances: &mut HashMap<LocalDefId, Vec<ty::Instance<'tcx>>>)
+{
+    let ty::InstanceKind::Item(def) = instance.def else { return };
+    let Some(owner) = def.as_local() else { return };
+    if tcx.hir_maybe_body_owned_by(owner).is_none() { return; }
+    let selected = instances.entry(owner).or_default();
+    if !selected.contains(&instance) { selected.push(instance); }
+}
+
+fn instantiated_storage<'tcx>(tcx: TyCtxt<'tcx>, nodes: &mut RecordWriter)
+    -> HashMap<LocalDefId, Vec<ty::Instance<'tcx>>>
+{
     let mut visited = HashSet::new();
+    let mut instances = HashMap::new();
     for unit in tcx.collect_and_partition_mono_items(()).codegen_units {
         for (item, _) in unit.items_in_deterministic_order(tcx) {
             let MonoItem::Fn(instance) = item else { continue };
             if !visited.insert(instance) { continue; }
+            source_instance(tcx, instance, &mut instances);
             let body = tcx.instance_mir(instance.def);
+            for scope in &body.source_scopes {
+                if let Some((callee, _)) = scope.inlined {
+                    if let Ok(callee) = instance.try_instantiate_mir_and_normalize_erasing_regions(
+                        tcx, ty::TypingEnv::fully_monomorphized(), ty::EarlyBinder::bind(tcx, callee)) {
+                        source_instance(tcx, callee, &mut instances);
+                    }
+                }
+            }
             let descriptor = instance_fact(tcx, instance);
             for (local, declaration) in body.local_decls.iter_enumerated() {
                 let ty = match instance.try_instantiate_mir_and_normalize_erasing_regions(
@@ -314,6 +337,7 @@ fn instantiated_storage<'tcx>(tcx: TyCtxt<'tcx>, nodes: &mut RecordWriter) {
             }
         }
     }
+    instances
 }
 
 fn resolution(tcx: TyCtxt<'_>, res: Res) -> Value {
@@ -334,10 +358,25 @@ fn node_reference(tcx: TyCtxt<'_>, id: rustc_hir::HirId, span: Span) -> Value {
 struct Facts<'tcx, 'records> {
     tcx: TyCtxt<'tcx>,
     typeck: &'tcx ty::TypeckResults<'tcx>,
+    body_owner: LocalDefId,
     nodes: &'records mut RecordWriter,
+    instances: &'records [ty::Instance<'tcx>],
 }
 
 impl<'tcx> Facts<'tcx, '_> {
+    fn type_instantiations(&self, id: rustc_hir::HirId) -> Vec<Value> {
+        let Some(input) = self.typeck.node_type_opt(id) else { return Vec::new() };
+        if !input.has_non_region_param() { return Vec::new(); }
+        self.instances.iter().map(|instance| {
+            let (ty, error) = match self.tcx.try_instantiate_and_normalize_erasing_regions(
+                instance.args, ty::TypingEnv::fully_monomorphized(), ty::EarlyBinder::bind(self.tcx, input)) {
+                Ok(value) => (type_fact(self.tcx, value, ty::TypingEnv::fully_monomorphized()), Value::Null),
+                Err(error) => (Value::Null, json!(format!("{error:?}"))),
+            };
+            json!({"instance": instance_fact(self.tcx, *instance), "type": ty, "error": error})
+        }).collect()
+    }
+
     fn initializer_projection(&self, pat: &'tcx rustc_hir::Pat<'tcx>, local: rustc_hir::HirId)
         -> Result<Vec<Value>, &'static str>
     {
@@ -664,6 +703,8 @@ impl<'tcx> Visitor<'tcx> for Facts<'tcx, '_> {
             rustc_hir::PatKind::Binding(_, id, name, _) => {
                 fact["role"] = json!("binding");
                 fact["name"] = json!(name.name.to_string());
+                fact["body_owner"] = definition(self.tcx, self.body_owner.to_def_id());
+                fact["type_instantiations"] = json!(self.type_instantiations(pat.hir_id));
                 fact["binding_reference"] = node_reference(self.tcx, id, self.tcx.hir_span(id));
                 fact["binding_mode"] = self.typeck.pat_binding_modes().get(pat.hir_id).map(|mode| {
                     match mode.0 {
@@ -776,15 +817,16 @@ impl Capture {
         tcx.hir_visit_all_item_likes_in_crate(&mut items);
         self.nodes.check()?;
         let mut bodies = HashMap::new();
+        let instances = instantiated_storage(tcx, &mut self.nodes);
+        self.nodes.check()?;
         for owner in tcx.hir_body_owners() {
-            let mut facts = Facts { tcx, typeck: tcx.typeck(owner), nodes: &mut self.nodes };
+            let mut facts = Facts { tcx, typeck: tcx.typeck(owner), body_owner: owner, nodes: &mut self.nodes,
+                instances: instances.get(&owner).map(Vec::as_slice).unwrap_or(&[]) };
             let body = tcx.hir_body_owned_by(owner);
             bodies.insert(owner, node_reference(tcx, body.value.hir_id, body.value.span));
             facts.visit_body(body);
             self.nodes.check()?;
         }
-        instantiated_storage(tcx, &mut self.nodes);
-        self.nodes.check()?;
         for id in tcx.iter_local_def_id() {
             let kind = tcx.def_kind(id);
             let ty = if matches!(kind, DefKind::Const | DefKind::Static { .. } | DefKind::AssocConst |
