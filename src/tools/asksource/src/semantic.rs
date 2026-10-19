@@ -8,6 +8,7 @@ use rustc_span::source_map::{FileLoader, RealFileLoader};
 use rustc_driver::Compilation;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::intravisit::{self, Visitor};
+use rustc_hir::pat_util::EnumerateAndAdjustIterator;
 use rustc_interface::interface;
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_middle::ty::consts::ConstExt;
@@ -337,6 +338,113 @@ struct Facts<'tcx, 'records> {
 }
 
 impl<'tcx> Facts<'tcx, '_> {
+    fn initializer_projection(&self, pat: &'tcx rustc_hir::Pat<'tcx>, local: rustc_hir::HirId)
+        -> Result<Vec<Value>, &'static str>
+    {
+        use rustc_hir::PatKind;
+        let mut child = pat.hir_id;
+        let mut projection = Vec::new();
+        for (id, node) in self.tcx.hir_parent_iter(pat.hir_id) {
+            if id == local {
+                projection.reverse();
+                return Ok(projection);
+            }
+            match node {
+                rustc_hir::Node::Pat(parent) => {
+                    if self.typeck.pat_adjustments().get(parent.hir_id).is_some_and(|steps| !steps.is_empty()) {
+                        return Err("implicit pattern adjustment requires reference-flow evidence");
+                    }
+                    match parent.kind {
+                        PatKind::Binding(_, _, _, Some(inner)) if inner.hir_id == child => {}
+                        PatKind::Tuple(elements, rest) => {
+                            let Some(ty) = self.typeck.node_type_opt(parent.hir_id) else {
+                                return Err("tuple pattern has no checked type");
+                            };
+                            let ty::Tuple(types) = ty.kind() else {
+                                return Err("tuple pattern has no checked tuple shape");
+                            };
+                            if elements.len() > types.len() {
+                                return Err("tuple pattern exceeds its checked shape");
+                            }
+                            let Some((index, _)) = elements.iter().enumerate_and_adjust(types.len(), rest)
+                                .find(|(_, element)| element.hir_id == child) else {
+                                return Err("binding has no checked tuple element");
+                            };
+                            projection.push(json!({"kind": "tuple", "index": index}));
+                        }
+                        PatKind::Struct(ref path, fields, _) => {
+                            let Some(field) = fields.iter().find(|field| field.hir_id == child) else {
+                                return Err("binding has no checked pattern field");
+                            };
+                            let Some(ty) = self.typeck.node_type_opt(parent.hir_id) else {
+                                return Err("struct pattern has no checked type");
+                            };
+                            let ty::Adt(adt, _) = ty.kind() else {
+                                return Err("struct pattern has no checked ADT shape");
+                            };
+                            let resolved = self.typeck.qpath_res(path, parent.hir_id);
+                            let Some(index) = self.typeck.opt_field_index(field.hir_id) else {
+                                return Err("pattern field has no checked index");
+                            };
+                            let Some(field) = adt.variant_of_res(resolved).fields.get(index) else {
+                                return Err("pattern field exceeds its checked ADT shape");
+                            };
+                            projection.push(json!({"kind": "adt", "definition": definition(self.tcx, field.did)}));
+                        }
+                        PatKind::TupleStruct(ref path, elements, rest) => {
+                            let Some(ty) = self.typeck.node_type_opt(parent.hir_id) else {
+                                return Err("tuple constructor pattern has no checked type");
+                            };
+                            let ty::Adt(adt, _) = ty.kind() else {
+                                return Err("tuple constructor pattern has no checked ADT shape");
+                            };
+                            let fields = &adt.variant_of_res(self.typeck.qpath_res(path, parent.hir_id)).fields;
+                            if elements.len() > fields.len() {
+                                return Err("tuple constructor pattern exceeds its checked shape");
+                            }
+                            let Some((index, _)) = elements.iter().enumerate_and_adjust(fields.len(), rest)
+                                .find(|(_, element)| element.hir_id == child) else {
+                                return Err("binding has no checked constructor element");
+                            };
+                            let Some(field) = fields.iter().nth(index) else {
+                                return Err("binding has no checked constructor field");
+                            };
+                            projection.push(json!({"kind": "adt", "definition": definition(self.tcx, field.did)}));
+                        }
+                        PatKind::Slice(before, _, after) => {
+                            let Some(ty) = self.typeck.node_type_opt(parent.hir_id) else {
+                                return Err("array pattern has no checked type");
+                            };
+                            let ty::Array(_, length) = ty.kind() else {
+                                return Err("slice pattern requires a captured fixed array length");
+                            };
+                            let Some(length) = length.try_to_target_usize(self.tcx)
+                                .and_then(|length| usize::try_from(length).ok()) else {
+                                return Err("array pattern length remains unresolved");
+                            };
+                            if before.len() + after.len() > length {
+                                return Err("array pattern exceeds its checked shape");
+                            }
+                            let index = before.iter().position(|element| element.hir_id == child)
+                                .or_else(|| after.iter().position(|element| element.hir_id == child)
+                                    .map(|index| length - after.len() + index));
+                            let Some(index) = index else {
+                                return Err("slice-rest binding requires array-view flow evidence");
+                            };
+                            projection.push(json!({"kind": "array", "index": index}));
+                        }
+                        PatKind::Or(_) => return Err("or-pattern requires selected-branch evidence"),
+                        _ => return Err("pattern requires additional initializer-flow evidence"),
+                    }
+                }
+                rustc_hir::Node::PatField(_) => {}
+                _ => return Err("binding projection has no direct declaring local"),
+            }
+            child = id;
+        }
+        Err("binding projection has no captured declaration path")
+    }
+
     fn node(&self, id: rustc_hir::HirId, span: Span, kind: &str) -> Value {
         let tcx = self.tcx;
         let typeck = self.typeck;
@@ -418,6 +526,7 @@ impl<'tcx> Visitor<'tcx> for Facts<'tcx, '_> {
             ExprKind::Struct(..) => "constructor",
             ExprKind::Repeat(..) => "repeat",
             ExprKind::Array(..) => "array_value",
+            ExprKind::Tup(..) => "tuple_value",
             ExprKind::Binary(..) => "binary",
             ExprKind::Unary(..) => "unary",
             ExprKind::Lit(..) => "literal",
@@ -428,6 +537,17 @@ impl<'tcx> Visitor<'tcx> for Facts<'tcx, '_> {
         };
         let mut fact = self.node(expr.hir_id, expr.span, kind);
         match expr.kind {
+            ExprKind::Tup(elements) => {
+                fact["operands"] = json!(elements.iter().map(|element|
+                    node_reference(self.tcx, element.hir_id, element.span)).collect::<Vec<_>>());
+            }
+            ExprKind::Array(elements) => {
+                fact["operands"] = json!(elements.iter().map(|element|
+                    node_reference(self.tcx, element.hir_id, element.span)).collect::<Vec<_>>());
+            }
+            ExprKind::Repeat(value, _) => {
+                fact["operands"] = json!([node_reference(self.tcx, value.hir_id, value.span)]);
+            }
             ExprKind::Binary(operator, left, right) => {
                 fact["operator"] = json!(operator.node.as_str());
                 fact["operands"] = json!([node_reference(self.tcx, left.hir_id, left.span), node_reference(self.tcx, right.hir_id, right.span)]);
@@ -461,7 +581,24 @@ impl<'tcx> Visitor<'tcx> for Facts<'tcx, '_> {
             }
             ExprKind::Call(callee, arguments) => {
                 fact["callee"] = node_reference(self.tcx, callee.hir_id, callee.span);
-                fact["operands"] = json!(arguments.iter().map(|arg| node_reference(self.tcx, arg.hir_id, arg.span)).collect::<Vec<_>>());
+                if let ty::FnDef(def, _) = *self.typeck.expr_ty(callee).kind()
+                    && let kind @ DefKind::Ctor(_, rustc_hir::def::CtorKind::Fn) = self.tcx.def_kind(def)
+                    && let ty::Adt(adt, _) = self.typeck.expr_ty(expr).kind()
+                {
+                    let resolved = Res::Def(kind, def);
+                    let fields = &adt.variant_of_res(resolved).fields;
+                    fact["kind"] = json!("constructor");
+                    fact["resolution"] = resolution(self.tcx, resolved);
+                    fact["constructor_tail"] = json!("none");
+                    fact["base"] = Value::Null;
+                    fact["fields"] = json!(fields.iter().zip(arguments).map(|(field, value)|
+                        json!({"definition": definition(self.tcx, field.did),
+                            "origin": origin(self.tcx, value.span),
+                            "value": node_reference(self.tcx, value.hir_id, value.span)})).collect::<Vec<_>>());
+                } else {
+                    fact["operands"] = json!(arguments.iter().map(|arg|
+                        node_reference(self.tcx, arg.hir_id, arg.span)).collect::<Vec<_>>());
+                }
             }
             ExprKind::MethodCall(_, receiver, arguments, _) => {
                 if let Some(def) = self.typeck.type_dependent_def_id(expr.hir_id) {
@@ -471,9 +608,19 @@ impl<'tcx> Visitor<'tcx> for Facts<'tcx, '_> {
                 fact["receiver"] = node_reference(self.tcx, receiver.hir_id, receiver.span);
                 fact["operands"] = json!(arguments.iter().map(|arg| node_reference(self.tcx, arg.hir_id, arg.span)).collect::<Vec<_>>());
             }
-            ExprKind::Struct(path, fields, ..) => {
+            ExprKind::Struct(path, fields, tail) => {
+                fact["callee"] = Value::Null;
                 let resolved = self.typeck.qpath_res(path, expr.hir_id);
                 fact["resolution"] = resolution(self.tcx, resolved);
+                let (tail, base) = match tail {
+                    rustc_hir::StructTailExpr::None => ("none", Value::Null),
+                    rustc_hir::StructTailExpr::Base(base) =>
+                        ("base", node_reference(self.tcx, base.hir_id, base.span)),
+                    rustc_hir::StructTailExpr::DefaultFields(_) => ("defaults", Value::Null),
+                    rustc_hir::StructTailExpr::NoneWithError(_) => ("invalid", Value::Null),
+                };
+                fact["constructor_tail"] = json!(tail);
+                fact["base"] = base;
                 let mut assignments = Vec::new();
                 for field in fields {
                     let mut assignment = json!({"origin": origin(self.tcx, field.span),
@@ -491,12 +638,17 @@ impl<'tcx> Visitor<'tcx> for Facts<'tcx, '_> {
             }
             ExprKind::Field(base, _) => {
                 fact["receiver"] = node_reference(self.tcx, base.hir_id, base.span);
+                fact["field"] = Value::Null;
                 let typeck = self.typeck;
                 if let Some(index) = typeck.opt_field_index(expr.hir_id) {
-                    if let ty::Adt(adt, _) = typeck.expr_ty_adjusted(base).kind() {
-                        if let Some(field) = adt.non_enum_variant().fields.get(index) {
-                            fact["field_definition"] = definition(self.tcx, field.did);
+                    match typeck.expr_ty_adjusted(base).kind() {
+                        ty::Adt(adt, _) if !adt.is_enum() => {
+                            if let Some(field) = adt.non_enum_variant().fields.get(index) {
+                                fact["field"] = json!({"kind": "adt", "definition": definition(self.tcx, field.did)});
+                            }
                         }
+                        ty::Tuple(_) => fact["field"] = json!({"kind": "tuple", "index": index.as_u32()}),
+                        _ => {}
                     }
                 }
             }
@@ -513,18 +665,33 @@ impl<'tcx> Visitor<'tcx> for Facts<'tcx, '_> {
                 fact["role"] = json!("binding");
                 fact["name"] = json!(name.name.to_string());
                 fact["binding_reference"] = node_reference(self.tcx, id, self.tcx.hir_span(id));
-                fact["binding_mode"] = json!(format!("{:?}", self.typeck.pat_binding_modes().get(pat.hir_id)));
+                fact["binding_mode"] = self.typeck.pat_binding_modes().get(pat.hir_id).map(|mode| {
+                    match mode.0 {
+                        rustc_hir::ByRef::No => "value",
+                        rustc_hir::ByRef::Yes(rustc_hir::Pinnedness::Not, rustc_hir::Mutability::Not) => "shared",
+                        rustc_hir::ByRef::Yes(rustc_hir::Pinnedness::Not, rustc_hir::Mutability::Mut) => "mutable",
+                        rustc_hir::ByRef::Yes(_, rustc_hir::Mutability::Not) => "pinned_shared",
+                        rustc_hir::ByRef::Yes(_, rustc_hir::Mutability::Mut) => "pinned_mutable",
+                    }
+                }).map(Value::from).unwrap_or(Value::Null);
                 fact["mutable"] = json!(self.typeck.pat_binding_modes().get(pat.hir_id)
                     .map(|mode| mode.1 == rustc_hir::Mutability::Mut));
                 let parent = self.tcx.hir_parent_iter(pat.hir_id).find(|(_, node)| {
                     !matches!(node, rustc_hir::Node::Pat(..) | rustc_hir::Node::PatField(..))
                 });
-                fact["declaration"] = parent.and_then(|(_, node)| match node {
-                    rustc_hir::Node::LetStmt(local) => {
-                        Some(node_reference(self.tcx, local.hir_id, local.span))
-                    }
+                let local = parent.and_then(|(_, node)| match node {
+                    rustc_hir::Node::LetStmt(local) => Some(local),
                     _ => None,
-                }).unwrap_or(Value::Null);
+                });
+                fact["declaration"] = local.map(|local|
+                    node_reference(self.tcx, local.hir_id, local.span)).unwrap_or(Value::Null);
+                let (projection, error) = match local.map(|local| self.initializer_projection(pat, local.hir_id)) {
+                    Some(Ok(projection)) => (json!(projection), Value::Null),
+                    Some(Err(error)) => (Value::Null, json!(error)),
+                    None => (Value::Null, Value::Null),
+                };
+                fact["initializer_projection"] = projection;
+                fact["projection_error"] = error;
             }
             rustc_hir::PatKind::Struct(ref path, ..) | rustc_hir::PatKind::TupleStruct(ref path, ..) => {
                 fact["role"] = json!("constructor");
