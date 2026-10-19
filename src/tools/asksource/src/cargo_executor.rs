@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use self::cargo::compiler::{BuildRunner, CompileMode, DefaultExecutor, Executor, Unit, UnitInterner};
 use self::cargo::util::CargoResult;
@@ -178,6 +179,8 @@ struct CaptureExecutor {
     selected_by_base: BTreeMap<String, BTreeSet<String>>,
     dispatch: Mutex<BTreeMap<String, String>>,
     errors: Mutex<Vec<String>>,
+    // Cargo joins compiler jobs before the completion marker is read.
+    compiled_build_script: AtomicBool,
 }
 
 impl CaptureExecutor {
@@ -424,6 +427,9 @@ impl Executor for CaptureExecutor {
                 "compiler capture inputs changed during build",
             ));
         }
+        if target.is_custom_build() {
+            self.compiled_build_script.store(true, Ordering::Relaxed);
+        }
         Ok(())
     }
 }
@@ -458,6 +464,8 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
         PathBuf::from(request["directory"].as_str().ok_or("missing capture directory")?);
     let sources: BTreeSet<PathBuf> =
         serde_json::from_value(request["sources"].clone()).map_err(|e| e.to_string())?;
+    let candidate_manifests: BTreeSet<PathBuf> =
+        serde_json::from_value(request["candidate_manifests"].clone()).map_err(|e| e.to_string())?;
     if !directory.is_absolute()
         || sources.iter().any(|path| !path.is_absolute())
         || request["graph"].as_object().is_none_or(|graph| graph.is_empty())
@@ -490,6 +498,10 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
         .map(|source| {
             fs::canonicalize(source).map_err(|e| format!("owned source {}: {e}", source.display()))
         })
+        .collect::<Result<_, _>>()?;
+    let canonical_manifests: BTreeSet<_> = candidate_manifests.iter()
+        .map(|manifest| fs::canonicalize(manifest)
+            .map_err(|e| format!("candidate manifest {}: {e}", manifest.display())))
         .collect::<Result<_, _>>()?;
     let cargo_exe =
         PathBuf::from(std::env::var_os("CARGO").ok_or(
@@ -585,7 +597,8 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
         bcx.unit_graph.keys().filter(|unit| !unit.mode.is_run_custom_build()).filter(|unit| {
             unit.target.src_path().path().is_some_and(|path| {
                 fs::canonicalize(path).is_ok_and(|path| canonical_sources.contains(&path))
-            })
+            }) || fs::canonicalize(unit.pkg.manifest_path())
+                .is_ok_and(|path| canonical_manifests.contains(&path))
         })
     {
         let key =
@@ -607,10 +620,17 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
         selected_by_base,
         dispatch: Mutex::new(BTreeMap::new()),
         errors: Mutex::new(Vec::new()),
+        compiled_build_script: AtomicBool::new(false),
     });
     drop(bcx);
     let exec: Arc<dyn Executor> = executor.clone();
     cargo::ops::compile_with_exec(&ws, &options, &exec).map_err(|e| e.to_string())?;
+    if executor.compiled_build_script.swap(false, Ordering::Relaxed) {
+        // A forced script compile does not transitively invalidate its run unit.
+        // Let Cargo settle script runs and dependents before publishing facts.
+        executor.dispatch.lock().map_err(|_| "Cargo capture dispatch poisoned")?.clear();
+        cargo::ops::compile_with_exec(&ws, &options, &exec).map_err(|e| e.to_string())?;
+    }
     let errors = executor.errors.lock().map_err(|_| "Cargo capture errors poisoned")?;
     if !errors.is_empty() {
         return Err(errors.join("; "));

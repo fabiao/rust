@@ -44,21 +44,21 @@ pub fn environment(overrides: &BTreeMap<String, Option<OsString>>) -> Result<Val
 
 pub fn validate_request(request: &Value) -> Result<(), String> {
     let fields = request.as_object().ok_or("capture request must be an object")?;
-    if fields.len() != 4
+    if fields.len() != 5
         || fields.keys().any(|key| {
-            !matches!(key.as_str(), "directory" | "sources" | "graph" | "compiler_shims")
+            !matches!(key.as_str(), "directory" | "sources" | "candidate_manifests" | "graph" | "compiler_shims")
         })
     {
         return Err(
-            "capture request requires only directory, sources, graph and compiler_shims".into()
+            "capture request requires directory, sources, candidate_manifests, graph and compiler_shims".into()
         );
     }
     if request["directory"].as_str().is_none_or(|path| !Path::new(path).is_absolute())
-        || request["sources"].as_array().is_none_or(|sources| {
+        || ["sources", "candidate_manifests"].iter().any(|field| request[*field].as_array().is_none_or(|sources| {
             sources
                 .iter()
                 .any(|source| source.as_str().is_none_or(|path| !Path::new(path).is_absolute()))
-        })
+        }))
         || request["graph"].as_object().is_none_or(|graph| graph.is_empty())
         || !request["compiler_shims"].is_object()
     {

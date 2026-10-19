@@ -80,6 +80,7 @@ pub(super) fn capture(original: &Command, context: &Value, request: &Value,
     fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
     let request_path = directory.join("request.json");
     let request = json!({"directory": directory, "sources": request["sources"],
+        "candidate_manifests": request["candidate_manifests"],
         "graph": {"selected": request["graph"], "bootstrap": context, "seed_sha256": request_sha256},
         "compiler_shims": compiler_shims});
     let request_bytes = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
