@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -345,13 +345,51 @@ impl<'tcx> Facts<'tcx, '_> {
             "type": typeck.node_type_opt(id).map(|value|
                 type_fact(tcx, value, ty::TypingEnv::post_analysis(tcx, id.owner.def_id))),
             "arguments": typeck.node_args_opt(id).map(|args| args.as_slice().iter().map(|arg| argument(tcx, *arg)).collect::<Vec<_>>()),
-            "selected_definition": typeck.type_dependent_def_id(id).map(|def| definition(tcx, def))})
+            "selected_definition": null, "selected_arguments": null, "selection_error": null})
+    }
+
+    fn select(&self, fact: &mut Value, id: rustc_hir::HirId, def: rustc_hir::def_id::DefId) {
+        let mut args = self.typeck.node_args(id);
+        if let Some(value) = self.typeck.node_type_opt(id) {
+            if let ty::FnDef(owner, arguments) = value.kind() {
+                if *owner != def {
+                    fact["selection_error"] = json!("compiler callable type disagrees with its resolved definition");
+                    return;
+                }
+                let Some(arguments) = arguments.no_bound_vars() else {
+                    fact["selection_error"] = json!("compiler callable arguments remain bound");
+                    return;
+                };
+                args = arguments;
+            }
+        }
+        let expected = self.tcx.generics_of(def).count();
+        if args.len() != expected {
+            fact["selection_error"] = json!(format!("compiler instance arguments incomplete: expected {expected}, recorded {}", args.len()));
+            return;
+        }
+        let environment = ty::TypingEnv::post_analysis(self.tcx, id.owner.def_id);
+        match ty::Instance::try_resolve(self.tcx, environment, def, args) {
+            Ok(Some(instance)) => {
+                if !matches!(instance.def, ty::InstanceKind::Item(_)) {
+                    fact["selection_error"] = json!("compiler instance is not a source item");
+                    return;
+                }
+                fact["selected_definition"] = definition(self.tcx, instance.def_id());
+                fact["selected_arguments"] = json!(instance.args.as_slice().iter()
+                    .map(|arg| argument(self.tcx, *arg)).collect::<Vec<_>>());
+            }
+            Ok(None) => fact["selection_error"] = json!("compiler instance remains unresolved"),
+            Err(error) => fact["selection_error"] = json!(format!("compiler instance resolution failed: {error:?}")),
+        }
     }
 }
 
 impl<'tcx> Visitor<'tcx> for Facts<'tcx, '_> {
     fn visit_block(&mut self, block: &'tcx rustc_hir::Block<'tcx>) {
-        let fact = self.node(block.hir_id, block.span, "block");
+        let mut fact = self.node(block.hir_id, block.span, "block");
+        fact["tail"] = block.expr.map(|expr| node_reference(self.tcx, expr.hir_id, expr.span))
+            .unwrap_or(Value::Null);
         self.nodes.push(fact);
         intravisit::walk_block(self, block);
     }
@@ -408,13 +446,28 @@ impl<'tcx> Visitor<'tcx> for Facts<'tcx, '_> {
                 fact["operands"] = json!([node_reference(self.tcx, operand.hir_id, operand.span)]);
             }
             ExprKind::Path(ref path) => {
-                fact["resolution"] = resolution(self.tcx, self.typeck.qpath_res(path, expr.hir_id));
+                let resolved = self.typeck.qpath_res(path, expr.hir_id);
+                fact["resolution"] = resolution(self.tcx, resolved);
+                if let Res::Def(kind, def) = resolved {
+                    if matches!(kind, DefKind::Fn | DefKind::AssocFn | DefKind::Const |
+                        DefKind::AssocConst | DefKind::AnonConst | DefKind::Static { .. } |
+                        DefKind::Ctor(_, rustc_hir::def::CtorKind::Fn)) {
+                        self.select(&mut fact, expr.hir_id, def);
+                    }
+                }
+            }
+            ExprKind::Block(block, _) => {
+                fact["block"] = node_reference(self.tcx, block.hir_id, block.span);
             }
             ExprKind::Call(callee, arguments) => {
                 fact["callee"] = node_reference(self.tcx, callee.hir_id, callee.span);
                 fact["operands"] = json!(arguments.iter().map(|arg| node_reference(self.tcx, arg.hir_id, arg.span)).collect::<Vec<_>>());
             }
             ExprKind::MethodCall(_, receiver, arguments, _) => {
+                if let Some(def) = self.typeck.type_dependent_def_id(expr.hir_id) {
+                    fact["resolution"] = resolution(self.tcx, Res::Def(self.tcx.def_kind(def), def));
+                    self.select(&mut fact, expr.hir_id, def);
+                }
                 fact["receiver"] = node_reference(self.tcx, receiver.hir_id, receiver.span);
                 fact["operands"] = json!(arguments.iter().map(|arg| node_reference(self.tcx, arg.hir_id, arg.span)).collect::<Vec<_>>());
             }
@@ -461,6 +514,17 @@ impl<'tcx> Visitor<'tcx> for Facts<'tcx, '_> {
                 fact["name"] = json!(name.name.to_string());
                 fact["binding_reference"] = node_reference(self.tcx, id, self.tcx.hir_span(id));
                 fact["binding_mode"] = json!(format!("{:?}", self.typeck.pat_binding_modes().get(pat.hir_id)));
+                fact["mutable"] = json!(self.typeck.pat_binding_modes().get(pat.hir_id)
+                    .map(|mode| mode.1 == rustc_hir::Mutability::Mut));
+                let parent = self.tcx.hir_parent_iter(pat.hir_id).find(|(_, node)| {
+                    !matches!(node, rustc_hir::Node::Pat(..) | rustc_hir::Node::PatField(..))
+                });
+                fact["declaration"] = parent.and_then(|(_, node)| match node {
+                    rustc_hir::Node::LetStmt(local) => {
+                        Some(node_reference(self.tcx, local.hir_id, local.span))
+                    }
+                    _ => None,
+                }).unwrap_or(Value::Null);
             }
             rustc_hir::PatKind::Struct(ref path, ..) | rustc_hir::PatKind::TupleStruct(ref path, ..) => {
                 fact["role"] = json!("constructor");
@@ -544,9 +608,12 @@ impl Capture {
         let mut items = ItemReferences { tcx, nodes: &mut self.nodes };
         tcx.hir_visit_all_item_likes_in_crate(&mut items);
         self.nodes.check()?;
+        let mut bodies = HashMap::new();
         for owner in tcx.hir_body_owners() {
             let mut facts = Facts { tcx, typeck: tcx.typeck(owner), nodes: &mut self.nodes };
-            facts.visit_body(tcx.hir_body_owned_by(owner));
+            let body = tcx.hir_body_owned_by(owner);
+            bodies.insert(owner, node_reference(tcx, body.value.hir_id, body.value.span));
+            facts.visit_body(body);
             self.nodes.check()?;
         }
         instantiated_storage(tcx, &mut self.nodes);
@@ -564,7 +631,8 @@ impl Capture {
                 None
             };
             self.definitions.push(json!({"definition": definition(tcx, id.to_def_id()), "kind": format!("{kind:?}"),
-                "origin": origin(tcx, tcx.def_span(id)), "type": ty}));
+                "origin": origin(tcx, tcx.def_span(id)), "type": ty,
+                "body": bodies.get(&id)}));
             self.definitions.check()?;
         }
         let mut sources = BTreeMap::new();
