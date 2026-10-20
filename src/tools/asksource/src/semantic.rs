@@ -535,6 +535,7 @@ impl<'tcx> Facts<'tcx, '_> {
 impl<'tcx> Visitor<'tcx> for Facts<'tcx, '_> {
     fn visit_block(&mut self, block: &'tcx rustc_hir::Block<'tcx>) {
         let mut fact = self.node(block.hir_id, block.span, "block");
+        fact["targeted_by_break"] = json!(block.targeted_by_break);
         fact["tail"] = block.expr.map(|expr| node_reference(self.tcx, expr.hir_id, expr.span))
             .unwrap_or(Value::Null);
         self.nodes.push(fact);
@@ -839,9 +840,17 @@ impl Capture {
             } else {
                 None
             };
+            let body_owner = if kind == DefKind::Field {
+                match tcx.hir_node_by_def_id(id) {
+                    rustc_hir::Node::Field(field) => field.default.map(|value| value.def_id),
+                    _ => None,
+                }
+            } else {
+                Some(id)
+            };
             self.definitions.push(json!({"definition": definition(tcx, id.to_def_id()), "kind": format!("{kind:?}"),
                 "origin": origin(tcx, tcx.def_span(id)), "type": ty,
-                "body": bodies.get(&id)}));
+                "body": body_owner.and_then(|owner| bodies.get(&owner))}));
             self.definitions.check()?;
         }
         let mut sources = BTreeMap::new();

@@ -180,7 +180,8 @@ impl<'ast> Visit<'ast> for Model {
 
     fn visit_field(&mut self, node: &'ast syn::Field) {
         self.enter("field", node.span(), json!({"name": node.ident.as_ref().map(|name| name.unraw().to_string()),
-            "attrs": attributes(&node.attrs), "type": range(node.ty.span())}));
+            "attrs": attributes(&node.attrs), "type": range(node.ty.span()),
+            "value": node.default.as_ref().map(|(_, value)| range(value.span()))}));
         visit::visit_field(self, node);
         self.leave();
     }
