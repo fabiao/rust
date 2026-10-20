@@ -139,13 +139,26 @@ fn argument<'tcx>(tcx: TyCtxt<'tcx>, arg: ty::GenericArg<'tcx>) -> Value {
     }
 }
 
+pub mod semantic_type {
+    pub const HEX_DIGITS: usize = (u128::BITS / 4) as usize;
+}
+
+fn semantic_type_id<'tcx>(tcx: TyCtxt<'tcx>, value: Ty<'tcx>) -> Option<String> {
+    if value.has_infer() || value.has_placeholders() || value.references_error() {
+        return None;
+    }
+    Some(format!("{:0width$x}", tcx.type_id_hash(value).as_u128(), width = semantic_type::HEX_DIGITS))
+}
+
 fn type_identity<'tcx>(tcx: TyCtxt<'tcx>, value: Ty<'tcx>) -> Value {
-    match value.kind() {
+    let mut fact = match value.kind() {
         ty::Array(element, extent) => json!({"kind": "array", "element": type_identity(tcx, *element),
                                            "extent": constant(tcx, *extent)}),
         ty::Slice(element) => json!({"kind": "slice", "element": type_identity(tcx, *element)}),
-        ty::Ref(_, element, _) => json!({"kind": "reference", "element": type_identity(tcx, *element)}),
-        ty::RawPtr(element, _) => json!({"kind": "pointer", "element": type_identity(tcx, *element)}),
+        ty::Ref(_, element, mutability) => json!({"kind": "reference", "element": type_identity(tcx, *element),
+            "mutability": if mutability.is_mut() { "mutable" } else { "immutable" }}),
+        ty::RawPtr(element, mutability) => json!({"kind": "pointer", "element": type_identity(tcx, *element),
+            "mutability": if mutability.is_mut() { "mutable" } else { "immutable" }}),
         ty::Tuple(elements) => json!({"kind": "tuple", "elements": elements.as_slice().iter().map(|ty| type_identity(tcx, *ty)).collect::<Vec<_>>()}),
         ty::Adt(def, args) => json!({"kind": "adt", "definition": definition(tcx, def.did()),
             "arguments": args.as_slice().iter().map(|arg| argument(tcx, *arg)).collect::<Vec<_>>()}),
@@ -153,8 +166,9 @@ fn type_identity<'tcx>(tcx: TyCtxt<'tcx>, value: Ty<'tcx>) -> Value {
             "bound_variables": format!("{:?}", args.bound_vars()),
             "arguments": args.skip_binder().as_slice().iter().map(|arg| argument(tcx, *arg)).collect::<Vec<_>>()}),
         ty::Param(param) => json!({"kind": "parameter", "index": param.index, "name": param.name.to_string()}),
-        ty::Closure(def, _) | ty::CoroutineClosure(def, _) | ty::Coroutine(def, _) =>
-            json!({"kind": "closure_or_coroutine", "definition": definition(tcx, *def)}),
+        ty::Closure(def, args) | ty::CoroutineClosure(def, args) | ty::Coroutine(def, args) =>
+            json!({"kind": "closure_or_coroutine", "definition": definition(tcx, *def),
+                "arguments": args.as_slice().iter().map(|arg| argument(tcx, *arg)).collect::<Vec<_>>()}),
         ty::Alias(kind, alias) => {
             let def = match alias.kind {
                 ty::AliasTyKind::Projection { def_id } | ty::AliasTyKind::Inherent { def_id } |
@@ -164,7 +178,12 @@ fn type_identity<'tcx>(tcx: TyCtxt<'tcx>, value: Ty<'tcx>) -> Value {
                 "arguments": alias.args.as_slice().iter().map(|arg| argument(tcx, *arg)).collect::<Vec<_>>()})
         }
         _ => json!({"kind": "scalar_or_other", "display": value.to_string()}),
+    };
+    fact["compiler_type_id"] = json!(semantic_type_id(tcx, value));
+    if fact["compiler_type_id"].is_null() {
+        fact["compiler_type_id_error"] = json!("type contains inference, placeholders or errors");
     }
+    fact
 }
 
 fn inline_storage<'tcx>(tcx: TyCtxt<'tcx>, value: Ty<'tcx>, typing_env: ty::TypingEnv<'tcx>,
@@ -227,13 +246,13 @@ fn inline_storage<'tcx>(tcx: TyCtxt<'tcx>, value: Ty<'tcx>, typing_env: ty::Typi
             let captures = inline_storage(tcx, args.as_coroutine().tupled_upvars_ty(), typing_env, ancestors);
             match tcx.coroutine_layout(*def, args) {
                 Ok(layout) => {
-                    let fields: Vec<_> = layout.field_tys.iter().filter_map(|field| {
+                    let fields: Vec<_> = layout.field_tys.iter_enumerated().filter_map(|(index, field)| {
                         let input = ty::EarlyBinder::bind(tcx, field.ty).instantiate(tcx, args);
                         let storage = match tcx.try_normalize_erasing_regions(typing_env, input) {
                             Ok(value) => inline_storage(tcx, value, typing_env, ancestors),
                             Err(error) => json!({"kind": "unresolved", "error": format!("{error:?}")}),
                         };
-                        (!storage.is_null()).then(|| json!({"origin": origin(tcx, field.source_info.span),
+                        (!storage.is_null()).then(|| json!({"index": index.as_u32(), "origin": origin(tcx, field.source_info.span),
                             "name": field.debuginfo_name.map(|name| name.to_string()), "storage": storage}))
                     }).collect();
                     if fields.is_empty() && captures.is_null() { Value::Null } else {
@@ -265,6 +284,7 @@ fn type_fact<'tcx>(tcx: TyCtxt<'tcx>, value: Ty<'tcx>, typing_env: ty::TypingEnv
 fn instance_fact<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::Instance<'tcx>) -> Value {
     json!({"definition": definition(tcx, instance.def_id()),
         "symbol": tcx.symbol_name(instance).name,
+        "compiler_type_id": semantic_type_id(tcx, instance.ty(tcx, ty::TypingEnv::fully_monomorphized())),
         "arguments": instance.args.as_slice().iter().map(|arg| argument(tcx, *arg)).collect::<Vec<_>>()})
 }
 
@@ -333,7 +353,7 @@ fn instantiated_storage<'tcx>(tcx: TyCtxt<'tcx>, nodes: &mut RecordWriter)
                 }).collect();
                 nodes.push(json!({"kind": "instantiated_storage", "owner": definition(tcx, owner),
                     "origin": origin(tcx, declaration.source_info.span), "instance": descriptor,
-                    "inlined": inlined, "names": names, "type": ty}));
+                    "mir_local": local.as_u32(), "inlined": inlined, "names": names, "type": ty}));
             }
         }
     }
@@ -853,8 +873,36 @@ impl Capture {
                 "body": body_owner.and_then(|owner| bodies.get(&owner))}));
             self.definitions.check()?;
         }
+        let mut artifacts = BTreeMap::new();
+        let mut crate_sources = BTreeMap::new();
+        for &krate in tcx.crates(()).iter() {
+            let source = tcx.used_crate_source(krate);
+            let mut files = BTreeMap::new();
+            for path in source.paths().chain(source.sdylib_interface.iter()) {
+                let path = fs::canonicalize(path).map_err(|e| e.to_string())?;
+                let hash = digest(&fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?);
+                artifacts.insert(path.clone(), hash.clone());
+                files.insert(path, hash);
+            }
+            crate_sources.insert(krate, (tcx.crate_name(krate).to_string(), files));
+        }
         let mut sources = BTreeMap::new();
         for file in tcx.sess.source_map().files().iter() {
+            if file.is_imported() {
+                let (krate, files) = crate_sources.get(&file.cnum)
+                    .ok_or_else(|| format!("imported source has no native crate artifacts: {}",
+                        file.name.prefer_local_unconditionally()))?;
+                if files.is_empty() { return Err(format!("imported source has no crate inputs: {}",
+                    file.name.prefer_local_unconditionally())); }
+                let id = format!("{:?}", file.stable_id);
+                let record = json!({"kind": "metadata", "name": file.name.prefer_local_unconditionally().to_string(),
+                    "path": None::<String>, "text": None::<String>, "compiler_hash": file.src_hash.to_string(),
+                    "source_file_id": id, "exported_source_file_id": id,
+                    "sha256": None::<String>, "normalized_sha256": None::<String>,
+                    "crate": krate, "artifacts": files, "byte_length": file.unnormalized_source_len});
+                if sources.insert(id, record).is_some() { return Err("duplicate compiler source identity".into()); }
+                continue;
+            }
             if let Some(text) = &file.src {
                 let name = file.name.prefer_local_unconditionally().to_string();
                 let generated = !matches!(file.name, rustc_span::FileName::Real(_));
@@ -896,15 +944,6 @@ impl Capture {
         let executable = std::env::current_exe().map_err(|e| e.to_string())?;
         let helper_hash = digest(&fs::read(&executable).map_err(|e| e.to_string())?);
         let compiler_hash = digest(&fs::read(self.args.first().ok_or("missing compiler")?).map_err(|e| e.to_string())?);
-        let mut artifacts = BTreeMap::new();
-        for &krate in tcx.crates(()).iter() {
-            let source = tcx.used_crate_source(krate);
-            for path in source.paths().chain(source.sdylib_interface.iter()) {
-                let path = fs::canonicalize(path).map_err(|e| e.to_string())?;
-                let hash = digest(&fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?);
-                artifacts.insert(path, hash);
-            }
-        }
         let sysroot = fs::canonicalize(tcx.sess.opts.sysroot.path()).map_err(|e| e.to_string())?;
         let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
         let outputs = tcx.output_filenames(());
