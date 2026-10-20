@@ -169,12 +169,14 @@ fn type_identity<'tcx>(tcx: TyCtxt<'tcx>, value: Ty<'tcx>) -> Value {
         ty::Closure(def, args) | ty::CoroutineClosure(def, args) | ty::Coroutine(def, args) =>
             json!({"kind": "closure_or_coroutine", "definition": definition(tcx, *def),
                 "arguments": args.as_slice().iter().map(|arg| argument(tcx, *arg)).collect::<Vec<_>>()}),
-        ty::Alias(kind, alias) => {
-            let def = match alias.kind {
-                ty::AliasTyKind::Projection { def_id } | ty::AliasTyKind::Inherent { def_id } |
-                ty::AliasTyKind::Opaque { def_id } | ty::AliasTyKind::Free { def_id } => def_id,
+        ty::Alias(rigid, alias) => {
+            let (kind, def) = match alias.kind {
+                ty::AliasTyKind::Projection { def_id } => ("Projection", def_id),
+                ty::AliasTyKind::Inherent { def_id } => ("Inherent", def_id),
+                ty::AliasTyKind::Opaque { def_id } => ("Opaque", def_id),
+                ty::AliasTyKind::Free { def_id } => ("Free", def_id),
             };
-            json!({"kind": "alias", "alias_kind": format!("{kind:?}"), "definition": definition(tcx, def),
+            json!({"kind": "alias", "alias_kind": kind, "rigidity": format!("{rigid:?}"), "definition": definition(tcx, def),
                 "arguments": alias.args.as_slice().iter().map(|arg| argument(tcx, *arg)).collect::<Vec<_>>()})
         }
         _ => json!({"kind": "scalar_or_other", "display": value.to_string()}),
@@ -277,7 +279,16 @@ fn inline_storage<'tcx>(tcx: TyCtxt<'tcx>, value: Ty<'tcx>, typing_env: ty::Typi
 
 fn type_fact<'tcx>(tcx: TyCtxt<'tcx>, value: Ty<'tcx>, typing_env: ty::TypingEnv<'tcx>) -> Value {
     let mut fact = type_identity(tcx, value);
-    fact["inline_storage"] = inline_storage(tcx, value, typing_env, &mut Vec::new());
+    let storage_env = typing_env.with_post_analysis_normalized(tcx);
+    let input = if storage_env != typing_env {
+        ty::set_aliases_to_non_rigid(tcx, value)
+    } else {
+        ty::Unnormalized::new_wip(value)
+    };
+    fact["inline_storage"] = match tcx.try_normalize_erasing_regions(storage_env, input) {
+        Ok(value) => inline_storage(tcx, value, storage_env, &mut Vec::new()),
+        Err(error) => json!({"kind": "unresolved", "error": format!("{error:?}")}),
+    };
     fact
 }
 
@@ -510,7 +521,7 @@ impl<'tcx> Facts<'tcx, '_> {
         json!({"kind": kind, "local_id": id.local_id.as_u32(),
             "owner": definition(tcx, id.owner.def_id.to_def_id()), "origin": origin(tcx, span),
             "type": typeck.node_type_opt(id).map(|value|
-                type_fact(tcx, value, ty::TypingEnv::post_analysis(tcx, id.owner.def_id))),
+                type_fact(tcx, value, ty::TypingEnv::post_typeck_until_borrowck(tcx, self.body_owner))),
             "arguments": typeck.node_args_opt(id).map(|args| args.as_slice().iter().map(|arg| argument(tcx, *arg)).collect::<Vec<_>>()),
             "selected_definition": null, "selected_arguments": null, "selection_error": null})
     }
