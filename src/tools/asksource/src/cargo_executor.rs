@@ -178,12 +178,47 @@ struct CaptureExecutor {
     selected: BTreeSet<String>,
     selected_by_base: BTreeMap<String, BTreeSet<String>>,
     dispatch: Mutex<BTreeMap<String, String>>,
+    artifact_publications: Mutex<BTreeMap<String, Vec<(String, PathBuf)>>>,
     errors: Mutex<Vec<String>>,
     // Cargo joins compiler jobs before the completion marker is read.
     compiled_build_script: AtomicBool,
 }
 
 impl CaptureExecutor {
+    fn entry_request(&self, key: &str, command: &ProcessBuilder) -> Result<Option<(PathBuf, String)>, String> {
+        let policy = match command.get_envs().get("ASK_ENTRY_LINK_POLICY") {
+            Some(value) => value.clone(),
+            None => std::env::var_os("ASK_ENTRY_LINK_POLICY"),
+        };
+        let Some(policy) = policy else { return Ok(None) };
+        let policy = fs::canonicalize(policy).map_err(|error| error.to_string())?;
+        let bytes = fs::read(&policy).map_err(|error| error.to_string())?;
+        let args = command.get_args().map(|arg| arg.to_str().ok_or("non-UTF8 controlled compiler argument"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let target = args.windows(2).find_map(|pair| (pair[0] == "--target").then_some(pair[1]))
+            .or_else(|| args.iter().find_map(|arg| arg.strip_prefix("--target=")));
+        let ask_target = target.is_some_and(|target| target == "x86_64-unknown-ask"
+            || fs::read(target).ok().and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .is_some_and(|spec| spec["os"] == "ask"));
+        if !ask_target { return Ok(None); }
+        let kinds = args.windows(2).find_map(|pair| (pair[0] == "--crate-type").then_some(pair[1]))
+            .or_else(|| args.iter().find_map(|arg| arg.strip_prefix("--crate-type=")));
+        let final_kind = kinds.is_some_and(|kinds| kinds.split(',').any(|kind|
+            matches!(kind, "bin" | "cdylib" | "dylib")));
+        if !final_kind { return Ok(None); }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| error.to_string())?.as_nanos();
+        let identity = crate::digest(format!("{key}:{}:{now}:{}", std::process::id(), crate::digest(&bytes)).as_bytes());
+        let path = self.directory.join(format!("{key}.entry-request.json"));
+        let request = json!({"request_id": identity,
+            "plan_path": self.directory.join(format!("{key}.entry-plan.json")),
+            "receipt_path": self.directory.join(format!("{key}.entry-receipt.json")),
+            "facts_path": self.fact_path(key), "policy_path": policy, "policy_sha256": crate::digest(&bytes)});
+        publish(&path, &request)?;
+        let hash = crate::digest(&fs::read(&path).map_err(|error| error.to_string())?);
+        Ok(Some((path, hash)))
+    }
+
     fn record_path(&self, key: &str) -> PathBuf {
         self.directory.join(format!("{key}.unit.json"))
     }
@@ -202,6 +237,30 @@ impl CaptureExecutor {
             let record = read_json(&self.record_path(key)).ok()?;
             let facts = read_json(&self.fact_path(key)).ok()?;
             crate::records::validate(&facts, &self.fact_path(key)).ok()?;
+            if let Some(plan) = facts["entry_input_plan_path"].as_str() {
+                let receipt = read_json(Path::new(facts["entry_input_receipt_path"].as_str()?)).ok()?;
+                if receipt["state"] != "complete"
+                    || receipt["facts_sha256"].as_str()? != crate::digest(&fs::read(self.fact_path(key)).ok()?)
+                    || receipt["plan_sha256"] != facts["entry_input_plan_sha256"]
+                    || receipt["plan_sha256"].as_str()? != crate::digest(&fs::read(plan).ok()?) {
+                    return None;
+                }
+                for field in ["premerge_artifacts", "compiler_output_artifacts", "output_artifacts"] {
+                    for (path, hash) in receipt[field].as_object()? {
+                        if hash.as_str()? != crate::digest(&fs::read(path).ok()?) { return None; }
+                    }
+                }
+            } else if std::env::var_os("ASK_ENTRY_LINK_POLICY").is_some() {
+                let arguments = facts["arguments"].as_array()?;
+                let ask_target = arguments.windows(2).any(|pair| pair[0] == "--target"
+                    && pair[1].as_str().is_some_and(|target| target == "x86_64-unknown-ask"
+                        || fs::read(target).ok().and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                            .is_some_and(|spec| spec["os"] == "ask")));
+                if ask_target && arguments.windows(2).any(|pair| pair[0] == "--crate-type"
+                    && pair[1].as_str().is_some_and(|kind| matches!(kind, "bin" | "dylib" | "cdylib"))) {
+                    return None;
+                }
+            }
             if record.get("request")? != &self.request
                 || record.get("graph_sha256")?.as_str()? != self.graph_sha256
                 || record.get("producer")? != &self.producer
@@ -315,9 +374,10 @@ fn discriminator(source: &Path, suffix: &str) -> String {
 
 impl Executor for CaptureExecutor {
     fn init(&self, runner: &BuildRunner<'_, '_>, unit: &Unit) {
-        if !self.selected_by_base.contains_key(&base_key(unit)) {
-            return;
-        }
+        let selected = self.selected_by_base.contains_key(&base_key(unit));
+        let publication = unit.target.is_dylib() || unit.target.is_cdylib()
+            || unit.target.is_bin() || unit.mode.is_any_test();
+        if !selected && !publication { return; }
         let snapshot = match graph_snapshot(&runner.bcx.unit_graph, &runner.bcx.roots) {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -333,6 +393,47 @@ impl Executor for CaptureExecutor {
             self.note_error("selected unit is absent from Cargo graph".into());
             return;
         };
+        if publication {
+            let publication = (|| -> Result<Vec<(String, PathBuf)>, String> {
+                let info = runner.bcx.target_data.info(unit.kind);
+                let target = runner.bcx.target_data.short_name(&unit.kind);
+                let (types, _) = info.rustc_outputs(unit.mode, unit.target.kind(), target)
+                    .map_err(|error| error.to_string())?;
+                let outputs = runner.outputs(unit).map_err(|error| error.to_string())?;
+                let metadata = runner.files().metadata(unit).c_extra_filename().map(|hash| hash.to_string());
+                let mut result = Vec::new();
+                for file_type in types {
+                    if !matches!(file_type.flavor, cargo::compiler::FileFlavor::Normal | cargo::compiler::FileFlavor::Linkable) {
+                        continue;
+                    }
+                    let kind = match file_type.crate_type {
+                        Some(cargo::compiler::CrateType::Bin) => "bin",
+                        Some(cargo::compiler::CrateType::Dylib) => "dylib",
+                        Some(cargo::compiler::CrateType::Cdylib) => "cdylib",
+                        _ => continue,
+                    };
+                    let source = runner.files().output_dir(unit)
+                        .join(file_type.output_filename(&unit.target, metadata.as_deref()));
+                    let output = outputs.iter().find(|output| output.path == source)
+                        .ok_or("typed Cargo artifact output has no publication record")?;
+                    result.push((kind.to_owned(), output.bin_dst().clone()));
+                }
+                Ok(result)
+            })();
+            match publication {
+                Ok(outputs) => match self.artifact_publications.lock() {
+                    Ok(mut declarations) => {
+                        if declarations.insert(key.clone(), outputs.clone()).is_some_and(|old| old != outputs) {
+                            self.note_error("Cargo artifact publication changed during capture".into());
+                            return;
+                        }
+                    }
+                    Err(_) => { self.note_error("Cargo artifact publication lock poisoned".into()); return; }
+                },
+                Err(error) => { self.note_error(error); return; }
+            }
+        }
+        if !selected { return; }
         let Some(source) = unit.target.src_path().path() else {
             self.note_error("selected unit has no source path".into());
             return;
@@ -378,6 +479,7 @@ impl Executor for CaptureExecutor {
             return DefaultExecutor.exec(cmd, id, target, mode, stdout, stderr);
         };
         let mut captured = cmd.clone();
+        let entry_request = self.entry_request(&key, cmd).map_err(cargo::util::errors::internal)?;
         let compiler = fs::canonicalize(Path::new(cmd.get_program()))?;
         let helper = compiler.with_file_name(if cfg!(windows) {
             "cargo-asksource.exe"
@@ -390,6 +492,8 @@ impl Executor for CaptureExecutor {
                 cmd.get_cwd().unwrap_or(&self.cwd), &launcher_environment(cmd).map_err(cargo::util::errors::internal)?).map_err(cargo::util::errors::internal)?;
             crate::launcher::validate(&launcher, &self.request).map_err(cargo::util::errors::internal)?;
             let capture = json!({"output": self.fact_path(&key), "request": self.request_path,
+                "entry_input_request": entry_request.as_ref().map(|(path, _)| path),
+                "entry_input_request_sha256": entry_request.as_ref().map(|(_, hash)| hash),
                 "request_sha256": crate::digest(&fs::read(&self.request_path)?), "launcher": launcher});
             captured.arg(format!("{}{}", crate::launcher::control::PREFIX, capture));
         } else {
@@ -397,8 +501,12 @@ impl Executor for CaptureExecutor {
                 std::ffi::OsString::from("capture"), "--output".into(), self.fact_path(&key).into_os_string(),
                 "--request".into(), self.request_path.clone().into_os_string(),
                 "--request-sha256".into(), crate::digest(&fs::read(&self.request_path)?).into(),
-                "--".into(), cmd.get_program().clone(),
             ];
+            if let Some((path, hash)) = &entry_request {
+                compiler_args.extend(["--entry-input-request".into(), path.clone().into_os_string(),
+                    "--entry-input-request-sha256".into(), hash.into()]);
+            }
+            compiler_args.extend(["--".into(), cmd.get_program().clone()]);
             compiler_args.extend(args.into_iter().cloned());
             captured.program(helper).args_replace(&compiler_args);
         }
@@ -593,9 +701,32 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
     );
     let mut selected = BTreeSet::new();
     let mut selected_by_base: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut primitive_units = HashSet::new();
+    if let Some(policy) = std::env::var_os("ASK_ENTRY_LINK_POLICY") {
+        let policy = read_json(Path::new(&policy))?;
+        let manifests: Vec<PathBuf> = serde_json::from_value(policy["primitive_manifests"].clone())
+            .map_err(|error| format!("invalid primitive capture manifests: {error}"))?;
+        let manifests: BTreeSet<_> = manifests.into_iter().map(fs::canonicalize)
+            .collect::<Result<_, _>>().map_err(|error| error.to_string())?;
+        let mut pending: Vec<_> = bcx.unit_graph.keys().filter(|unit|
+            fs::canonicalize(unit.pkg.manifest_path()).is_ok_and(|path| manifests.contains(&path)))
+            .cloned().collect();
+        pending.extend(bcx.unit_graph.keys().filter(|unit| {
+            matches!(unit.kind, self::cargo::compiler::CompileKind::Target(target)
+                if target.rustc_target() == "x86_64-unknown-ask")
+                && unit.target.is_executable()
+                && !unit.mode.is_run_custom_build()
+        }).cloned());
+        while let Some(unit) = pending.pop() {
+            if !primitive_units.insert(unit.clone()) { continue; }
+            for edge in bcx.unit_graph.get(&unit).ok_or("missing primitive dependency unit")? {
+                pending.push(edge.unit.clone());
+            }
+        }
+    }
     for unit in
         bcx.unit_graph.keys().filter(|unit| !unit.mode.is_run_custom_build()).filter(|unit| {
-            unit.target.src_path().path().is_some_and(|path| {
+            primitive_units.contains(*unit) || unit.target.src_path().path().is_some_and(|path| {
                 fs::canonicalize(path).is_ok_and(|path| canonical_sources.contains(&path))
             }) || fs::canonicalize(unit.pkg.manifest_path())
                 .is_ok_and(|path| canonical_manifests.contains(&path))
@@ -619,17 +750,18 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
         selected,
         selected_by_base,
         dispatch: Mutex::new(BTreeMap::new()),
+        artifact_publications: Mutex::new(BTreeMap::new()),
         errors: Mutex::new(Vec::new()),
         compiled_build_script: AtomicBool::new(false),
     });
     drop(bcx);
     let exec: Arc<dyn Executor> = executor.clone();
-    cargo::ops::compile_with_exec(&ws, &options, &exec).map_err(|e| e.to_string())?;
+    let mut compilation = cargo::ops::compile_with_exec(&ws, &options, &exec).map_err(|e| e.to_string())?;
     if executor.compiled_build_script.swap(false, Ordering::Relaxed) {
         // A forced script compile does not transitively invalidate its run unit.
         // Let Cargo settle script runs and dependents before publishing facts.
         executor.dispatch.lock().map_err(|_| "Cargo capture dispatch poisoned")?.clear();
-        cargo::ops::compile_with_exec(&ws, &options, &exec).map_err(|e| e.to_string())?;
+        compilation = cargo::ops::compile_with_exec(&ws, &options, &exec).map_err(|e| e.to_string())?;
     }
     let errors = executor.errors.lock().map_err(|_| "Cargo capture errors poisoned")?;
     if !errors.is_empty() {
@@ -658,12 +790,56 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
             "record": executor.record_path(key),
             "record_sha256": crate::digest(&fs::read(executor.record_path(key)).map_err(|e| e.to_string())?)}));
     }
+    let mut published_artifacts: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    let mut published_paths = BTreeMap::new();
+    let declarations = executor.artifact_publications.lock()
+        .map_err(|_| "Cargo artifact publication lock poisoned")?;
+    let mut publications = Vec::new();
+    for output in &compilation.binaries {
+        let path = std::path::absolute(&output.path).map_err(|error| error.to_string())?;
+        let mut identity = None;
+        for (key, outputs) in declarations.iter() {
+            for (kind, declared) in outputs {
+                if kind != "bin" || std::path::absolute(declared).map_err(|error| error.to_string())? != path {
+                    continue;
+                }
+                if executor.graph["units"][key]["unit"] != descriptor(&output.unit)
+                    || identity.replace(key.clone()).is_some()
+                {
+                    return Err("published Cargo binary has an ambiguous unit identity".into());
+                }
+            }
+        }
+        let key = identity.ok_or("published artifact has no captured Cargo unit identity")?;
+        publications.push((key, "bin".to_owned(), path));
+    }
+    for (key, outputs) in declarations.iter() {
+        for (kind, path) in outputs {
+            if kind != "bin" { publications.push((key.clone(), kind.clone(), path.clone())); }
+        }
+    }
+    for (key, kind, path) in publications {
+        let path = std::path::absolute(path).map_err(|error| error.to_string())?;
+        let hash = crate::digest(&fs::read(&path)
+            .map_err(|error| format!("published artifact {}: {error}", path.display()))?);
+        if let Some(previous) = published_paths.insert(path.clone(), (key.clone(), kind.clone(), hash.clone())) {
+            if previous != (key.clone(), kind.clone(), hash.clone()) {
+                return Err(format!("Cargo published conflicting unit identities at {}", path.display()));
+            }
+            continue;
+        }
+        published_artifacts.entry(key).or_default()
+            .push(json!({"kind": kind, "path": path, "sha256": hash}));
+    }
+    for outputs in published_artifacts.values_mut() {
+        outputs.sort_by_cached_key(Value::to_string);
+    }
     publish(
         &snapshot,
         &json!({"complete": true, "request": executor.request,
         "graph": executor.graph, "graph_inputs": executor.graph_inputs, "graph_sha256": executor.graph_sha256,
         "configuration_sha256": executor.configuration_sha256, "cwd": executor.cwd,
-        "producer": executor.producer, "facts": facts, "cargo": cargo_exe,
+        "producer": executor.producer, "facts": facts, "published_artifacts": published_artifacts, "cargo": cargo_exe,
         "cargo_sha256": crate::digest(&fs::read(&cargo_exe).map_err(|e| e.to_string())?)}),
     )
 }

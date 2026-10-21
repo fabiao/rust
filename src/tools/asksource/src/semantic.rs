@@ -828,11 +828,15 @@ struct Capture {
     definitions: RecordWriter,
     loaded: Arc<Mutex<LoadedInputs>>,
     error: Option<String>,
+    entry: Option<crate::entry_inputs::Capture>,
 }
 
 impl rustc_driver::Callbacks for Capture {
     fn config(&mut self, config: &mut interface::Config) {
         self.standard.config(config);
+        if let Some(entry) = &mut self.entry {
+            if let Err(error) = entry.configure(config) { self.error = Some(error); }
+        }
         config.file_loader = Some(Box::new(RecordingLoader {
             inner: config.file_loader.take().unwrap_or_else(|| Box::new(RealFileLoader)),
             inputs: Arc::clone(&self.loaded),
@@ -841,8 +845,17 @@ impl rustc_driver::Callbacks for Capture {
 
     fn after_analysis<'tcx>(&mut self, _compiler: &interface::Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
         tcx.dcx().abort_if_errors();
+        if self.error.is_some() { return Compilation::Stop; }
         match rustc_middle::ty::print::with_no_trimmed_paths!(self.collect(tcx)) {
-            Ok(bytes) => self.pending = Some(bytes),
+            Ok(mut bytes) => {
+                if let Some(entry) = &mut self.entry {
+                    if let Err(error) = entry.pending(tcx, &mut bytes) {
+                        self.error = Some(error);
+                        return Compilation::Stop;
+                    }
+                }
+                self.pending = Some(bytes);
+            }
             Err(error) => {
                 self.error = Some(error);
                 return Compilation::Stop;
@@ -982,11 +995,14 @@ impl Capture {
                 output_paths.push(std::path::absolute(output.as_path()).map_err(|e| e.to_string())?);
             }
         }
-        let response = json!({"complete": true, "output_paths": output_paths, "arguments": self.args, "sources": sources,
+        let mut response = json!({"complete": true, "output_paths": output_paths, "arguments": self.args, "sources": sources,
             "cwd": cwd, "sysroot": sysroot, "dependency_artifacts": artifacts,
             "cfg": tcx.sess.config.iter().map(|(name, value)| json!([name.as_str(), value.map(|v| v.as_str().to_owned())])).collect::<Vec<_>>(),
             "helper_sha256": helper_hash, "compiler_sha256": compiler_hash,
             "file_inputs": inputs, "environment_inputs": environment});
+        if tcx.output_filenames(()).outputs.should_codegen() {
+            response["codegen_modules"] = json!(crate::entry_inputs::codegen_modules(tcx, &response)?);
+        }
         Ok(response)
     }
 }
@@ -998,6 +1014,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
         .arg(Arg::new("request").long("request").requires("request-sha256").value_parser(value_parser!(PathBuf)))
         .arg(Arg::new("request-sha256").long("request-sha256").requires("request"))
         .arg(Arg::new("launcher").long("launcher").requires("request"))
+        .arg(Arg::new("entry-input-request").long("entry-input-request")
+            .requires("entry-input-request-sha256").value_parser(value_parser!(PathBuf)))
+        .arg(Arg::new("entry-input-request-sha256").long("entry-input-request-sha256").requires("entry-input-request"))
         .arg(Arg::new("compiler").required(true).num_args(1..).last(true))
         .try_get_matches_from(std::iter::once("capture").chain(args.iter().map(String::as_str)))
         .map_err(|e| e.to_string())?;
@@ -1056,7 +1075,12 @@ pub fn run(args: &[String]) -> Result<(), String> {
         }
     }
     let effective_environment = crate::launcher::environment(&Default::default())?;
-    let mut capture = Capture { standard: rustc_driver::TimePassesCallbacks::default(), args: args.clone(), pending: None, error: None,
+    let entry = matches.get_one::<PathBuf>("entry-input-request").map(|path| {
+        crate::entry_inputs::Capture::load(path,
+            matches.get_one::<String>("entry-input-request-sha256").ok_or("missing entry request hash")?, &destination, &args)
+    }).transpose()?;
+    if let Some(entry) = &entry { tool_inputs.extend(entry.tracked_inputs()?); }
+    let mut capture = Capture { standard: rustc_driver::TimePassesCallbacks::default(), args: args.clone(), pending: None, error: None, entry,
         nodes: RecordWriter::new(&destination, records::field::NODES)?,
         definitions: RecordWriter::new(&destination, records::field::DEFINITIONS)?,
         loaded: Arc::new(Mutex::new(LoadedInputs::default())) };
@@ -1108,5 +1132,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let bytes = serde_json::to_vec(&facts).map_err(|e| e.to_string())?;
     let temporary = destination.with_extension("partial");
     fs::write(&temporary, bytes).map_err(|e| format!("{}: {e}", temporary.display()))?;
-    fs::rename(&temporary, &destination).map_err(|e| format!("{}: {e}", destination.display()))
+    fs::rename(&temporary, &destination).map_err(|e| format!("{}: {e}", destination.display()))?;
+    if let Some(entry) = &capture.entry { entry.complete(&destination)?; }
+    Ok(())
 }

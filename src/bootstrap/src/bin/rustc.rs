@@ -184,7 +184,13 @@ fn main() {
         cmd.arg("capture").arg("--output").arg(capture["output"].as_str().expect("capture output"))
             .arg("--request").arg(capture["request"].as_str().expect("capture request"))
             .arg("--request-sha256").arg(capture["request_sha256"].as_str().expect("capture request hash"))
-            .arg("--launcher").arg(capture["launcher"].to_string()).arg("--").arg(compiler);
+            .arg("--launcher").arg(capture["launcher"].to_string());
+        if let Some(path) = capture["entry_input_request"].as_str() {
+            cmd.arg("--entry-input-request").arg(path)
+                .arg("--entry-input-request-sha256")
+                .arg(capture["entry_input_request_sha256"].as_str().expect("entry capture request hash"));
+        }
+        cmd.arg("--").arg(compiler);
         cmd
     } else { match env::var_os("RUSTC_WRAPPER_REAL") {
         Some(wrapper) if !wrapper.is_empty() => {

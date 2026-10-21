@@ -1859,6 +1859,11 @@ rustc_queries! {
         desc { "checking if the crate has_global_allocator" }
         separate_provide_extern
     }
+    query has_default_lib_allocator(_: CrateNum) -> bool {
+        eval_always
+        desc { "checking if the crate has_default_lib_allocator" }
+        separate_provide_extern
+    }
     query has_alloc_error_handler(_: CrateNum) -> bool {
         // This query depends on untracked global state in CStore
         eval_always

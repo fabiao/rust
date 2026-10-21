@@ -870,9 +870,7 @@ pub(crate) fn optimize(
     let _handlers =
         DiagnosticHandlers::new(cgcx, shared_emitter, llcx, module, CodegenDiagnosticsStage::Opt);
 
-    if module.kind == ModuleKind::Regular {
-        save_temp_bitcode(cgcx, module, "no-opt");
-    }
+    save_temp_bitcode(cgcx, module, "no-opt");
 
     // FIXME(ZuseZ4): support SanitizeHWAddress and prevent illegal/unsupported opts
 

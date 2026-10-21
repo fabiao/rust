@@ -8,9 +8,12 @@ extern crate rustc_interface;
 extern crate rustc_middle;
 extern crate rustc_span;
 extern crate rustc_session;
+extern crate rustc_codegen_ssa;
+extern crate rustc_structures;
 
 mod syntax;
 mod semantic;
+mod entry_inputs;
 mod records;
 mod launcher;
 mod cargo_build;
