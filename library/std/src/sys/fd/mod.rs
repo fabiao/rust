@@ -3,6 +3,10 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 cfg_select! {
+    target_os = "ask" => {
+        pub(crate) mod ask;
+        pub use ask::*;
+    }
     any(target_family = "unix", target_os = "wasi") => {
         mod unix;
         pub use unix::*;

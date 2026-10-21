@@ -140,7 +140,12 @@ pub(crate) fn cleanup() {
     static CLEANUP: Once = Once::new();
     CLEANUP.call_once(|| unsafe {
         // Flush stdout and disable buffering.
+        #[cfg(not(target_os = "ask"))]
         crate::io::cleanup();
+        #[cfg(target_os = "ask")]
+        if ask_entry::execution_class() != ask_fd::execution_class::CLASS1 {
+            crate::io::cleanup();
+        }
         // SAFETY: Only called once during runtime cleanup.
         sys::cleanup();
     });
@@ -155,6 +160,11 @@ fn lang_start_internal(
     argv: *const *const u8,
     sigpipe: u8,
 ) -> isize {
+    #[cfg(target_os = "ask")]
+    return ask_entry::run(main, argc, argv, sigpipe);
+
+    #[cfg(not(target_os = "ask"))]
+    {
     // Guard against the code called by this function from unwinding outside of the Rust-controlled
     // code, which is UB. This is a requirement imposed by a combination of how the
     // `#[lang="start"]` attribute is implemented as well as by the implementation of the panicking
@@ -192,7 +202,12 @@ fn lang_start_internal(
         ret_code
     })
     .unwrap_or_else(handle_rt_panic)
+    }
 }
+
+#[cfg(all(target_os = "ask", not(test)))]
+#[path = "rt/ask_entry.rs"]
+pub(crate) mod ask_entry;
 
 #[cfg(not(any(test, doctest)))]
 #[lang = "start"]

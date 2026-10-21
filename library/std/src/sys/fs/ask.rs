@@ -1,24 +1,11 @@
-//! `std::fs` PAL for ask: a blocking `File` bridging onto `askfs`'s
-//! `FS_OP_*` wire protocol (`ask_io::fs`) over a `SyncChannel`
-//! (`sys::pal::ask::channel`, re-exported as `sys::channel`). One fresh
-//! channel per `File::open` — `askfs`
-//! itself allows only one open handle per accepted session
-//! (`MAX_OPEN_HANDLES = 1`), so multiplexing several files over one channel
-//! isn't possible even in principle.
-//!
-//! The process's namespace bindings arrive once at spawn time in the
-//! fixed startup view (`GetSpawnBlob(SPAWN_BLOB_VIEW,..)`,
-//! `ask_abi::view`); this module decodes mount capability tokens and optional
-//! source roots so paths like `/out/marker.txt` or `/in/asset.txt` map to
-//! provider-relative opens (`profiles/…/out/marker.txt`, `apptest/in/asset.txt`).
+//! Files retain resident descriptors; path operations use the scoped startup view.
 
 use crate::ffi::OsString;
 use crate::hash::Hash;
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut, SeekFrom};
 use crate::path::{Path, PathBuf};
-use crate::sync::Mutex;
-pub use crate::sys::fs::common::{Dir, ExtraHomeDirs, ExtraMediaDirs};
 use crate::sys::channel::SyncChannel;
+pub use crate::sys::fs::common::{Dir, ExtraHomeDirs, ExtraMediaDirs};
 use crate::sys::pal::unsupported_err;
 use crate::sys::time::SystemTime;
 use crate::sys::unsupported;
@@ -33,13 +20,10 @@ fn startup_view() -> io::Result<ask_io::view::View> {
 fn resolve_fs_path(path: &Path) -> io::Result<(u32, heapless_path::PathBuf)> {
     let path = path.to_str().ok_or_else(unsupported_err)?;
     let view = startup_view()?;
-    let resolved = view
-        .resolve(path, ask_io::view::Operation::Read)
-        .map_err(|_| unsupported_err())?;
+    let resolved =
+        view.resolve(path, ask_io::view::Operation::Read).map_err(|_| unsupported_err())?;
     let mut encoded = [0u8; ask_io::fs::PATH_MAX];
-    let relative = resolved
-        .encode_path(&mut encoded)
-        .map_err(|_| unsupported_err())?;
+    let relative = resolved.encode_path(&mut encoded).map_err(|_| unsupported_err())?;
     let mut out = heapless_path::PathBuf::new();
     out.push(relative.as_bytes())?;
     Ok((resolved.provider_token, out))
@@ -57,17 +41,11 @@ mod heapless_path {
 
     impl PathBuf {
         pub fn new() -> Self {
-            Self {
-                buf: [0; ask_io::fs::PATH_MAX],
-                len: 0,
-            }
+            Self { buf: [0; ask_io::fs::PATH_MAX], len: 0 }
         }
 
         pub fn push(&mut self, bytes: &[u8]) -> io::Result<()> {
-            let end = self
-                .len
-                .checked_add(bytes.len())
-                .ok_or_else(unsupported_err)?;
+            let end = self.len.checked_add(bytes.len()).ok_or_else(unsupported_err)?;
             if end > ask_io::fs::PATH_MAX {
                 return Err(unsupported_err());
             }
@@ -200,15 +178,11 @@ impl FileAttr {
     }
 
     pub fn perm(&self) -> FilePermissions {
-        FilePermissions {
-            readonly: self.mode & MODE_OWNER_WRITE == 0,
-        }
+        FilePermissions { readonly: self.mode & MODE_OWNER_WRITE == 0 }
     }
 
     pub fn file_type(&self) -> FileType {
-        FileType {
-            is_dir: self.is_dir,
-        }
+        FileType { is_dir: self.is_dir }
     }
 
     pub fn modified(&self) -> io::Result<SystemTime> {
@@ -290,21 +264,9 @@ impl OpenOptions {
     }
 }
 
-/// One open file's mutable state: the `askfs` channel plus the client-side
-/// cursor/size tracking `askio::fs::File` also keeps, since `askfs`'s wire
-/// protocol carries no server-side "current position" concept of its own.
-struct Inner {
-    channel: SyncChannel,
-    position: u64,
-    size: u64,
-}
-
-/// A single open file with its own `SyncChannel` and handle. The mutex
-/// serializes wire operations and cursor updates when callers share the file.
+/// One alias in the resident description owner.
 pub struct File {
-    inner: Mutex<Inner>,
-    handle: u32,
-    append: bool,
+    descriptor: crate::sys::fd::FileDesc,
 }
 
 fn map_fs_result(result: i32) -> io::Result<()> {
@@ -318,7 +280,7 @@ fn map_fs_result(result: i32) -> io::Result<()> {
 /// missing path — actively misleading, and indistinguishable to a caller that
 /// wants to react to one but not the others. Unrecognized codes keep the
 /// conservative `Other`, never a specific kind the provider did not state.
-fn fs_error(result: i32, context: &'static str) -> io::Error {
+pub(crate) fn fs_error(result: i32, context: &'static str) -> io::Error {
     use ask_io::fs::FsError;
 
     let kind = match FsError::from_result(result) {
@@ -363,10 +325,7 @@ fn path_exchange<const N: usize>(
     channel.call(op, &request)
 }
 
-/// One path-addressed round trip. `askfs`'s stateless metadata operations
-/// (metadata, `MKDIR`, `UNLINK`, `RENAME`, directory enumeration, ...) need no open
-/// handle, but each still requires an accepted session because the provider
-/// serves only one client Channel at a time.
+/// A path-addressed metadata operation uses its own admitted provider Channel.
 fn metadata_call<T, const N: usize>(
     provider_token: u32,
     op: u32,
@@ -418,238 +377,198 @@ fn stat_path(path: &Path, nofollow: bool) -> io::Result<FileAttr> {
 
 impl File {
     pub fn open(path: &Path, opts: &OpenOptions) -> io::Result<File> {
-        let (provider_token, relative) = resolve_fs_path(path)?;
-        let mut channel =
-            SyncChannel::create_leased(provider_token, ask_io::fs::path_window::CHANNEL_PAGES)
-                .map_err(|_| io::const_error!(io::ErrorKind::NotFound, "fs provider unreachable"))?;
-
-        let mut request = [0u8; ask_io::fs::FS_OPEN_REQUEST_LEN];
-        let window = channel
-            .shared_region_mut(ask_io::fs::path_window::OFFSET, ask_io::fs::path_window::LEN)
-            .ok_or_else(unsupported_err)?;
-        let payload = ask_io::fs::encode_fs_open_request(
-            &mut request,
-            window,
-            opts.wire_flags(),
-            relative.as_bytes(),
-        )
-        .ok_or_else(unsupported_err)?;
-        let completion = channel.call(ask_io::fs::OP_OPEN, payload)?;
-        if completion.result < 0 {
-            return Err(fs_error(completion.result, "fs: open failed"));
-        }
-        let (handle, size) =
-            ask_io::fs::decode_fs_open_reply(completion.payload()).ok_or_else(unsupported_err)?;
-        if handle == ask_io::fs::HANDLE_INVALID {
-            return Err(io::const_error!(
-                io::ErrorKind::Other,
-                "fs: open returned no handle"
-            ));
-        }
-
-        Ok(File {
-            inner: Mutex::new(Inner {
-                channel,
-                position: if opts.append { size } else { 0 },
-                size,
-            }),
-            handle,
-            append: opts.append,
-        })
-    }
-
-    /// Query the provider object retained by this open description, avoiding
-    /// both a path race and stale client-side size/timestamp projections.
-    pub fn file_attr(&self) -> io::Result<FileAttr> {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let mut request = [0u8; ask_io::fs::FS_METADATA_HANDLE_REQUEST_LEN];
-        let payload = ask_io::fs::encode_fs_metadata_handle_request(&mut request, self.handle);
-        let completion = inner.channel.call(ask_io::fs::OP_METADATA, payload)?;
-        map_fs_result(completion.result)?;
-        ask_io::fs::decode_fs_metadata(completion.payload())
-            .map(FileAttr::from_metadata)
-            .ok_or_else(unsupported_err)
-    }
-
-    pub fn fsync(&self) -> io::Result<()> {
-        Ok(())
-    }
-
-    pub fn datasync(&self) -> io::Result<()> {
-        Ok(())
-    }
-
-    pub fn truncate(&self, size: u64) -> io::Result<()> {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let mut request = [0u8; 12];
-        let payload = ask_io::fs::encode_fs_ftruncate_request(&mut request, self.handle, size);
-        let completion = inner.channel.call(ask_io::fs::OP_FTRUNCATE, payload)?;
-        map_fs_result(completion.result)?;
-        inner.size = size;
-        if inner.position > size {
-            inner.position = size;
-        }
-        Ok(())
-    }
-
-    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let want = buf.len().min(ask_io::fs::READ_DATA_MAX);
-        let mut request = [0u8; 16];
-        let payload = ask_io::fs::encode_fs_read_request(
-            &mut request,
-            self.handle,
-            inner.position,
-            want as u32,
-        );
-        let completion = inner.channel.call(ask_io::fs::OP_READ, payload)?;
-        if completion.result < 0 {
-            return Err(fs_error(completion.result, "askfs: read failed"));
-        }
-        let data = completion.payload();
-        let n = data.len().min(buf.len());
-        buf[..n].copy_from_slice(&data[..n]);
-        inner.position += n as u64;
-        Ok(n)
-    }
-
-    pub fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
-        crate::io::default_read_vectored(|b| self.read(b), bufs)
-    }
-
-    pub fn is_read_vectored(&self) -> bool {
-        false
-    }
-
-    pub fn read_buf(&self, cursor: BorrowedCursor<'_, u8>) -> io::Result<()> {
-        crate::io::default_read_buf(|buf| self.read(buf), cursor)
-    }
-
-    pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let n = buf.len().min(ask_io::fs::WRITE_DATA_MAX);
-        // `askfs` always lands an append-mode write at the tree's live EOF,
-        // ignoring the declared offset — declaring `size` here (not
-        // `position`) matches that server behavior, mirroring
-        // `askio::fs::File`'s own append handling.
-        let offset = if self.append { inner.size } else { inner.position };
-        let mut request = [0u8; 12 + ask_io::fs::WRITE_DATA_MAX];
-        let payload =
-            ask_io::fs::encode_fs_write_request(&mut request, self.handle, offset, &buf[..n])
+        crate::sys::fd::blocking(async {
+            let (provider_token, relative) = resolve_fs_path(path)?;
+            let source = crate::sys::fd::mount_source(provider_token)?;
+            let pages = ask_io::fs::path_window::CHANNEL_PAGES;
+            let mut channel = ask_ipc::SyncChannel::create_leased(source.record.token.0, pages)
+                .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+            let rights = (if opts.read { ask_io::fd::rights::READ } else { 0 })
+                | (if opts.write || opts.append { ask_io::fd::rights::WRITE } else { 0 })
+                | ask_io::fd::rights::TRANSFER;
+            if rights & ask_io::fd::rights::ACCESS == 0 {
+                return Err(io::Error::from(io::ErrorKind::InvalidInput));
+            }
+            let mut request = [0; ask_io::fs::FS_OPEN_REQUEST_LEN];
+            let window = channel
+                .shared_region_mut(ask_io::fs::path_window::OFFSET, ask_io::fs::path_window::LEN)
                 .ok_or_else(unsupported_err)?;
-        let completion = inner.channel.call(ask_io::fs::OP_WRITE, payload)?;
-        if completion.result < 0 {
-            return Err(fs_error(completion.result, "askfs: write failed"));
-        }
-        let written = ask_io::fs::decode_fs_handle(completion.payload())
-            .ok_or_else(unsupported_err)? as usize;
-        let written = written.min(n);
-        inner.position = offset + written as u64;
-        if inner.position > inner.size {
-            inner.size = inner.position;
-        }
-        Ok(written)
+            let payload = ask_io::fs::encode_fs_open_request(
+                &mut request,
+                window,
+                opts.wire_flags(),
+                rights,
+                relative.as_bytes(),
+            )
+            .ok_or_else(unsupported_err)?;
+            let deadline = ask_sys::get_monotonic_ms()
+                .checked_add(ask_ipc::directory::policy::DEADLINE_MS)
+                .ok_or_else(unsupported_err)?;
+            let completion =
+                crate::sys::fd::call(&mut channel, ask_io::fs::OP_OPEN, payload, deadline)?;
+            if completion.result != 0 {
+                return Err(fs_error(completion.result, "file open failed"));
+            }
+            let reply = ask_io::fs::decode_fs_open_reply(completion.payload())
+                .filter(|reply| reply.granted_rights == rights)
+                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+            let descriptor = crate::sys::fd::bind_native(source, channel, pages, reply)?;
+            Ok(File { descriptor })
+        })?
     }
 
+    pub fn as_raw_fd(&self) -> i32 {
+        self.descriptor.as_raw_fd()
+    }
+    pub fn file_attr(&self) -> io::Result<FileAttr> {
+        let mut bytes = [0; ask_io::fs::METADATA_LEN];
+        let result =
+            crate::sys::fd::blocking(crate::sys::fd::metadata(self.as_raw_fd(), &mut bytes))??;
+        if result.encoding != ask_fd::metadata_encoding::FILESYSTEM
+            || result.byte_length != bytes.len() as u64
+        {
+            return Err(io::Error::from(io::ErrorKind::InvalidData));
+        }
+        ask_io::fs::decode_fs_metadata(&bytes)
+            .map(FileAttr::from_metadata)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))
+    }
+    pub fn fsync(&self) -> io::Result<()> {
+        self.descriptor.flush()
+    }
+    pub fn datasync(&self) -> io::Result<()> {
+        self.descriptor.flush()
+    }
+    pub fn truncate(&self, size: u64) -> io::Result<()> {
+        let mut bytes = [0; ask_io::fs::FS_FTRUNCATE_REQUEST_LEN];
+        let payload = ask_io::fs::encode_fs_ftruncate_request(&mut bytes, size);
+        crate::sys::fd::blocking(crate::sys::fd::native(
+            self.as_raw_fd(),
+            ask_io::fs::OP_FTRUNCATE,
+            payload,
+            &mut [],
+        ))?
+        .map(|_| ())
+    }
+    pub fn read(&self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.descriptor.read(bytes)
+    }
+    pub fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
+        self.descriptor.read_vectored(bufs)
+    }
+    pub fn is_read_vectored(&self) -> bool {
+        self.descriptor.is_read_vectored()
+    }
+    pub fn read_buf(&self, cursor: BorrowedCursor<'_, u8>) -> io::Result<()> {
+        self.descriptor.read_buf(cursor)
+    }
+    pub fn write(&self, bytes: &[u8]) -> io::Result<usize> {
+        self.descriptor.write(bytes)
+    }
     pub fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-        crate::io::default_write_vectored(|b| self.write(b), bufs)
+        self.descriptor.write_vectored(bufs)
     }
-
     pub fn is_write_vectored(&self) -> bool {
-        false
+        self.descriptor.is_write_vectored()
     }
-
     pub fn flush(&self) -> io::Result<()> {
-        Ok(())
+        self.descriptor.flush()
     }
-
-    pub fn seek(&self, pos: SeekFrom) -> io::Result<u64> {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let new_position = match pos {
-            SeekFrom::Start(offset) => offset,
-            SeekFrom::End(delta) => {
-                let base = inner.size as i64;
-                base.checked_add(delta)
-                    .filter(|v| *v >= 0)
-                    .ok_or_else(|| io::const_error!(io::ErrorKind::InvalidInput, "seek out of range"))?
-                    as u64
-            }
-            SeekFrom::Current(delta) => {
-                let base = inner.position as i64;
-                base.checked_add(delta)
-                    .filter(|v| *v >= 0)
-                    .ok_or_else(|| io::const_error!(io::ErrorKind::InvalidInput, "seek out of range"))?
-                    as u64
-            }
+    pub fn seek(&self, position: SeekFrom) -> io::Result<u64> {
+        let (position, absolute_offset, seek_delta) = match position {
+            SeekFrom::Start(offset) => (ask_fd::position::ABSOLUTE, offset, 0),
+            SeekFrom::Current(delta) => (ask_fd::position::DESCRIPTION_CURSOR, 0, delta),
+            SeekFrom::End(delta) => (ask_fd::position::END, 0, delta),
         };
-        inner.position = new_position;
-        Ok(new_position)
+        let request = ask_fd::IoRequest {
+            action: ask_fd::action::SEEK,
+            position,
+            absolute_offset,
+            seek_delta,
+            requested_count: 0,
+            native_opcode: 0,
+            reserved: 0,
+        };
+        crate::sys::fd::blocking(crate::sys::fd::perform(self.as_raw_fd(), request, &[], &mut []))?
+            .map(|result| result.resulting_position)
     }
-
     pub fn size(&self) -> Option<io::Result<u64>> {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        Some(Ok(inner.size))
+        Some(self.file_attr().map(|attribute| attribute.size()))
     }
-
     pub fn tell(&self) -> io::Result<u64> {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(inner.position)
+        self.seek(SeekFrom::Current(0))
     }
-
-    pub fn duplicate(&self) -> io::Result<File> {
-        unsupported()
+    pub fn duplicate(&self) -> io::Result<Self> {
+        self.descriptor.try_clone().map(|descriptor| Self { descriptor })
     }
-
-    pub fn set_permissions(&self, _perm: FilePermissions) -> io::Result<()> {
-        unsupported()
-    }
-
-    pub fn set_times(&self, times: FileTimes) -> io::Result<()> {
-        let update = times.to_update()?;
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let mut request = [0u8; ask_io::fs::FS_UTIMENS_HANDLE_REQUEST_LEN];
-        let payload =
-            ask_io::fs::encode_fs_utimens_handle_request(&mut request, self.handle, update);
-        let completion = inner.channel.call(ask_io::fs::OP_UTIMENS, payload)?;
-        if completion.result < 0 {
-            return Err(fs_error(completion.result, "fs: set times failed"));
+    pub fn set_permissions(&self, permissions: FilePermissions) -> io::Result<()> {
+        let mut mode = self.file_attr()?.mode;
+        if permissions.readonly {
+            mode &= !MODE_OWNER_WRITE;
+        } else {
+            mode |= MODE_OWNER_WRITE;
         }
-        Ok(())
+        let mut bytes = [0; ask_io::fs::FS_CHMOD_ATTACHMENT_REQUEST_LEN];
+        let payload = ask_io::fs::encode_fs_chmod_attachment_request(&mut bytes, mode);
+        crate::sys::fd::blocking(crate::sys::fd::native(
+            self.as_raw_fd(),
+            ask_io::fs::OP_CHMOD,
+            payload,
+            &mut [],
+        ))?
+        .map(|_| ())
     }
-
+    pub fn set_times(&self, times: FileTimes) -> io::Result<()> {
+        let mut bytes = [0; ask_io::fs::FS_UTIMENS_ATTACHMENT_REQUEST_LEN];
+        let payload =
+            ask_io::fs::encode_fs_utimens_attachment_request(&mut bytes, times.to_update()?);
+        crate::sys::fd::blocking(crate::sys::fd::native(
+            self.as_raw_fd(),
+            ask_io::fs::OP_UTIMENS,
+            payload,
+            &mut [],
+        ))?
+        .map(|_| ())
+    }
     pub fn lock(&self) -> io::Result<()> {
         unsupported()
     }
-
     pub fn lock_shared(&self) -> io::Result<()> {
         unsupported()
     }
-
     pub fn try_lock(&self) -> Result<(), crate::fs::TryLockError> {
         Err(crate::fs::TryLockError::Error(io::Error::from(io::ErrorKind::Unsupported)))
     }
-
     pub fn try_lock_shared(&self) -> Result<(), crate::fs::TryLockError> {
         Err(crate::fs::TryLockError::Error(io::Error::from(io::ErrorKind::Unsupported)))
     }
-
     pub fn unlock(&self) -> io::Result<()> {
         unsupported()
     }
 }
-
-impl Drop for File {
-    fn drop(&mut self) {
-        let mut request = [0u8; 4];
-        let payload = ask_io::fs::encode_fs_handle(&mut request, self.handle);
-        let inner = self.inner.get_mut().unwrap_or_else(|e| e.into_inner());
-        let _ = inner.channel.call(ask_io::fs::OP_CLOSE, payload);
+impl crate::os::fd::AsFd for File {
+    fn as_fd(&self) -> crate::os::fd::BorrowedFd<'_> {
+        crate::os::fd::AsFd::as_fd(&self.descriptor)
     }
 }
-
+impl crate::sys::AsInner<crate::sys::fd::FileDesc> for File {
+    fn as_inner(&self) -> &crate::sys::fd::FileDesc {
+        &self.descriptor
+    }
+}
+impl crate::sys::IntoInner<crate::sys::fd::FileDesc> for File {
+    fn into_inner(self) -> crate::sys::fd::FileDesc {
+        self.descriptor
+    }
+}
+impl crate::sys::FromInner<crate::sys::fd::FileDesc> for File {
+    fn from_inner(descriptor: crate::sys::fd::FileDesc) -> Self {
+        Self { descriptor }
+    }
+}
 impl crate::fmt::Debug for File {
     fn fmt(&self, f: &mut crate::fmt::Formatter<'_>) -> crate::fmt::Result {
-        f.debug_struct("File").field("handle", &self.handle).finish()
+        f.debug_struct("File").field("fd", &self.as_raw_fd()).finish()
     }
 }
 
@@ -781,9 +700,7 @@ impl DirEntry {
     }
 
     pub fn file_type(&self) -> io::Result<FileType> {
-        Ok(FileType {
-            is_dir: self.is_dir,
-        })
+        Ok(FileType { is_dir: self.is_dir })
     }
 }
 
@@ -817,10 +734,7 @@ pub fn rename(old: &Path, new: &Path) -> io::Result<()> {
     // two mounts would need a copy plus unlink, which is the caller's policy
     // to choose, not this PAL's.
     if old_provider != new_provider {
-        return Err(io::const_error!(
-            io::ErrorKind::CrossesDevices,
-            "fs: rename across providers"
-        ));
+        return Err(io::const_error!(io::ErrorKind::CrossesDevices, "fs: rename across providers"));
     }
     metadata_unit(
         old_provider,

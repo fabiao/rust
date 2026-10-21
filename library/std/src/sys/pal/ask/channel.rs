@@ -23,7 +23,7 @@ use crate::time::Duration;
 /// resolves within a human-imperceptible bound rather than wedging, long
 /// enough to keep the busy-poll overhead negligible against real IPC
 /// round-trip latency.
-const POLL_INTERVAL_MS: u64 = 25;
+pub(crate) const POLL_INTERVAL_MS: u64 = 25;
 
 /// One complete `[header][payload]` message popped off a ring, copied out of
 /// shared memory so it carries no borrow of `SyncChannel`.
@@ -129,6 +129,8 @@ impl SyncChannel {
     /// A mutable view into a protocol-defined portion of the shared mapping
     /// (e.g. `net`'s page-1 data window), bounds-checked against the pages
     /// actually mapped.
+    pub fn virt(&self) -> u64 { self.base.expose_provenance() as u64 }
+
     pub fn shared_region_mut(&mut self, offset: usize, len: usize) -> Option<&mut [u8]> {
         let mapped_len = self.pages.checked_mul(4096)? as usize;
         let end = offset.checked_add(len)?;

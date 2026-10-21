@@ -1,50 +1,38 @@
-//! `IsTerminal` for ask: stdio tracks the controlling-terminal lease.
-//! Ordinary files are never terminals; ASK has no fd-based `isatty`.
+//! Terminal identity is queried from the captured resident description.
 
 pub trait PalIsTerminal {
+    fn pal_is_terminal(&self) -> bool;
+}
+impl PalIsTerminal for crate::fs::File {
     fn pal_is_terminal(&self) -> bool {
-        false
+        crate::sys::fd::is_terminal(crate::os::fd::AsRawFd::as_raw_fd(self))
     }
 }
-
-impl PalIsTerminal for crate::fs::File {}
-
-impl PalIsTerminal for crate::io::Stdin {
+impl PalIsTerminal for crate::os::fd::OwnedFd {
     fn pal_is_terminal(&self) -> bool {
-        crate::sys::stdio::has_controlling_terminal()
+        crate::sys::fd::is_terminal(crate::os::fd::AsRawFd::as_raw_fd(self))
     }
 }
-
-impl PalIsTerminal for crate::io::Stdout {
+impl PalIsTerminal for crate::os::fd::BorrowedFd<'_> {
     fn pal_is_terminal(&self) -> bool {
-        crate::sys::stdio::has_controlling_terminal()
+        crate::sys::fd::is_terminal(crate::os::fd::AsRawFd::as_raw_fd(self))
     }
 }
-
-impl PalIsTerminal for crate::io::Stderr {
-    fn pal_is_terminal(&self) -> bool {
-        crate::sys::stdio::has_controlling_terminal()
-    }
+macro_rules! standard_stream {
+    ($type:ty, $number:expr) => {
+        impl PalIsTerminal for $type {
+            fn pal_is_terminal(&self) -> bool {
+                crate::sys::fd::is_terminal($number)
+            }
+        }
+    };
 }
-
-impl PalIsTerminal for crate::io::StdinLock<'_> {
-    fn pal_is_terminal(&self) -> bool {
-        crate::sys::stdio::has_controlling_terminal()
-    }
-}
-
-impl PalIsTerminal for crate::io::StdoutLock<'_> {
-    fn pal_is_terminal(&self) -> bool {
-        crate::sys::stdio::has_controlling_terminal()
-    }
-}
-
-impl PalIsTerminal for crate::io::StderrLock<'_> {
-    fn pal_is_terminal(&self) -> bool {
-        crate::sys::stdio::has_controlling_terminal()
-    }
-}
-
+standard_stream!(crate::io::Stdin, ask_io::fd::number::STDIN);
+standard_stream!(crate::io::Stdout, ask_io::fd::number::STDOUT);
+standard_stream!(crate::io::Stderr, ask_io::fd::number::STDERR);
+standard_stream!(crate::io::StdinLock<'_>, ask_io::fd::number::STDIN);
+standard_stream!(crate::io::StdoutLock<'_>, ask_io::fd::number::STDOUT);
+standard_stream!(crate::io::StderrLock<'_>, ask_io::fd::number::STDERR);
 pub fn is_terminal<T: PalIsTerminal>(value: &T) -> bool {
     value.pal_is_terminal()
 }

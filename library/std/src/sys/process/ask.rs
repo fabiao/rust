@@ -2,8 +2,7 @@
 //!
 //! `Command::new` takes an installed package identity, not a filesystem path.
 //! Motor OS's `motor.rs` is the file-shape donor; ASK rewrites spawn around
-//! `OP_LAUNCH` and an inherited `APP_LAUNCHER_TOKEN` because `std` cannot
-//! depend on `askme`.
+//! the descriptor launch transaction over the inherited Launcher authority.
 
 use super::CommandEnvs;
 use super::env::{CommandEnv, CommandResolvedEnvs};
@@ -12,15 +11,27 @@ use crate::num::NonZeroI32;
 use crate::path::Path;
 use crate::process::StdioPipes;
 use crate::sync::{Mutex, OnceLock};
+use crate::sys::FromInner;
 use crate::sys::channel::SyncChannel;
+use crate::sys::fd::FileDesc;
 use crate::sys::fs::File;
-use crate::sys::pipe::Pipe;
+#[path = "ask/activation.rs"]
+mod activation;
 use crate::sys::pal;
+use crate::sys::pipe::Pipe;
 use crate::{fmt, io};
 
 pub type EnvKey = OsString;
 
 static LAUNCHER: OnceLock<Mutex<SyncChannel>> = OnceLock::new();
+
+fn require_class2() -> io::Result<()> {
+    if crate::rt::ask_entry::execution_class() == ask_fd::execution_class::CLASS1 {
+        Err(io::Error::from(io::ErrorKind::WouldBlock))
+    } else {
+        Ok(())
+    }
+}
 
 pub enum Stdio {
     Inherit,
@@ -29,6 +40,8 @@ pub enum Stdio {
     ParentStdout,
     ParentStderr,
     InheritFile(File),
+    Pipe(Pipe),
+    Fd(FileDesc),
 }
 
 impl Stdio {
@@ -39,7 +52,9 @@ impl Stdio {
             Self::MakePipe => Ok(Self::MakePipe),
             Self::ParentStdout => Ok(Self::ParentStdout),
             Self::ParentStderr => Ok(Self::ParentStderr),
-            Self::InheritFile(_) => Ok(Self::Inherit),
+            Self::InheritFile(file) => file.duplicate().map(Self::InheritFile),
+            Self::Pipe(pipe) => pipe.try_clone().map(Self::Pipe),
+            Self::Fd(fd) => fd.try_clone().map(Self::Fd),
         }
     }
 }
@@ -122,6 +137,7 @@ impl Command {
         default: Stdio,
         needs_stdin: bool,
     ) -> io::Result<(Process, StdioPipes)> {
+        require_class2()?;
         let stdin = match self.stdin.as_ref() {
             Some(stdin) => stdin.try_clone()?,
             None if needs_stdin => default.try_clone()?,
@@ -145,23 +161,43 @@ impl Command {
 
         let name = package_name(&self.program)?;
         let argv = pack_os_fields(self.args.iter().map(OsString::as_os_str))?;
-        let mut env_pairs: Vec<(OsString, OsString)> =
-            self.env.capture().into_iter().map(|(k, v)| (k, v)).collect();
-        append_stdio_env(&mut env_pairs, &stdin, &stdout, &stderr)?;
+        let env_pairs: Vec<(OsString, OsString)> = self.env.capture().into_iter().collect();
         let env = pack_env_pairs(&env_pairs)?;
-
-        let launched = launch(name, &argv, &env)?;
-        let pipes = attach_parent_stdio(launched, &stdin, &stdout, &stderr)?;
+        let mut stdin = plan_stdio(stdin, ask_io::fd::number::STDIN)?;
+        let mut stdout = plan_stdio(stdout, ask_io::fd::number::STDOUT)?;
+        let mut stderr = plan_stdio(stderr, ask_io::fd::number::STDERR)?;
+        let actions = [&stdin, &stdout, &stderr]
+            .into_iter()
+            .map(|plan| ask_io::fd::OrderedAction {
+                kind: ask_io::fd::action::DUP,
+                source: plan.source,
+                target: plan.target,
+                reserved: 0,
+            })
+            .collect::<Vec<_>>();
+        let launched = activation::launch(name, &argv, &env, &actions)?;
+        let pipes = StdioPipes {
+            stdin: stdin.parent.take(),
+            stdout: stdout.parent.take(),
+            stderr: stderr.parent.take(),
+        };
         Ok((Process { identity: launched.identity(), status: None }, pipes))
     }
 }
 
 fn package_name(program: &OsStr) -> io::Result<&[u8]> {
     let bytes = program.as_encoded_bytes();
-    if bytes.is_empty() || bytes.contains(&0) || bytes.contains(&b'/') {
+    if bytes.is_empty()
+        || bytes.contains(&0)
+        || bytes.len() > ask_io::process::selector::MAX_LEN
+        || bytes.split(|byte| *byte == b'/').count() > 2
+        || bytes
+            .split(|byte| *byte == b'/')
+            .any(|part| part.is_empty() || part == b"." || part == b"..")
+    {
         return Err(io::const_error!(
             io::ErrorKind::NotFound,
-            "ask Command launches an installed package by name, not a filesystem path"
+            "ask Command requires an installed package or package/entry selector"
         ));
     }
     Ok(bytes)
@@ -173,6 +209,9 @@ where
 {
     let mut out = Vec::new();
     for field in fields {
+        if field.as_encoded_bytes().contains(&0) {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
         if !out.is_empty() {
             out.push(0);
         }
@@ -190,6 +229,12 @@ where
 fn pack_env_pairs(pairs: &[(OsString, OsString)]) -> io::Result<Vec<u8>> {
     let mut out = Vec::new();
     for (key, value) in pairs {
+        if key.as_encoded_bytes().is_empty()
+            || key.as_encoded_bytes().iter().any(|byte| *byte == 0 || *byte == b'=')
+            || value.as_encoded_bytes().contains(&0)
+        {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
         if !out.is_empty() {
             out.push(0);
         }
@@ -206,115 +251,65 @@ fn pack_env_pairs(pairs: &[(OsString, OsString)]) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
-fn push_env(pairs: &mut Vec<(OsString, OsString)>, key: &str, value: OsString) {
-    pairs.retain(|(existing, _)| existing.as_encoded_bytes() != key.as_bytes());
-    pairs.push((OsString::from(key), value));
+struct StdioPlan {
+    source: i32,
+    target: i32,
+    _owned: Option<Stdio>,
+    parent: Option<Pipe>,
 }
-
-fn append_stdio_env(
-    pairs: &mut Vec<(OsString, OsString)>,
-    stdin: &Stdio,
-    stdout: &Stdio,
-    stderr: &Stdio,
-) -> io::Result<()> {
-    if matches!(stdin, Stdio::MakePipe) {
-        push_env(pairs, "ASK_STDIN_PIPE", OsString::from("1"));
-    }
-    if matches!(stdout, Stdio::MakePipe) {
-        push_env(pairs, "ASK_STDOUT_PIPE", OsString::from("1"));
-    }
-    if matches!(stderr, Stdio::MakePipe) {
-        push_env(pairs, "ASK_STDERR_PIPE", OsString::from("1"));
-    }
-    Ok(())
+fn plan_stdio(spec: Stdio, target: i32) -> io::Result<StdioPlan> {
+    let mut parent = None;
+    let spec = match spec {
+        Stdio::Inherit => Stdio::Fd(FileDesc::from_inner(crate::sys::fd::duplicate(target)?)),
+        Stdio::ParentStdout => {
+            Stdio::Fd(FileDesc::from_inner(crate::sys::fd::duplicate(ask_io::fd::number::STDOUT)?))
+        }
+        Stdio::ParentStderr => {
+            Stdio::Fd(FileDesc::from_inner(crate::sys::fd::duplicate(ask_io::fd::number::STDERR)?))
+        }
+        Stdio::Null => Stdio::Fd(crate::sys::fd::null()?),
+        Stdio::MakePipe => {
+            let (reader, writer) = crate::sys::pipe::pipe()?;
+            if target == ask_io::fd::number::STDIN {
+                parent = Some(writer);
+                Stdio::Pipe(reader)
+            } else {
+                parent = Some(reader);
+                Stdio::Pipe(writer)
+            }
+        }
+        other => other,
+    };
+    let source = match &spec {
+        Stdio::Inherit => target,
+        Stdio::ParentStdout => ask_io::fd::number::STDOUT,
+        Stdio::ParentStderr => ask_io::fd::number::STDERR,
+        Stdio::InheritFile(file) => file.as_raw_fd(),
+        Stdio::Pipe(pipe) => pipe.as_raw_fd(),
+        Stdio::Fd(fd) => fd.as_raw_fd(),
+        Stdio::Null | Stdio::MakePipe => return Err(pal::unsupported_err()),
+    };
+    Ok(StdioPlan { source, target, _owned: Some(spec), parent })
 }
 
 fn launcher() -> io::Result<crate::sync::MutexGuard<'static, SyncChannel>> {
     let cell = LAUNCHER.get_or_try_init(|| {
         SyncChannel::create_leased(ask_abi::APP_LAUNCHER_TOKEN, ask_io::process::CHANNEL_PAGES)
             .map(Mutex::new)
-            .map_err(|_| {
-                io::const_error!(io::ErrorKind::NotConnected, "launcher channel rejected")
-            })
+            .map_err(|_| io::const_error!(io::ErrorKind::NotConnected, "launcher channel rejected"))
     })?;
     Ok(cell.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
-fn launch(name: &[u8], argv: &[u8], env: &[u8]) -> io::Result<ask_io::process::LaunchReply> {
-    let total = name
-        .len()
-        .checked_add(argv.len())
-        .and_then(|len| len.checked_add(env.len()))
-        .filter(|total| *total <= ask_io::process::DATA_LEN as usize)
-        .ok_or_else(|| {
-            io::const_error!(io::ErrorKind::InvalidInput, "launch payload exceeds channel window")
-        })?;
-    if name.is_empty() {
-        return Err(io::const_error!(io::ErrorKind::NotFound, "empty package name"));
-    }
-    let mut guard = launcher()?;
-    let window = guard
-        .shared_region_mut(ask_io::process::DATA_OFFSET as usize, total)
-        .ok_or_else(pal::unsupported_err)?;
-    let argv_offset = name.len();
-    let env_offset = argv_offset + argv.len();
-    window[..argv_offset].copy_from_slice(name);
-    window[argv_offset..env_offset].copy_from_slice(argv);
-    window[env_offset..total].copy_from_slice(env);
-    let request = ask_io::process::LaunchRequest {
-        name: ask_io::process::Buffer::new(0, name.len() as u32).ok_or_else(pal::unsupported_err)?,
-        argv: ask_io::process::Buffer::new(argv_offset as u32, argv.len() as u32)
-            .ok_or_else(pal::unsupported_err)?,
-        env: ask_io::process::Buffer::new(env_offset as u32, env.len() as u32)
-            .ok_or_else(pal::unsupported_err)?,
-        flags: ask_io::process::launch_flag::FOREGROUND,
-        stdout_peer: None,
-    };
-    let mut payload = [0; ask_io::process::LAUNCH_REQUEST_LEN];
-    let completion = guard.call(
-        ask_io::process::OP_LAUNCH,
-        ask_io::process::encode_launch_request(&mut payload, request),
-    )?;
-    drop(guard);
-    if completion.result != ask_io::process::RESULT_OK {
-        return Err(map_process_result(completion.result));
-    }
-    ask_io::process::decode_launch_reply(completion.payload()).ok_or_else(pal::unsupported_err)
-}
-
-fn attach_parent_stdio(
-    child: ask_io::process::LaunchReply,
-    stdin: &Stdio,
-    stdout: &Stdio,
-    stderr: &Stdio,
-) -> io::Result<StdioPipes> {
-    let stdin_pipe = if matches!(stdin, Stdio::MakePipe) {
-        Some(crate::sys::pipe::writer_to_endpoint(child.endpoint_token)?)
-    } else {
-        None
-    };
-    let stdout_pipe = if matches!(stdout, Stdio::MakePipe) {
-        Some(crate::sys::pipe::accept_reader_from(child.pid)?)
-    } else {
-        None
-    };
-    let stderr_pipe = if matches!(stderr, Stdio::MakePipe) {
-        Some(crate::sys::pipe::accept_reader_from(child.pid)?)
-    } else {
-        None
-    };
-    Ok(StdioPipes { stdin: stdin_pipe, stdout: stdout_pipe, stderr: stderr_pipe })
-}
-
 fn map_process_result(result: i32) -> io::Error {
     match result {
-        ask_io::process::RESULT_NOT_FOUND => {
+        ask_io::process::result::NOT_FOUND => {
             io::const_error!(io::ErrorKind::NotFound, "package not installed")
         }
-        ask_io::process::RESULT_DENIED => {
+        ask_io::process::result::DENIED => {
             io::const_error!(io::ErrorKind::PermissionDenied, "launch denied")
         }
-        ask_io::process::RESULT_BUSY => {
+        ask_io::process::result::BUSY => {
             io::const_error!(io::ErrorKind::WouldBlock, "launcher busy")
         }
         _ => io::const_error!(io::ErrorKind::Other, "launcher rejected the request"),
@@ -322,8 +317,8 @@ fn map_process_result(result: i32) -> io::Error {
 }
 
 impl From<Pipe> for Stdio {
-    fn from(_pipe: Pipe) -> Stdio {
-        Stdio::MakePipe
+    fn from(pipe: Pipe) -> Stdio {
+        Stdio::Pipe(pipe)
     }
 }
 
@@ -417,6 +412,7 @@ impl Process {
     }
 
     pub fn kill(&mut self) -> io::Result<()> {
+        require_class2()?;
         let mut payload = [0; ask_io::process::PROCESS_IDENTITY_LEN];
         let mut guard = launcher()?;
         let completion = guard.call(
@@ -424,7 +420,7 @@ impl Process {
             ask_io::process::encode_process_identity(&mut payload, self.identity),
         )?;
         drop(guard);
-        if completion.result != ask_io::process::RESULT_OK {
+        if completion.result != ask_io::process::result::OK {
             return Err(map_process_result(completion.result));
         }
         Ok(())
@@ -446,6 +442,7 @@ impl Process {
         if let Some(status) = self.status {
             return Ok(status);
         }
+        require_class2()?;
         let mut payload = [0; ask_io::process::WAIT_REQUEST_LEN];
         let mut guard = launcher()?;
         let completion = guard.call(
@@ -453,10 +450,10 @@ impl Process {
             ask_io::process::encode_wait_request(&mut payload, self.identity, flags),
         )?;
         drop(guard);
-        if completion.result == ask_io::process::RESULT_BUSY {
+        if completion.result == ask_io::process::result::BUSY {
             return Err(io::const_error!(io::ErrorKind::WouldBlock, "child still running"));
         }
-        if completion.result != ask_io::process::RESULT_OK {
+        if completion.result != ask_io::process::result::OK {
             return Err(map_process_result(completion.result));
         }
         let status = ask_io::process::decode_exit_status(completion.payload())

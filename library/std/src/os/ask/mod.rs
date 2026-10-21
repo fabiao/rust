@@ -4,6 +4,13 @@
 
 pub mod ffi;
 
+/// Drain buffered standard output without driving an executor.
+#[doc(hidden)]
+#[unstable(feature = "ask_runtime", issue = "none")]
+pub async fn drain_stdio() -> crate::io::Result<()> {
+    crate::io::drain_ask().await
+}
+
 /// A prelude for conveniently writing platform-specific code.
 ///
 /// Includes all extension traits, and some important type definitions.

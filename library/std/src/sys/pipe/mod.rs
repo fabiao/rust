@@ -16,9 +16,6 @@ cfg_select! {
     target_os = "ask" => {
         mod ask;
         pub use ask::{Pipe, pipe};
-        pub(crate) use ask::{
-            accept_reader, accept_reader_from, discard_unclaimed_channels, writer_to_endpoint,
-        };
     }
     _ => {
         mod unsupported;

@@ -765,6 +765,26 @@ pub(crate) fn cleanup() {
     }
 }
 
+#[cfg(target_os = "ask")]
+pub(crate) async fn drain_ask() -> io::Result<()> {
+    let bytes = if let Some(stdout) = STDOUT.get() {
+        let lock = stdout.try_lock().ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
+        let mut writer = lock.try_borrow_mut().map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
+        let old = crate::mem::replace(&mut *writer, LineWriter::with_capacity(0, stdout_raw()));
+        let (_, bytes) = old.into_parts();
+        bytes.map_err(|_| io::Error::from(io::ErrorKind::Other))?
+    } else { Vec::new() };
+    let mut bytes = bytes.as_slice();
+    while !bytes.is_empty() {
+        let request = crate::sys::fd::ask::request(ask_fd::action::WRITE, bytes.len());
+        let result = crate::sys::fd::ask::perform(ask_io::fd::number::STDOUT, request, bytes, &mut []).await?;
+        let count = usize::try_from(result.completed_count).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
+        if count == 0 { return Err(io::Error::from(io::ErrorKind::WriteZero)); }
+        bytes = bytes.get(count..).ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+    }
+    Ok(())
+}
+
 impl Stdout {
     /// Locks this handle to the standard output stream, returning a writable
     /// guard.

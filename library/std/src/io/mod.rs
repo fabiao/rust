@@ -337,6 +337,8 @@ pub use self::stdio::{
     Stderr, StderrLock, Stdin, StdinLock, Stdout, StdoutLock, stderr, stdin, stdout,
 };
 pub(crate) use self::stdio::{attempt_print_to_stderr, cleanup};
+#[cfg(target_os = "ask")]
+pub(crate) use self::stdio::drain_ask;
 #[unstable(feature = "internal_output_capture", issue = "none")]
 #[doc(no_inline, hidden)]
 pub use self::stdio::{set_output_capture, try_set_output_capture};

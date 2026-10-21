@@ -56,6 +56,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "askfd"
+version = "0.1.0"
+dependencies = [
+ "askabi",
+ "askio",
+ "rustc-std-workspace-core",
+]
+
+[[package]]
 name = "askio"
 version = "0.1.0"
 dependencies = [
@@ -412,6 +421,7 @@ dependencies = [
  "alloc",
  "askabi",
  "askalloc",
+ "askfd",
  "askio",
  "askipc",
  "asksys",
