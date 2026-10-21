@@ -381,6 +381,14 @@ fn resolution(tcx: TyCtxt<'_>, res: Res) -> Value {
     }
 }
 
+fn const_argument(tcx: TyCtxt<'_>, arg: &rustc_hir::ConstArg<'_, rustc_hir::AmbigArg>) -> Value {
+    let mut fact = json!({"kind": "const_argument", "origin": origin(tcx, arg.span)});
+    if let rustc_hir::ConstArgKind::Path(rustc_hir::QPath::Resolved(_, path)) = arg.kind {
+        fact["resolution"] = resolution(tcx, path.res);
+    }
+    fact
+}
+
 fn node_reference(tcx: TyCtxt<'_>, id: rustc_hir::HirId, span: Span) -> Value {
     json!({"local_id": id.local_id.as_u32(),
         "owner": definition(tcx, id.owner.def_id.to_def_id()), "origin": origin(tcx, span)})
@@ -564,6 +572,11 @@ impl<'tcx> Facts<'tcx, '_> {
 }
 
 impl<'tcx> Visitor<'tcx> for Facts<'tcx, '_> {
+    fn visit_const_arg(&mut self, arg: &'tcx rustc_hir::ConstArg<'tcx, rustc_hir::AmbigArg>) {
+        self.nodes.push(const_argument(self.tcx, arg));
+        intravisit::walk_const_arg(self, arg);
+    }
+
     fn visit_block(&mut self, block: &'tcx rustc_hir::Block<'tcx>) {
         let mut fact = self.node(block.hir_id, block.span, "block");
         fact["targeted_by_break"] = json!(block.targeted_by_break);
@@ -802,11 +815,7 @@ impl<'tcx> Visitor<'tcx> for ItemReferences<'tcx, '_> {
     }
 
     fn visit_const_arg(&mut self, arg: &'tcx rustc_hir::ConstArg<'tcx, rustc_hir::AmbigArg>) {
-        let mut fact = json!({"kind": "const_argument", "origin": origin(self.tcx, arg.span)});
-        if let rustc_hir::ConstArgKind::Path(rustc_hir::QPath::Resolved(_, path)) = arg.kind {
-            fact["resolution"] = resolution(self.tcx, path.res);
-        }
-        self.nodes.push(fact);
+        self.nodes.push(const_argument(self.tcx, arg));
         intravisit::walk_const_arg(self, arg);
     }
 }
