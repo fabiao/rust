@@ -96,3 +96,4 @@ windows-sys = { path = 'windows-sys' }
 askabi = { path = '../../../../core/libs/askabi/source' }
 asksys = { path = '../../../../core/libs/asksys/source' }
 askio = { path = '../../../../core/libs/askio/source' }
+askfd = { path = '../../../../core/libs/askfd/source' }

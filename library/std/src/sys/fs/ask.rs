@@ -487,7 +487,8 @@ impl File {
             seek_delta,
             requested_count: 0,
             native_opcode: 0,
-            reserved: 0,
+            flags: 0,
+            endpoint: ask_io::net::SocketAddress::EMPTY,
         };
         crate::sys::fd::blocking(crate::sys::fd::perform(self.as_raw_fd(), request, &[], &mut []))?
             .map(|result| result.resulting_position)

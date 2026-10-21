@@ -1,210 +1,259 @@
-//! `std::net` PAL for ask: blocking `TcpStream`/`TcpListener`/`UdpSocket`
-//! bridging onto `netstack`'s `NET_OP_*` wire protocol (`ask_io::net`) over
-//! one process-wide `SyncChannel` — `netstack` accepts exactly one client
-//! channel for its entire process lifetime (docs/rust-toolchain.md), so
-//! every socket handle in this process multiplexes over the same connection
-//! rather than opening one channel per socket, unlike `sys/fs/ask.rs`.
+//! Native sockets use the process resident descriptor owner.
+
+use ask_io::net as wire;
 
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
 use crate::net::{
     Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs,
 };
-use crate::sync::{Mutex, MutexGuard, OnceLock};
-use crate::sys::channel::SyncChannel;
+use crate::os::fd::FromRawFd;
+use crate::sync::Mutex;
+use crate::sys::fd::{self, FileDesc};
 use crate::sys::pal::unsupported_err;
 use crate::sys::unsupported;
 use crate::time::Duration;
 
-/// The process-wide channel to `netstack`, created lazily on first socket
-/// use and shared by every `TcpStream`/`TcpListener`/`UdpSocket` handle in
-/// this process — see the module doc comment.
-static NET_CHANNEL: OnceLock<Mutex<SyncChannel>> = OnceLock::new();
+const SOCKET_RIGHTS: u32 = ask_io::fd::rights::ACCESS | ask_io::fd::rights::TRANSFER;
 
-fn channel() -> io::Result<MutexGuard<'static, SyncChannel>> {
-    let cell = NET_CHANNEL.get_or_try_init(|| {
-        SyncChannel::create_leased(ask_abi::APP_NET_TOKEN, ask_io::net::CHANNEL_PAGES)
-            .map(Mutex::new)
-            .map_err(|_| io::const_error!(io::ErrorKind::NotConnected, "netstack unreachable"))
-    })?;
-    Ok(cell.lock().unwrap_or_else(|e| e.into_inner()))
+fn invalid() -> io::Error {
+    io::Error::from(io::ErrorKind::InvalidData)
 }
-
-fn to_net_endpoint(addr: SocketAddr) -> io::Result<ask_io::net::NetEndpoint> {
+fn first_addr<A: ToSocketAddrs>(addr: A) -> io::Result<SocketAddr> {
+    addr.to_socket_addrs()?.next().ok_or(io::Error::NO_ADDRESSES)
+}
+fn to_net_endpoint(addr: SocketAddr) -> io::Result<wire::NetEndpoint> {
     match addr {
         SocketAddr::V4(v4) => {
-            let mut address = [0u8; 16];
+            let mut address = [0; 16];
             address[..4].copy_from_slice(&v4.ip().octets());
-            Ok(ask_io::net::NetEndpoint {
-                family: ask_io::net::AF_IPV4,
-                port: v4.port(),
-                address,
-            })
+            Ok(wire::NetEndpoint { family: wire::AF_IPV4, port: v4.port(), address })
         }
-        SocketAddr::V6(v6) => Ok(ask_io::net::NetEndpoint {
-            family: ask_io::net::AF_IPV6,
+        SocketAddr::V6(v6) if v6.scope_id() == 0 && v6.flowinfo() == 0 => Ok(wire::NetEndpoint {
+            family: wire::AF_IPV6,
             port: v6.port(),
             address: v6.ip().octets(),
         }),
+        _ => Err(unsupported_err()),
     }
 }
-
-fn lookup_socket_addr(endpoint: ask_io::net::NetEndpoint) -> io::Result<SocketAddr> {
+fn lookup_socket_addr(endpoint: wire::NetEndpoint) -> io::Result<SocketAddr> {
     match endpoint.family {
-        ask_io::net::AF_IPV4 => {
-            let octets: [u8; 4] = endpoint
-                .address
-                .get(..4)
-                .and_then(|bytes| bytes.try_into().ok())
-                .ok_or_else(unsupported_err)?;
-            Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(octets), endpoint.port)))
+        wire::AF_IPV4 => {
+            let bytes: [u8; 4] =
+                endpoint.address.get(..4).and_then(|v| v.try_into().ok()).ok_or_else(invalid)?;
+            Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(bytes), endpoint.port)))
         }
-        ask_io::net::AF_IPV6 => Ok(SocketAddr::V6(SocketAddrV6::new(
+        wire::AF_IPV6 => Ok(SocketAddr::V6(SocketAddrV6::new(
             Ipv6Addr::from(endpoint.address),
             endpoint.port,
             0,
             0,
         ))),
-        _ => Err(unsupported_err()),
+        _ => Err(invalid()),
     }
 }
-
-fn from_net_endpoint(endpoint: ask_io::net::NetEndpoint) -> io::Result<SocketAddr> {
-    lookup_socket_addr(endpoint)
-}
-
-fn first_addr<A: ToSocketAddrs>(addr: A) -> io::Result<SocketAddr> {
-    addr.to_socket_addrs()?.next().ok_or(io::Error::NO_ADDRESSES)
-}
-
-/// Block until a deferred op's completion arrives, respecting an optional
-/// wall-clock deadline — `netstack`'s server-side defer already does the
-/// waiting-without-spinning half (it re-wakes this channel's peer once an op
-/// becomes ready, docs/rust-toolchain.md), so this only needs to keep
-/// parking (or time out) rather than retry `RESULT_WOULD_BLOCK` itself.
-fn call_with_timeout(
-    guard: &mut SyncChannel,
-    opcode: u32,
-    payload: &[u8],
-    timeout: Option<Duration>,
-) -> io::Result<crate::sys::channel::Completion> {
-    guard.call_timeout(opcode, payload, timeout)
-}
-
-fn socket_call(
-    opcode: u32,
-    payload: &[u8],
-) -> io::Result<crate::sys::channel::Completion> {
-    let mut guard = channel()?;
-    call_with_timeout(&mut guard, opcode, payload, None)
-}
-
-fn netstack_error(result: i32) -> io::Error {
-    match result {
-        ask_io::net::RESULT_WOULD_BLOCK => {
-            io::const_error!(io::ErrorKind::WouldBlock, "socket operation would block")
-        }
-        ask_io::net::RESULT_UNSUPPORTED => unsupported_err(),
-        ask_io::net::RESULT_INVALID => {
-            io::const_error!(io::ErrorKind::InvalidInput, "netstack rejected request")
-        }
-        ask_io::net::RESULT_EXHAUSTED => {
-            io::const_error!(io::ErrorKind::OutOfMemory, "netstack resource quota exhausted")
-        }
-        _ => io::const_error!(io::ErrorKind::Other, "netstack operation failed"),
+fn constructor_error(error: ask_ipc::attachment::Error) -> io::Error {
+    use ask_ipc::attachment::Error as E;
+    match error {
+        E::Owner { status, record } => fd::error(status, record),
+        E::Lifecycle(code) => fd::lifecycle_error(code),
+        E::Transport(_) => io::Error::from(io::ErrorKind::BrokenPipe),
+        E::Expired => io::Error::from(io::ErrorKind::TimedOut),
+        E::Introduction(_) => io::Error::from(io::ErrorKind::PermissionDenied),
+        E::Protocol => invalid(),
+        E::Native(code) => netstack_error(code),
     }
 }
-
-fn set_bool_option(
-    handle: u32,
-    option: ask_io::net::SocketOption,
-    value: bool,
-) -> io::Result<()> {
-    let mut encoded_value = [0u8; 1];
-    let encoded_value = ask_io::net::encode_net_bool_option(&mut encoded_value, value);
-    let mut request = [0u8; ask_io::net::OPTION_HEADER_LEN + 1];
-    let payload = ask_io::net::encode_net_setopt_request(
-        &mut request,
-        handle,
-        option,
-        encoded_value,
+fn netstack_error(code: i32) -> io::Error {
+    fd::error(
+        ask_fd::status::NATIVE_FAILURE,
+        ask_fd::ErrorRecord {
+            domain: ask_fd::error_domain::NETWORK,
+            native_code: code as u32,
+            detail: 0,
+        },
     )
-    .ok_or_else(unsupported_err)?;
-    let completion = socket_call(ask_io::net::OP_SETOPT, payload)?;
-    if completion.result < 0 {
-        return Err(netstack_error(completion.result));
-    }
-    Ok(())
 }
 
-fn get_bool_option(handle: u32, option: ask_io::net::SocketOption) -> io::Result<bool> {
-    let mut request = [0u8; ask_io::net::OPTION_HEADER_LEN];
-    let payload = ask_io::net::encode_net_getopt_request(&mut request, handle, option);
-    let completion = socket_call(ask_io::net::OP_GETOPT, payload)?;
-    if completion.result < 0 {
-        return Err(netstack_error(completion.result));
+fn deadline() -> u64 {
+    ask_sys::get_monotonic_ms().saturating_add(ask_ipc::directory::policy::DEADLINE_MS)
+}
+fn alias_options() -> ask_ipc::attachment::AliasOptions {
+    ask_ipc::attachment::AliasOptions {
+        minimum: ask_io::fd::number::AFTER_STANDARD,
+        close_on_exec: true,
     }
-    ask_io::net::decode_net_bool_option(completion.payload()).ok_or_else(unsupported_err)
+}
+fn bind_opened(opened: ask_ipc::attachment::Opened) -> io::Result<FileDesc> {
+    let raw = opened
+        .bind(alias_options())
+        .map_err(constructor_error)?
+        .into_raw()
+        .map_err(|(_bound, error)| constructor_error(error))?;
+    Ok(unsafe { FileDesc::from_raw_fd(raw) })
+}
+fn open_socket(protocol: u8, family: u8, end: u64) -> io::Result<FileDesc> {
+    fd::blocking(async {
+        let bound = ask_ipc::net::socket_blocking(
+            protocol,
+            family,
+            SOCKET_RIGHTS,
+            alias_options(),
+            end,
+            ask_ipc::sync::WaitHooks::RAW,
+        )
+        .map_err(|error| match error {
+            ask_ipc::net::Error::Attachment(error) => constructor_error(error),
+            ask_ipc::net::Error::Directory(_) => io::Error::from(io::ErrorKind::PermissionDenied),
+        })?;
+        let raw = bound.into_raw().map_err(|(_bound, error)| constructor_error(error))?;
+        Ok(unsafe { FileDesc::from_raw_fd(raw) })
+    })?
 }
 
-fn open_socket(protocol: u8, family: u8) -> io::Result<u32> {
-    if family != ask_io::net::AF_IPV4 && family != ask_io::net::AF_IPV6 {
-        return Err(unsupported_err());
-    }
-    let mut request = [0u8; 2];
-    let payload = ask_io::net::encode_net_socket_request(&mut request, family, protocol);
-    let completion = socket_call(ask_io::net::OP_SOCKET, payload)?;
-    if completion.result < 0 {
-        return Err(io::const_error!(io::ErrorKind::Other, "netstack: socket failed"));
-    }
-    ask_io::net::decode_net_handle(completion.payload()).ok_or_else(unsupported_err)
+fn control(
+    socket: &FileDesc,
+    opcode: u32,
+    input: &[u8],
+    output: &mut [u8],
+    timeout: Option<Duration>,
+) -> io::Result<usize> {
+    fd::blocking_with_timeout(fd::native(socket.as_raw_fd(), opcode, input, output), timeout)?
 }
-
-fn close_handle(handle: u32) {
-    let mut request = [0u8; 4];
-    let payload = ask_io::net::encode_net_handle(&mut request, handle);
-    let _ = socket_call(ask_io::net::OP_CLOSE, payload);
+fn endpoint_control(
+    socket: &FileDesc,
+    opcode: u32,
+    endpoint: wire::NetEndpoint,
+    timeout: Option<Duration>,
+) -> io::Result<()> {
+    let mut bytes = [0; wire::ENDPOINT_LEN];
+    let payload = wire::encode_net_endpoint_request(&mut bytes, endpoint).ok_or_else(invalid)?;
+    control(socket, opcode, payload, &mut [], timeout).map(|_| ())
+}
+fn endpoint_option(socket: &FileDesc, option: wire::SocketOption) -> io::Result<SocketAddr> {
+    let mut bytes = [0; wire::ENDPOINT_LEN];
+    let mut request = [0; 4];
+    let payload = wire::encode_net_getopt_request(&mut request, option);
+    let count = control(socket, wire::OP_GETOPT, payload, &mut bytes, None)?;
+    lookup_socket_addr(
+        wire::decode_net_endpoint(bytes.get(..count).ok_or_else(invalid)?).ok_or_else(invalid)?,
+    )
+}
+fn set_bool_option(socket: &FileDesc, option: wire::SocketOption, value: bool) -> io::Result<()> {
+    let mut request = [0; wire::OPTION_HEADER_LEN + 1];
+    let bytes = [u8::from(value)];
+    let payload =
+        wire::encode_net_setopt_request(&mut request, option, &bytes).ok_or_else(invalid)?;
+    control(socket, wire::OP_SETOPT, payload, &mut [], None).map(|_| ())
+}
+fn get_bool_option(socket: &FileDesc, option: wire::SocketOption) -> io::Result<bool> {
+    let mut request = [0; 4];
+    let mut output = [0; 1];
+    let count = control(
+        socket,
+        wire::OP_GETOPT,
+        wire::encode_net_getopt_request(&mut request, option),
+        &mut output,
+        None,
+    )?;
+    wire::decode_net_bool_option(output.get(..count).ok_or_else(invalid)?).ok_or_else(invalid)
+}
+fn take_error(socket: &FileDesc) -> io::Result<Option<io::Error>> {
+    let mut request = [0; 4];
+    let mut output = [0; 4];
+    let count = control(
+        socket,
+        wire::OP_GETOPT,
+        wire::encode_net_getopt_request(&mut request, wire::SocketOption::Error),
+        &mut output,
+        None,
+    )?;
+    if count != output.len() {
+        return Err(invalid());
+    }
+    let code = i32::from_le_bytes(output);
+    Ok((code != wire::result::OK).then(|| netstack_error(code)))
+}
+fn read(
+    socket: &FileDesc,
+    output: &mut [u8],
+    timeout: Option<Duration>,
+    datagram: bool,
+) -> io::Result<ask_fd::IoResult> {
+    let mut request = fd::request(ask_fd::action::READ, output.len());
+    if datagram {
+        request.native_opcode = wire::OP_RECV_FROM;
+    }
+    fd::blocking_with_timeout(fd::perform(socket.as_raw_fd(), request, &[], output), timeout)?
+}
+fn write(
+    socket: &FileDesc,
+    input: &[u8],
+    timeout: Option<Duration>,
+    destination: Option<SocketAddr>,
+) -> io::Result<usize> {
+    let mut request = fd::request(ask_fd::action::WRITE, input.len());
+    if let Some(destination) = destination {
+        request.native_opcode = wire::OP_SEND_TO;
+        request.endpoint = to_net_endpoint(destination)?.into();
+    }
+    let result = fd::blocking_with_timeout(
+        fd::perform(socket.as_raw_fd(), request, input, &mut []),
+        timeout,
+    )??;
+    usize::try_from(result.completed_count).map_err(|_| invalid())
+}
+fn validate_timeout(timeout: Option<Duration>) -> io::Result<()> {
+    if timeout.is_some_and(|value| value.is_zero()) {
+        Err(io::Error::from(io::ErrorKind::InvalidInput))
+    } else {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
 pub struct TcpStream {
-    handle: u32,
-    peer: SocketAddr,
+    socket: FileDesc,
     read_timeout: Mutex<Option<Duration>>,
     write_timeout: Mutex<Option<Duration>>,
 }
-
 impl TcpStream {
     pub fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<TcpStream> {
         Self::connect_timeout(&first_addr(addr)?, Duration::MAX)
     }
 
     pub fn connect_timeout(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
+        validate_timeout(Some(timeout))?;
         let endpoint = to_net_endpoint(*addr)?;
-        let handle = open_socket(ask_io::net::PROTO_TCP, endpoint.family)?;
-        let mut request = [0u8; 23];
-        let payload = ask_io::net::encode_net_endpoint_request(&mut request, handle, endpoint);
-        let timeout = if timeout == Duration::MAX { None } else { Some(timeout) };
-        let mut guard = channel()?;
-        let completion = call_with_timeout(&mut guard, ask_io::net::OP_CONNECT, payload, timeout)?;
-        drop(guard);
-        if completion.result < 0 {
-            close_handle(handle);
-            return Err(io::const_error!(io::ErrorKind::ConnectionRefused, "netstack: connect failed"));
-        }
-        Ok(TcpStream {
-            handle,
-            peer: *addr,
-            read_timeout: Mutex::new(None),
-            write_timeout: Mutex::new(None),
-        })
+        let expiry = (timeout != Duration::MAX).then(|| {
+            ask_sys::get_monotonic_ms()
+                .saturating_add(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX).max(1))
+        });
+        let socket = open_socket(
+            wire::PROTO_TCP,
+            endpoint.family,
+            expiry.map_or_else(deadline, |end| end.min(deadline())),
+        )?;
+        let remaining = expiry
+            .map(|end| {
+                end.checked_sub(ask_sys::get_monotonic_ms())
+                    .filter(|left| *left != 0)
+                    .map(Duration::from_millis)
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))
+            })
+            .transpose()?;
+        endpoint_control(&socket, wire::OP_CONNECT, endpoint, remaining)?;
+        Ok(Self { socket, read_timeout: Mutex::new(None), write_timeout: Mutex::new(None) })
     }
 
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        validate_timeout(timeout)?;
         *self.read_timeout.lock().unwrap_or_else(|e| e.into_inner()) = timeout;
         Ok(())
     }
 
     pub fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        validate_timeout(timeout)?;
         *self.write_timeout.lock().unwrap_or_else(|e| e.into_inner()) = timeout;
         Ok(())
     }
@@ -222,22 +271,8 @@ impl TcpStream {
     }
 
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let timeout = *self.read_timeout.lock().unwrap_or_else(|e| e.into_inner());
-        let want = (buf.len() as u32).min(ask_io::net::DATA_LEN);
-        let buffer = ask_io::net::NetBuffer::new(0, want).ok_or_else(unsupported_err)?;
-        let mut request = [0u8; 16];
-        let payload = ask_io::net::encode_net_io_request(&mut request, self.handle, buffer, 0);
-        let mut guard = channel()?;
-        let completion = call_with_timeout(&mut guard, ask_io::net::OP_RECV, payload, timeout)?;
-        if completion.result < 0 {
-            return Err(netstack_error(completion.result));
-        }
-        let n = (completion.result as usize).min(buf.len());
-        let data = guard
-            .shared_region_mut(ask_io::net::DATA_OFFSET as usize, n)
-            .ok_or_else(unsupported_err)?;
-        buf[..n].copy_from_slice(data);
-        Ok(n)
+        let result = read(&self.socket, buf, self.read_timeout()?, false)?;
+        usize::try_from(result.completed_count).map_err(|_| invalid())
     }
 
     pub fn read_buf(&self, cursor: BorrowedCursor<'_, u8>) -> io::Result<()> {
@@ -253,23 +288,7 @@ impl TcpStream {
     }
 
     pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
-        let timeout = *self.write_timeout.lock().unwrap_or_else(|e| e.into_inner());
-        let n = (buf.len() as u32).min(ask_io::net::DATA_LEN) as usize;
-        let mut guard = channel()?;
-        {
-            let data = guard
-                .shared_region_mut(ask_io::net::DATA_OFFSET as usize, n)
-                .ok_or_else(unsupported_err)?;
-            data.copy_from_slice(&buf[..n]);
-        }
-        let buffer = ask_io::net::NetBuffer::new(0, n as u32).ok_or_else(unsupported_err)?;
-        let mut request = [0u8; 16];
-        let payload = ask_io::net::encode_net_io_request(&mut request, self.handle, buffer, 0);
-        let completion = call_with_timeout(&mut guard, ask_io::net::OP_SEND, payload, timeout)?;
-        if completion.result < 0 {
-            return Err(netstack_error(completion.result));
-        }
-        Ok(completion.result as usize)
+        write(&self.socket, buf, self.write_timeout()?, None)
     }
 
     pub fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
@@ -281,31 +300,29 @@ impl TcpStream {
     }
 
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
-        Ok(self.peer)
+        endpoint_option(&self.socket, wire::SocketOption::PeerEndpoint)
     }
 
     pub fn socket_addr(&self) -> io::Result<SocketAddr> {
-        unsupported()
+        endpoint_option(&self.socket, wire::SocketOption::LocalEndpoint)
     }
 
     pub fn shutdown(&self, shutdown: Shutdown) -> io::Result<()> {
         let direction = match shutdown {
-            Shutdown::Read => ask_io::net::SHUTDOWN_READ,
-            Shutdown::Write => ask_io::net::SHUTDOWN_WRITE,
-            Shutdown::Both => ask_io::net::SHUTDOWN_BOTH,
+            Shutdown::Read => wire::SHUTDOWN_READ,
+            Shutdown::Write => wire::SHUTDOWN_WRITE,
+            Shutdown::Both => wire::SHUTDOWN_BOTH,
         };
-        let mut request = [0u8; 8];
-        let payload =
-            ask_io::net::encode_net_handle_value(&mut request, self.handle, direction as u32);
-        let completion = socket_call(ask_io::net::OP_SHUTDOWN, payload)?;
-        if completion.result < 0 {
-            return Err(io::const_error!(io::ErrorKind::Other, "netstack: shutdown failed"));
-        }
-        Ok(())
+        control(&self.socket, wire::OP_SHUTDOWN, &u32::from(direction).to_le_bytes(), &mut [], None)
+            .map(|_| ())
     }
 
     pub fn duplicate(&self) -> io::Result<TcpStream> {
-        unsupported()
+        Ok(Self {
+            socket: self.socket.duplicate()?,
+            read_timeout: Mutex::new(self.read_timeout()?),
+            write_timeout: Mutex::new(self.write_timeout()?),
+        })
     }
 
     pub fn set_linger(&self, _timeout: Option<Duration>) -> io::Result<()> {
@@ -325,11 +342,11 @@ impl TcpStream {
     }
 
     pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
-        set_bool_option(self.handle, ask_io::net::SocketOption::NoDelay, nodelay)
+        set_bool_option(&self.socket, ask_io::net::SocketOption::NoDelay, nodelay)
     }
 
     pub fn nodelay(&self) -> io::Result<bool> {
-        get_bool_option(self.handle, ask_io::net::SocketOption::NoDelay)
+        get_bool_option(&self.socket, ask_io::net::SocketOption::NoDelay)
     }
 
     pub fn set_ttl(&self, _ttl: u32) -> io::Result<()> {
@@ -341,75 +358,122 @@ impl TcpStream {
     }
 
     pub fn take_error(&self) -> io::Result<Option<io::Error>> {
-        Ok(None)
+        take_error(&self.socket)
     }
 
     pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
-        set_bool_option(
-            self.handle,
-            ask_io::net::SocketOption::Nonblocking,
-            nonblocking,
-        )
-    }
-}
-
-impl Drop for TcpStream {
-    fn drop(&mut self) {
-        close_handle(self.handle);
+        set_bool_option(&self.socket, ask_io::net::SocketOption::Nonblocking, nonblocking)
     }
 }
 
 #[derive(Debug)]
 pub struct TcpListener {
-    handle: u32,
-    local: SocketAddr,
+    socket: FileDesc,
 }
-
 impl TcpListener {
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<TcpListener> {
-        let addr = first_addr(addr)?;
-        let endpoint = to_net_endpoint(addr)?;
-        let handle = open_socket(ask_io::net::PROTO_TCP, endpoint.family)?;
-        let mut request = [0u8; 23];
-        let payload = ask_io::net::encode_net_endpoint_request(&mut request, handle, endpoint);
-        // `netstack` dispatches `NET_OP_BIND` and `NET_OP_LISTEN` through the
-        // same handler (`serve_tcp_listen`), which binds and starts
-        // listening in one step — a single `OP_LISTEN` call is both.
-        let listen_completion = socket_call(ask_io::net::OP_LISTEN, payload)?;
-        if listen_completion.result < 0 {
-            close_handle(handle);
-            return Err(io::const_error!(io::ErrorKind::AddrInUse, "netstack: listen failed"));
-        }
-        Ok(TcpListener { handle, local: addr })
+        let endpoint = to_net_endpoint(first_addr(addr)?)?;
+        let socket = open_socket(wire::PROTO_TCP, endpoint.family, deadline())?;
+        endpoint_control(&socket, wire::OP_BIND, endpoint, None)?;
+        control(&socket, wire::OP_LISTEN, &[], &mut [], None)?;
+        Ok(Self { socket })
     }
 
     pub fn socket_addr(&self) -> io::Result<SocketAddr> {
-        Ok(self.local)
+        endpoint_option(&self.socket, wire::SocketOption::LocalEndpoint)
     }
 
     pub fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
-        let mut request = [0u8; 4];
-        let payload = ask_io::net::encode_net_handle(&mut request, self.handle);
-        let completion = socket_call(ask_io::net::OP_ACCEPT, payload)?;
-        if completion.result < 0 {
-            return Err(netstack_error(completion.result));
-        }
-        let (new_handle, endpoint) =
-            ask_io::net::decode_net_endpoint_request(completion.payload()).ok_or_else(unsupported_err)?;
-        let peer = from_net_endpoint(endpoint)?;
-        Ok((
-            TcpStream {
-                handle: new_handle,
-                peer,
-                read_timeout: Mutex::new(None),
-                write_timeout: Mutex::new(None),
-            },
-            peer,
-        ))
+        fd::blocking(async {
+            let mut metadata_bytes = [0; ask_io::fd::layout::OBJECT_METADATA];
+            let metadata = fd::metadata(self.socket.as_raw_fd(), &mut metadata_bytes).await?;
+            if metadata.encoding != ask_fd::metadata_encoding::OBJECT
+                || metadata.byte_length != metadata_bytes.len() as u64
+            {
+                return Err(invalid());
+            }
+            let object = ask_io::fd::ObjectMetadata::decode(&metadata_bytes).ok_or_else(invalid)?;
+            let required =
+                ask_io::fd::metadata_attributes::IDENTITY | ask_io::fd::metadata_attributes::RIGHTS;
+            if object.kind != ask_io::fd::backend::SOCKET
+                || object.attributes & required != required
+                || object.rights & SOCKET_RIGHTS != SOCKET_RIGHTS
+            {
+                return Err(invalid());
+            }
+            let nonblocking = get_bool_option(&self.socket, wire::SocketOption::Nonblocking)?;
+            let mut ready = if nonblocking {
+                None
+            } else {
+                Some(fd::Readiness::new(self.socket.as_raw_fd(), ask_fd::readiness::READABLE)?)
+            };
+            loop {
+                if let Some(ready) = ready.as_mut() {
+                    ready.wait().await?;
+                }
+                let end = deadline();
+                let mut bytes = [0; wire::ACCEPT_REQUEST_LEN];
+                let payload = wire::AcceptRequest {
+                    deadline: end,
+                    rights: SOCKET_RIGHTS,
+                    flags: wire::io_flags::NONBLOCKING,
+                }
+                .encode(&mut bytes)
+                .ok_or_else(invalid)?;
+                let mut output = [0; wire::ACCEPT_REPLY_LEN];
+                let request = fd::request(ask_fd::action::ACCEPT, output.len());
+                let (result, creator) = match fd::perform_retained(
+                    self.socket.as_raw_fd(),
+                    request,
+                    payload,
+                    &mut output,
+                )
+                .await
+                {
+                    Ok(value) => value,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock && !nonblocking => {
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                let count = usize::try_from(result.completed_count).map_err(|_| invalid())?;
+                let accepted = wire::AcceptReply::decode(output.get(..count).ok_or_else(invalid)?)
+                    .ok_or_else(invalid)?;
+                let mut redeem = ask_ipc::attachment::Redeem::new(
+                    ask_abi::ProcessIdentity {
+                        pid: object.provider_pid,
+                        generation: object.provider_generation,
+                    },
+                    accepted.grant,
+                    ask_io::fd::backend::SOCKET,
+                    SOCKET_RIGHTS,
+                    end,
+                )
+                .map_err(constructor_error)?;
+                let opened =
+                    crate::future::poll_fn(|_| match redeem.probe(ask_sys::get_monotonic_ms()) {
+                        Ok(Some(opened)) => crate::task::Poll::Ready(Ok(opened)),
+                        Ok(None) => crate::task::Poll::Pending,
+                        Err(error) => crate::task::Poll::Ready(Err(constructor_error(error))),
+                    })
+                    .await?;
+                let socket = bind_opened(opened)?;
+                drop(creator);
+                let peer = lookup_socket_addr(accepted.peer.endpoint().ok_or_else(invalid)?)?;
+                return Ok((
+                    TcpStream {
+                        socket,
+                        read_timeout: Mutex::new(None),
+                        write_timeout: Mutex::new(None),
+                    },
+                    peer,
+                ));
+            }
+        })?
     }
 
     pub fn duplicate(&self) -> io::Result<TcpListener> {
-        unsupported()
+        Ok(Self { socket: self.socket.duplicate()? })
     }
 
     pub fn set_ttl(&self, _ttl: u32) -> io::Result<()> {
@@ -429,89 +493,41 @@ impl TcpListener {
     }
 
     pub fn take_error(&self) -> io::Result<Option<io::Error>> {
-        Ok(None)
+        take_error(&self.socket)
     }
 
     pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
-        set_bool_option(
-            self.handle,
-            ask_io::net::SocketOption::Nonblocking,
-            nonblocking,
-        )
-    }
-}
-
-impl Drop for TcpListener {
-    fn drop(&mut self) {
-        close_handle(self.handle);
+        set_bool_option(&self.socket, ask_io::net::SocketOption::Nonblocking, nonblocking)
     }
 }
 
 #[derive(Debug)]
 pub struct UdpSocket {
-    handle: u32,
-    local: SocketAddr,
-    connected: Mutex<Option<SocketAddr>>,
+    socket: FileDesc,
     read_timeout: Mutex<Option<Duration>>,
     write_timeout: Mutex<Option<Duration>>,
 }
-
 impl UdpSocket {
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<UdpSocket> {
-        let addr = first_addr(addr)?;
-        let endpoint = to_net_endpoint(addr)?;
-        let handle = open_socket(ask_io::net::PROTO_UDP, endpoint.family)?;
-        let mut request = [0u8; 23];
-        let payload = ask_io::net::encode_net_endpoint_request(&mut request, handle, endpoint);
-        let completion = socket_call(ask_io::net::OP_BIND, payload)?;
-        if completion.result < 0 {
-            close_handle(handle);
-            return Err(io::const_error!(io::ErrorKind::AddrInUse, "netstack: bind failed"));
-        }
-        Ok(UdpSocket {
-            handle,
-            local: addr,
-            connected: Mutex::new(None),
-            read_timeout: Mutex::new(None),
-            write_timeout: Mutex::new(None),
-        })
+        let endpoint = to_net_endpoint(first_addr(addr)?)?;
+        let socket = open_socket(wire::PROTO_UDP, endpoint.family, deadline())?;
+        endpoint_control(&socket, wire::OP_BIND, endpoint, None)?;
+        Ok(Self { socket, read_timeout: Mutex::new(None), write_timeout: Mutex::new(None) })
     }
 
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
-        self.connected
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .ok_or_else(|| io::const_error!(io::ErrorKind::NotConnected, "socket is not connected"))
+        endpoint_option(&self.socket, wire::SocketOption::PeerEndpoint)
     }
 
     pub fn socket_addr(&self) -> io::Result<SocketAddr> {
-        Ok(self.local)
+        endpoint_option(&self.socket, wire::SocketOption::LocalEndpoint)
     }
 
     pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        let timeout = *self.read_timeout.lock().unwrap_or_else(|e| e.into_inner());
-        let want = (buf.len() as u32).min(ask_io::net::DATA_LEN);
-        let buffer = ask_io::net::NetBuffer::new(0, want).ok_or_else(unsupported_err)?;
-        let mut request = [0u8; 16];
-        let payload = ask_io::net::encode_net_io_request(&mut request, self.handle, buffer, 0);
-        let mut guard = channel()?;
-        let completion = call_with_timeout(&mut guard, ask_io::net::OP_RECV_FROM, payload, timeout)?;
-        if completion.result < 0 {
-            return Err(netstack_error(completion.result));
-        }
-        // `OP_RECV_FROM`'s completion payload is the raw 19-byte sender
-        // `NetEndpoint` (`netstack`'s `try_udp_recv_from` reply), not a
-        // handle-prefixed endpoint request — the byte count travels in
-        // `completion.result` instead, matching every other I/O op here.
-        let from = ask_io::net::decode_net_endpoint(completion.payload())
-            .ok_or_else(unsupported_err)?;
-        let from = from_net_endpoint(from)?;
-        let n = (completion.result as usize).min(buf.len());
-        let data = guard
-            .shared_region_mut(ask_io::net::DATA_OFFSET as usize, n)
-            .ok_or_else(unsupported_err)?;
-        buf[..n].copy_from_slice(data);
-        Ok((n, from))
+        let result = read(&self.socket, buf, self.read_timeout()?, true)?;
+        let count = usize::try_from(result.completed_count).map_err(|_| invalid())?;
+        let peer = lookup_socket_addr(result.endpoint.endpoint().ok_or_else(invalid)?)?;
+        Ok((count, peer))
     }
 
     pub fn peek_from(&self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
@@ -519,37 +535,25 @@ impl UdpSocket {
     }
 
     pub fn send_to(&self, buf: &[u8], addr: &SocketAddr) -> io::Result<usize> {
-        let timeout = *self.write_timeout.lock().unwrap_or_else(|e| e.into_inner());
-        let n = (buf.len() as u32).min(ask_io::net::DATA_LEN) as usize;
-        let endpoint = to_net_endpoint(*addr)?;
-        let mut guard = channel()?;
-        {
-            let data = guard
-                .shared_region_mut(ask_io::net::DATA_OFFSET as usize, n)
-                .ok_or_else(unsupported_err)?;
-            data.copy_from_slice(&buf[..n]);
-        }
-        let buffer = ask_io::net::NetBuffer::new(0, n as u32).ok_or_else(unsupported_err)?;
-        let mut request = [0u8; 35];
-        let payload =
-            ask_io::net::encode_net_datagram_request(&mut request, self.handle, buffer, 0, endpoint);
-        let completion = call_with_timeout(&mut guard, ask_io::net::OP_SEND_TO, payload, timeout)?;
-        if completion.result < 0 {
-            return Err(netstack_error(completion.result));
-        }
-        Ok(completion.result as usize)
+        write(&self.socket, buf, self.write_timeout()?, Some(*addr))
     }
 
     pub fn duplicate(&self) -> io::Result<UdpSocket> {
-        unsupported()
+        Ok(Self {
+            socket: self.socket.duplicate()?,
+            read_timeout: Mutex::new(self.read_timeout()?),
+            write_timeout: Mutex::new(self.write_timeout()?),
+        })
     }
 
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        validate_timeout(timeout)?;
         *self.read_timeout.lock().unwrap_or_else(|e| e.into_inner()) = timeout;
         Ok(())
     }
 
     pub fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        validate_timeout(timeout)?;
         *self.write_timeout.lock().unwrap_or_else(|e| e.into_inner()) = timeout;
         Ok(())
     }
@@ -619,34 +623,16 @@ impl UdpSocket {
     }
 
     pub fn take_error(&self) -> io::Result<Option<io::Error>> {
-        Ok(None)
+        take_error(&self.socket)
     }
 
     pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
-        set_bool_option(
-            self.handle,
-            ask_io::net::SocketOption::Nonblocking,
-            nonblocking,
-        )
+        set_bool_option(&self.socket, ask_io::net::SocketOption::Nonblocking, nonblocking)
     }
 
     pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let timeout = *self.read_timeout.lock().unwrap_or_else(|e| e.into_inner());
-        let want = (buf.len() as u32).min(ask_io::net::DATA_LEN);
-        let buffer = ask_io::net::NetBuffer::new(0, want).ok_or_else(unsupported_err)?;
-        let mut request = [0u8; 16];
-        let payload = ask_io::net::encode_net_io_request(&mut request, self.handle, buffer, 0);
-        let mut guard = channel()?;
-        let completion = call_with_timeout(&mut guard, ask_io::net::OP_RECV, payload, timeout)?;
-        if completion.result < 0 {
-            return Err(netstack_error(completion.result));
-        }
-        let n = (completion.result as usize).min(buf.len());
-        let data = guard
-            .shared_region_mut(ask_io::net::DATA_OFFSET as usize, n)
-            .ok_or_else(unsupported_err)?;
-        buf[..n].copy_from_slice(data);
-        Ok(n)
+        let result = read(&self.socket, buf, self.read_timeout()?, false)?;
+        usize::try_from(result.completed_count).map_err(|_| invalid())
     }
 
     pub fn peek(&self, _buf: &mut [u8]) -> io::Result<usize> {
@@ -654,51 +640,14 @@ impl UdpSocket {
     }
 
     pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
-        let timeout = *self.write_timeout.lock().unwrap_or_else(|e| e.into_inner());
-        let n = (buf.len() as u32).min(ask_io::net::DATA_LEN) as usize;
-        let mut guard = channel()?;
-        {
-            let data = guard
-                .shared_region_mut(ask_io::net::DATA_OFFSET as usize, n)
-                .ok_or_else(unsupported_err)?;
-            data.copy_from_slice(&buf[..n]);
-        }
-        let buffer = ask_io::net::NetBuffer::new(0, n as u32).ok_or_else(unsupported_err)?;
-        let mut request = [0u8; 16];
-        let payload = ask_io::net::encode_net_io_request(&mut request, self.handle, buffer, 0);
-        let completion = call_with_timeout(&mut guard, ask_io::net::OP_SEND, payload, timeout)?;
-        if completion.result < 0 {
-            return Err(netstack_error(completion.result));
-        }
-        Ok(completion.result as usize)
+        write(&self.socket, buf, self.write_timeout()?, None)
     }
 
     pub fn connect<A: ToSocketAddrs>(&self, addr: A) -> io::Result<()> {
-        let addr = first_addr(addr)?;
-        let endpoint = to_net_endpoint(addr)?;
-        let mut request = [0u8; 23];
-        let payload = ask_io::net::encode_net_endpoint_request(&mut request, self.handle, endpoint);
-        let completion = socket_call(ask_io::net::OP_CONNECT, payload)?;
-        if completion.result < 0 {
-            return Err(io::const_error!(io::ErrorKind::ConnectionRefused, "netstack: connect failed"));
-        }
-        *self.connected.lock().unwrap_or_else(|e| e.into_inner()) = Some(addr);
-        Ok(())
+        endpoint_control(&self.socket, wire::OP_CONNECT, to_net_endpoint(first_addr(addr)?)?, None)
     }
 }
 
-impl Drop for UdpSocket {
-    fn drop(&mut self) {
-        close_handle(self.handle);
-    }
-}
-
-/// Name resolution goes to the `resolver` service over its own
-/// `APP_RESOLVER_TOKEN` lease (`ask_io::resolver`), separate from the
-/// `netstack` channel above so a process can be granted sockets without name
-/// resolution. Literals never reach the service: they are parsed here, so
-/// `connect("127.0.0.1:port")` and `connect("[::1]:port")` work in a process
-/// with no resolver lease at all.
 pub struct LookupHost {
     addresses: [SocketAddr; ask_io::resolver::MAX_ADDRESSES],
     count: usize,
@@ -727,34 +676,18 @@ impl Iterator for LookupHost {
     }
 }
 
-/// The process-wide channel to `resolver`, created lazily on first name
-/// lookup. A process that only ever connects to literals never creates it.
-static RESOLVER_CHANNEL: OnceLock<Mutex<SyncChannel>> = OnceLock::new();
-
-fn resolver_channel() -> io::Result<MutexGuard<'static, SyncChannel>> {
-    ask_sys::log("resolver PAL: acquiring channel");
-    let cell = RESOLVER_CHANNEL.get_or_try_init(|| {
-        ask_sys::log("resolver PAL: creating leased channel");
-        match SyncChannel::create_leased(
-            ask_abi::APP_RESOLVER_TOKEN,
-            ask_io::resolver::CHANNEL_PAGES,
-        ) {
-            Ok(channel) => Ok(Mutex::new(channel)),
-            Err(error) => {
-                eprintln!(
-                    "resolver PAL: lease creation failed token={} pages={} error={error:?}",
-                    ask_abi::APP_RESOLVER_TOKEN,
-                    ask_io::resolver::CHANNEL_PAGES,
-                );
-                Err(io::const_error!(
-                    io::ErrorKind::NotConnected,
-                    "no resolver lease"
-                ))
-            }
-        }
-    })?;
-    ask_sys::log("resolver PAL: channel ready");
-    Ok(cell.lock().unwrap_or_else(|e| e.into_inner()))
+fn resolver_channel() -> io::Result<ask_ipc::SyncChannel> {
+    let mut endpoint = ask_ipc::directory::connect(
+        ask_io::directory::EndpointUse::Once,
+        ask_io::resolver::INTERFACE_NAME,
+        ask_io::resolver::INTERFACE_VERSION,
+        0,
+        ask_ipc::sync::WaitHooks::RAW,
+    )
+    .map_err(|_| io::Error::from(io::ErrorKind::PermissionDenied))?;
+    endpoint
+        .create_channel(ask_io::resolver::CHANNEL_PAGES)
+        .map_err(|_| io::Error::from(io::ErrorKind::NotConnected))
 }
 
 fn resolver_error(result: i32) -> io::Error {
@@ -785,10 +718,26 @@ fn resolve_name(host: &str, port: u16) -> io::Result<LookupHost> {
     )
     .ok_or_else(|| io::const_error!(io::ErrorKind::InvalidInput, "invalid host name"))?;
 
-    let completion = {
-        let mut guard = resolver_channel()?;
-        guard.call(ask_io::resolver::OP_LOOKUP, payload)?
-    };
+    let completion = fd::blocking_with_timeout(
+        async {
+            let mut channel = resolver_channel()?;
+            let identity = channel
+                .submit(ask_io::resolver::OP_LOOKUP, payload, None)
+                .map_err(|_| io::Error::from(io::ErrorKind::NotConnected))?;
+            crate::future::poll_fn(|_| match channel.try_recv_completion() {
+                Ok(Some(completion)) if completion.user_data == identity => {
+                    crate::task::Poll::Ready(Ok(completion))
+                }
+                Ok(Some(_)) => crate::task::Poll::Ready(Err(invalid())),
+                Ok(None) => crate::task::Poll::Pending,
+                Err(_) => {
+                    crate::task::Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected)))
+                }
+            })
+            .await
+        },
+        Some(Duration::from_millis(ask_ipc::directory::policy::DEADLINE_MS)),
+    )??;
     if completion.result < 0 {
         return Err(resolver_error(completion.result));
     }

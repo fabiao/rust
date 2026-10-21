@@ -164,7 +164,9 @@ pub(crate) struct MountSource {
 
 impl Drop for MountSource {
     fn drop(&mut self) {
-        if !self.id.valid() { return; }
+        if !self.id.valid() {
+            return;
+        }
         let mut error = ErrorRecord::clear();
         if unsafe { ask_fd::__askfd_release_source(&self.id, &mut error) } != status::COMPLETE {
             crate::sys::abort_internal();
@@ -191,8 +193,8 @@ fn lookup_mount_source(token: u32) -> io::Result<MountSource> {
 }
 
 fn reconnect_error(error: ask_ipc::filesystem::Error) -> io::Error {
-    use ask_ipc::filesystem::Error;
     use ask_io::process::result;
+    use ask_ipc::filesystem::Error;
     let kind = match error {
         Error::Expired => io::ErrorKind::TimedOut,
         Error::Protocol => io::ErrorKind::InvalidData,
@@ -208,35 +210,59 @@ fn reconnect_error(error: ask_ipc::filesystem::Error) -> io::Error {
 pub(crate) fn mount_source(token: u32) -> io::Result<MountSource> {
     let previous = lookup_mount_source(token)?;
     if ask_sys::get_process_generation(previous.record.provider_pid).ok()
-        == Some(previous.record.provider_generation) { return Ok(previous); }
-    let slot = token.checked_sub(ask_abi::APP_MOUNT_TOKEN_BASE)
+        == Some(previous.record.provider_generation)
+    {
+        return Ok(previous);
+    }
+    let slot = token
+        .checked_sub(ask_abi::APP_MOUNT_TOKEN_BASE)
         .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
     let mount = if slot as usize == ask_io::view::MountPoint::In.slot() {
         ask_io::process::mount::IN
     } else if slot as usize == ask_io::view::MountPoint::Apps.slot() {
         ask_io::process::mount::APPS
-    } else { return Err(io::Error::from(io::ErrorKind::BrokenPipe)); };
-    let deadline = ask_sys::get_monotonic_ms().checked_add(ask_ipc::directory::policy::DEADLINE_MS)
+    } else {
+        return Err(io::Error::from(io::ErrorKind::BrokenPipe));
+    };
+    let deadline = ask_sys::get_monotonic_ms()
+        .checked_add(ask_ipc::directory::policy::DEADLINE_MS)
         .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))?;
-    let mut exchange = ask_ipc::filesystem::Reconnect::new(mount, deadline).map_err(reconnect_error)?;
+    let mut exchange =
+        ask_ipc::filesystem::Reconnect::new(mount, deadline).map_err(reconnect_error)?;
     let endpoint = loop {
-        if let Some(endpoint) = exchange.probe(ask_sys::get_monotonic_ms()).map_err(reconnect_error)? { break endpoint; }
+        if let Some(endpoint) =
+            exchange.probe(ask_sys::get_monotonic_ms()).map_err(reconnect_error)?
+        {
+            break endpoint;
+        }
         let remaining = deadline.saturating_sub(ask_sys::get_monotonic_ms());
-        if remaining == 0 { return Err(io::Error::from(io::ErrorKind::TimedOut)); }
+        if remaining == 0 {
+            return Err(io::Error::from(io::ErrorKind::TimedOut));
+        }
         let _ = ask_sys::park_timeout(remaining.min(crate::sys::channel::POLL_INTERVAL_MS));
     };
     let record = ask_fd::SourceRecord {
-        token: ask_abi::CapabilityToken(endpoint.authority.token().ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))?),
-        backend: ask_io::fd::backend::FILE, reserved: 0, padding: 0,
-        provider_pid: endpoint.provider.pid, provider_generation: endpoint.provider.generation,
+        token: ask_abi::CapabilityToken(
+            endpoint.authority.token().ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))?,
+        ),
+        backend: ask_io::fd::backend::FILE,
+        reserved: 0,
+        padding: 0,
+        provider_pid: endpoint.provider.pid,
+        provider_generation: endpoint.provider.generation,
     };
     let mut replacement = MountSource { id: ask_fd::SourceId::invalid(), record };
     retry(|error| unsafe { ask_fd::__askfd_adopt_source(&record, &mut replacement.id, error) })?;
     let _ = endpoint.authority.into_token();
     let mut error_record = ErrorRecord::clear();
-    let code = unsafe { ask_fd::__askfd_bind_mount(slot, &previous.id, &replacement.id, &mut error_record) };
-    if code == status::COMPLETE { replacement.id = ask_fd::SourceId::invalid(); }
-    else if code != status::CONFLICT { return Err(error(code, error_record)); }
+    let code = unsafe {
+        ask_fd::__askfd_bind_mount(slot, &previous.id, &replacement.id, &mut error_record)
+    };
+    if code == status::COMPLETE {
+        replacement.id = ask_fd::SourceId::invalid();
+    } else if code != status::CONFLICT {
+        return Err(error(code, error_record));
+    }
     lookup_mount_source(token)
 }
 
@@ -431,6 +457,20 @@ pub(crate) fn error(code: u32, record: ErrorRecord) -> io::Error {
             "native filesystem operation failed",
         );
     }
+    if code == status::NATIVE_FAILURE && record.domain == ask_fd::error_domain::NETWORK {
+        use ask_io::net::result;
+        return io::Error::from(match record.native_code as i32 {
+            result::WOULD_BLOCK => io::ErrorKind::WouldBlock,
+            result::INVALID | result::NOT_SOCKET => io::ErrorKind::InvalidInput,
+            result::UNSUPPORTED => io::ErrorKind::Unsupported,
+            result::EXHAUSTED => io::ErrorKind::OutOfMemory,
+            result::CLOSED => io::ErrorKind::BrokenPipe,
+            result::NOT_CONNECTED => io::ErrorKind::NotConnected,
+            result::DENIED => io::ErrorKind::PermissionDenied,
+            result::CANCELLED => io::ErrorKind::Interrupted,
+            _ => io::ErrorKind::Other,
+        });
+    }
     if code == status::NATIVE_FAILURE && record.domain == ask_fd::error_domain::STREAM {
         use ask_io::pipe::buffered::result;
         return io::Error::from(match record.native_code as i32 {
@@ -487,9 +527,8 @@ impl Drop for CapturedAlias {
     fn drop(&mut self) {
         let mut number = -1;
         let mut record = ErrorRecord::clear();
-        let code = unsafe {
-            ask_fd::__askfd_relinquish_alias(&self.ticket, &mut number, &mut record)
-        };
+        let code =
+            unsafe { ask_fd::__askfd_relinquish_alias(&self.ticket, &mut number, &mut record) };
         if code == status::COMPLETE {
             return;
         }
@@ -507,7 +546,7 @@ impl Drop for CapturedAlias {
     }
 }
 
-struct Operation {
+pub(crate) struct Operation {
     id: OperationId,
     _alias: CapturedAlias,
 }
@@ -527,6 +566,15 @@ pub(crate) async fn perform(
     input: &[u8],
     output: &mut [u8],
 ) -> io::Result<IoResult> {
+    perform_retained(number, request, input, output).await.map(|(value, _operation)| value)
+}
+
+pub(crate) async fn perform_retained(
+    number: i32,
+    request: IoRequest,
+    input: &[u8],
+    output: &mut [u8],
+) -> io::Result<(IoResult, Operation)> {
     let alias = CapturedAlias::acquire(number)?;
     let mut record = ErrorRecord::clear();
     let span = BufferSpan { data: input.as_ptr().cast_mut().cast(), length: input.len() as u64 };
@@ -553,6 +601,7 @@ pub(crate) async fn perform(
             completed_count: 0,
             resulting_position: 0,
             error: ErrorRecord::clear(),
+            endpoint: ask_io::net::SocketAddress::EMPTY,
         };
         let code =
             unsafe { ask_fd::__askfd_probe_io(&operation.id, &span, &mut value, &mut record) };
@@ -568,6 +617,7 @@ pub(crate) async fn perform(
         }
     })
     .await
+    .map(|value| (value, operation))
 }
 
 pub(crate) fn request(action: u32, count: usize) -> IoRequest {
@@ -582,7 +632,8 @@ pub(crate) fn request(action: u32, count: usize) -> IoRequest {
         seek_delta: 0,
         requested_count: count as u64,
         native_opcode: 0,
-        reserved: 0,
+        flags: 0,
+        endpoint: ask_io::net::SocketAddress::EMPTY,
     }
 }
 
@@ -599,7 +650,8 @@ pub(crate) async fn native(
         seek_delta: 0,
         requested_count: output.len() as u64,
         native_opcode: opcode,
-        reserved: 0,
+        flags: 0,
+        endpoint: ask_io::net::SocketAddress::EMPTY,
     };
     let result = perform(number, request, payload, output).await?;
     usize::try_from(result.completed_count).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))
@@ -639,6 +691,69 @@ pub(crate) async fn metadata(number: i32, output: &mut [u8]) -> io::Result<ask_f
     .await
 }
 
+pub(crate) struct Readiness {
+    id: ask_fd::RegistrationId,
+    interests: u32,
+    revision: u64,
+}
+impl Readiness {
+    pub(crate) fn new(number: i32, interests: u32) -> io::Result<Self> {
+        let alias = CapturedAlias::acquire(number)?;
+        let mut id = ask_fd::RegistrationId::invalid();
+        retry(|record| unsafe {
+            ask_fd::__askfd_register_ready(&alias.ticket, interests, &mut id, record)
+        })?;
+        Ok(Self { id, interests, revision: 0 })
+    }
+    pub(crate) async fn wait(&mut self) -> io::Result<ask_fd::ReadyResult> {
+        loop {
+            if self.revision != 0 {
+                retry(|record| unsafe {
+                    ask_fd::__askfd_rearm_ready(&self.id, self.revision, record)
+                })?;
+            }
+            let result = crate::future::poll_fn(|cx| {
+                let mut record = ErrorRecord::clear();
+                let mut output = ask_fd::ReadyResult {
+                    status: status::PENDING,
+                    events: 0,
+                    revision: 0,
+                    error: ErrorRecord::clear(),
+                };
+                match unsafe {
+                    ask_fd::__askfd_probe_ready(&self.id, self.revision, &mut output, &mut record)
+                } {
+                    status::PENDING => Poll::Pending,
+                    status::CONTENDED => {
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                    status::COMPLETE if output.status == status::COMPLETE => {
+                        Poll::Ready(Ok(output))
+                    }
+                    status::COMPLETE => Poll::Ready(Err(error(output.status, output.error))),
+                    code => Poll::Ready(Err(error(code, record))),
+                }
+            })
+            .await?;
+            self.revision = result.revision;
+            if result.events
+                & (self.interests | ask_fd::readiness::TERMINAL | ask_fd::readiness::ERROR)
+                != 0
+            {
+                return Ok(result);
+            }
+        }
+    }
+}
+impl Drop for Readiness {
+    fn drop(&mut self) {
+        if retry(|record| unsafe { ask_fd::__askfd_unregister_ready(&self.id, record) }).is_err() {
+            crate::sys::abort_internal();
+        }
+    }
+}
+
 pub(crate) fn is_terminal(number: i32) -> bool {
     let mut bytes = [0; ask_io::fd::layout::OBJECT_METADATA];
     match blocking(metadata(number, &mut bytes)) {
@@ -651,15 +766,33 @@ pub(crate) fn is_terminal(number: i32) -> bool {
 }
 
 pub(crate) fn blocking<F: Future>(future: F) -> io::Result<F::Output> {
+    blocking_with_timeout(future, None)
+}
+
+pub(crate) fn blocking_with_timeout<F: Future>(
+    future: F,
+    timeout: Option<crate::time::Duration>,
+) -> io::Result<F::Output> {
     if crate::rt::ask_entry::execution_class() == ask_fd::execution_class::CLASS1 {
         return Err(io::Error::from(io::ErrorKind::WouldBlock));
     }
+    let deadline = timeout.map(|duration| {
+        ask_sys::get_monotonic_ms()
+            .saturating_add(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+    });
     let mut future = core::pin::pin!(future);
     let mut context = Context::from_waker(Waker::noop());
     loop {
         if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
             return Ok(output);
         }
-        let _ = ask_sys::park_timeout(crate::sys::channel::POLL_INTERVAL_MS);
+        let now = ask_sys::get_monotonic_ms();
+        if deadline.is_some_and(|deadline| now >= deadline) {
+            return Err(io::Error::from(io::ErrorKind::TimedOut));
+        }
+        let wait = deadline.map_or(crate::sys::channel::POLL_INTERVAL_MS, |deadline| {
+            deadline.saturating_sub(now).min(crate::sys::channel::POLL_INTERVAL_MS)
+        });
+        let _ = ask_sys::park_timeout(wait);
     }
 }
