@@ -106,6 +106,13 @@ fn rust_entry_wrapper(tcx: TyCtxt<'_>, facts: &Value) -> Result<Value, String> {
     Ok(json!({"symbol": symbol, "module": module, "std_start_artifacts": artifacts}))
 }
 
+pub fn resolved_mir(tcx: TyCtxt<'_>) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    rustc_middle::mir::pretty::write_mir_pretty(tcx, &mut bytes)
+        .map_err(|error| format!("cannot capture actual compiler MIR: {error}"))?;
+    String::from_utf8(bytes).map_err(|error| error.to_string())
+}
+
 pub struct Capture {
     request: Value,
     request_path: PathBuf,

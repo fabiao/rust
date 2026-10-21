@@ -1182,6 +1182,7 @@ impl Capture {
             "file_inputs": inputs, "environment_inputs": environment});
         if tcx.output_filenames(()).outputs.should_codegen() {
             response["codegen_modules"] = json!(crate::entry_inputs::codegen_modules(tcx, &response)?);
+            response["resolved_mir"] = json!(crate::entry_inputs::resolved_mir(tcx)?);
         }
         Ok(response)
     }
