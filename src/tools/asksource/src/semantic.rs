@@ -139,8 +139,72 @@ fn argument<'tcx>(tcx: TyCtxt<'tcx>, arg: ty::GenericArg<'tcx>) -> Value {
     }
 }
 
+fn slice_length<'tcx>(tcx: TyCtxt<'tcx>, value: rustc_middle::mir::ConstValue,
+    input: Ty<'tcx>, environment: ty::TypingEnv<'tcx>) -> Option<u64> {
+    use rustc_middle::mir::{ConstValue, interpret::{GlobalAlloc, alloc_range}};
+    match value {
+        ConstValue::Slice { meta, .. } => Some(meta),
+        ConstValue::Indirect { alloc_id, offset }
+            if matches!(input.kind(), ty::Ref(_, element, _) if matches!(element.kind(), ty::Str | ty::Slice(_))) =>
+        {
+            let layout = tcx.layout_of(environment.as_query_input(input)).ok()?;
+            if layout.fields.count() != 2 {
+                return None;
+            }
+            let GlobalAlloc::Memory(allocation) = tcx.global_alloc(alloc_id) else { return None; };
+            allocation.inner().read_scalar(&tcx,
+                alloc_range(offset + layout.fields.offset(1), tcx.data_layout.pointer_size()), false)
+                .ok()?.to_target_usize(&tcx).discard_err()
+        }
+        _ => None,
+    }
+}
+
 pub mod semantic_type {
     pub const HEX_DIGITS: usize = (u128::BITS / 4) as usize;
+}
+
+pub mod compiler_items {
+    pub const TYPE_SIZE: &str = "mem_size_of";
+    pub const STRING_LENGTH: &str = "str_len";
+}
+
+pub mod generic_roles {
+    pub const DECLARED: &str = "declared";
+    pub const CLOSURE: &[&str] = &["closure_kind_ty", "closure_sig_as_fn_ptr_ty", "tupled_upvars_ty"];
+    pub const COROUTINE: &[&str] = &["kind_ty", "resume_ty", "yield_ty", "return_ty", "tupled_upvars_ty"];
+    pub const COROUTINE_CLOSURE: &[&str] = &[
+        "closure_kind_ty", "signature_parts_ty", "tupled_upvars_ty", "coroutine_captures_by_ref_ty",
+    ];
+    pub const CONST_BLOCK: &[&str] = &["const_ty_placeholder"];
+}
+
+fn parameter_role(tcx: TyCtxt<'_>, parameter: &ty::GenericParamDef) -> Option<&'static str> {
+    let kind = tcx.def_kind(parameter.def_id);
+    if matches!(kind, DefKind::TyParam | DefKind::ConstParam | DefKind::LifetimeParam |
+        DefKind::Trait | DefKind::TraitAlias) {
+        return Some(generic_roles::DECLARED);
+    }
+    let roles = if kind == DefKind::AnonConst && parameter.name == rustc_span::sym::const_ty_placeholder {
+        generic_roles::CONST_BLOCK
+    } else if kind == DefKind::Closure {
+        let input = tcx.type_of(parameter.def_id).instantiate_identity();
+        let closure = tcx.try_normalize_erasing_regions(
+            ty::TypingEnv::non_body_analysis(tcx, parameter.def_id), input,
+        ).ok()?;
+        match closure.kind() {
+            ty::Closure(..) => generic_roles::CLOSURE,
+            ty::Coroutine(..) => generic_roles::COROUTINE,
+            ty::CoroutineClosure(..) => generic_roles::COROUTINE_CLOSURE,
+            _ => return None,
+        }
+    } else {
+        return None;
+    };
+    let generics = tcx.generics_of(parameter.def_id);
+    if generics.own_params.len() != roles.len() { return None; }
+    let index = (parameter.index as usize).checked_sub(generics.parent_count)?;
+    roles.get(index).copied()
 }
 
 fn semantic_type_id<'tcx>(tcx: TyCtxt<'tcx>, value: Ty<'tcx>) -> Option<String> {
@@ -309,6 +373,28 @@ fn source_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::Instance<'tcx>,
     if !selected.contains(&instance) { selected.push(instance); }
 }
 
+fn inline_scope<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::Instance<'tcx>, body: &rustc_middle::mir::Body<'tcx>,
+    scope: rustc_middle::mir::SourceScope) -> (ty::Instance<'tcx>, Vec<Value>) {
+    let mut selected = instance;
+    let mut frames = Vec::new();
+    let mut current = Some(scope);
+    while let Some(index) = current {
+        let Some(scope) = body.source_scopes.get(index) else { break };
+        if let Some((callee, call_site)) = scope.inlined {
+            match instance.try_instantiate_mir_and_normalize_erasing_regions(
+                tcx, ty::TypingEnv::fully_monomorphized(), ty::EarlyBinder::bind(tcx, callee)) {
+                Ok(callee) => {
+                    if frames.is_empty() { selected = callee; }
+                    frames.push(json!({"instance": instance_fact(tcx, callee), "origin": origin(tcx, call_site)}));
+                }
+                Err(error) => frames.push(json!({"unresolved": format!("{error:?}")})),
+            }
+        }
+        current = scope.parent_scope;
+    }
+    (selected, frames)
+}
+
 fn instantiated_storage<'tcx>(tcx: TyCtxt<'tcx>, nodes: &mut RecordWriter)
     -> HashMap<LocalDefId, Vec<ty::Instance<'tcx>>>
 {
@@ -329,6 +415,16 @@ fn instantiated_storage<'tcx>(tcx: TyCtxt<'tcx>, nodes: &mut RecordWriter)
                 }
             }
             let descriptor = instance_fact(tcx, instance);
+            for (scope_id, scope) in body.source_scopes.iter_enumerated() {
+                if scope.parent_scope.is_some() && scope.inlined.is_none() { continue; }
+                let (selected, inlined) = inline_scope(tcx, instance, body, scope_id);
+                if !matches!(selected.def, ty::InstanceKind::Item(_)) { continue; }
+                nodes.push(json!({"kind": "instantiated_body", "owner": definition(tcx, selected.def_id()),
+                    "origin": origin(tcx, tcx.def_span(selected.def_id())), "instance": descriptor,
+                    "mir_scope": scope_id.as_u32(), "inlined": inlined,
+                    "type": type_fact(tcx, selected.ty(tcx, ty::TypingEnv::fully_monomorphized()),
+                        ty::TypingEnv::fully_monomorphized())}));
+            }
             for (local, declaration) in body.local_decls.iter_enumerated() {
                 let ty = match instance.try_instantiate_mir_and_normalize_erasing_regions(
                     tcx, ty::TypingEnv::fully_monomorphized(), ty::EarlyBinder::bind(tcx, declaration.ty)) {
@@ -336,23 +432,7 @@ fn instantiated_storage<'tcx>(tcx: TyCtxt<'tcx>, nodes: &mut RecordWriter)
                     Err(error) => json!({"inline_storage": {"kind": "unresolved", "error": format!("{error:?}")}}),
                 };
                 if ty["inline_storage"].is_null() { continue; }
-                let mut inlined = Vec::new();
-                let mut owner = instance.def_id();
-                let mut current = Some(declaration.source_info.scope);
-                while let Some(index) = current {
-                    let Some(scope) = body.source_scopes.get(index) else { break };
-                    if let Some((callee, call_site)) = scope.inlined {
-                        match instance.try_instantiate_mir_and_normalize_erasing_regions(
-                            tcx, ty::TypingEnv::fully_monomorphized(), ty::EarlyBinder::bind(tcx, callee)) {
-                            Ok(callee) => {
-                                if inlined.is_empty() { owner = callee.def_id(); }
-                                inlined.push(json!({"instance": instance_fact(tcx, callee), "origin": origin(tcx, call_site)}));
-                            }
-                            Err(error) => inlined.push(json!({"unresolved": format!("{error:?}")})),
-                        }
-                    }
-                    current = scope.parent_scope;
-                }
+                let (selected, inlined) = inline_scope(tcx, instance, body, declaration.source_info.scope);
                 let names: Vec<_> = body.var_debug_info.iter().filter_map(|variable| {
                     if let rustc_middle::mir::VarDebugInfoContents::Place(place) = &variable.value {
                         if place.local == local && place.projection.is_empty() {
@@ -362,7 +442,7 @@ fn instantiated_storage<'tcx>(tcx: TyCtxt<'tcx>, nodes: &mut RecordWriter)
                     }
                     None
                 }).collect();
-                nodes.push(json!({"kind": "instantiated_storage", "owner": definition(tcx, owner),
+                nodes.push(json!({"kind": "instantiated_storage", "owner": definition(tcx, selected.def_id()),
                     "origin": origin(tcx, declaration.source_info.span), "instance": descriptor,
                     "mir_local": local.as_u32(), "inlined": inlined, "names": names, "type": ty}));
             }
@@ -528,6 +608,7 @@ impl<'tcx> Facts<'tcx, '_> {
         let typeck = self.typeck;
         json!({"kind": kind, "local_id": id.local_id.as_u32(),
             "owner": definition(tcx, id.owner.def_id.to_def_id()), "origin": origin(tcx, span),
+            "body_owner": definition(tcx, self.body_owner.to_def_id()),
             "type": typeck.node_type_opt(id).map(|value|
                 type_fact(tcx, value, ty::TypingEnv::post_typeck_until_borrowck(tcx, self.body_owner))),
             "arguments": typeck.node_args_opt(id).map(|args| args.as_slice().iter().map(|arg| argument(tcx, *arg)).collect::<Vec<_>>()),
@@ -561,13 +642,101 @@ impl<'tcx> Facts<'tcx, '_> {
                     fact["selection_error"] = json!("compiler instance is not a source item");
                     return;
                 }
+                let selected = self.tcx.generics_of(instance.def_id());
+                let caller = self.tcx.generics_of(self.body_owner);
+                if instance.args.len() != selected.count() {
+                    fact["selection_error"] = json!("selected compiler instance has incomplete arguments");
+                    return;
+                }
+                let mut bindings = Vec::new();
+                for (index, arg) in instance.args.as_slice().iter().enumerate() {
+                    let parameter = selected.param_at(index, self.tcx);
+                    let Some(role) = parameter_role(self.tcx, parameter) else {
+                        fact["selection_error"] = json!("selected compiler parameter has an unsupported semantic role");
+                        return;
+                    };
+                    let argument_parameter = match arg.kind() {
+                        ty::GenericArgKind::Const(value) => match value.kind() {
+                            ty::ConstKind::Param(param) => Some(param.index),
+                            _ => None,
+                        },
+                        ty::GenericArgKind::Type(value) => match value.kind() {
+                            ty::Param(param) => Some(param.index),
+                            _ => None,
+                        },
+                        ty::GenericArgKind::Lifetime(_) => None,
+                    };
+                    if argument_parameter.is_some_and(|index| index as usize >= caller.count()) {
+                        fact["selection_error"] = json!("selected argument has no declaring caller parameter");
+                        return;
+                    }
+                    let argument_parameter = argument_parameter.map(|index| caller.param_at(index as usize, self.tcx));
+                    let argument_role = argument_parameter.and_then(|parameter| parameter_role(self.tcx, parameter));
+                    if argument_parameter.is_some() && argument_role.is_none() {
+                        fact["selection_error"] = json!("caller compiler parameter has an unsupported semantic role");
+                        return;
+                    }
+                    bindings.push(json!({"parameter": definition(self.tcx, parameter.def_id),
+                        "role": role,
+                        "argument": argument(self.tcx, *arg),
+                        "argument_parameter": argument_parameter.map(|parameter| definition(self.tcx, parameter.def_id)),
+                        "argument_parameter_role": argument_role}));
+                }
                 fact["selected_definition"] = definition(self.tcx, instance.def_id());
-                fact["selected_arguments"] = json!(instance.args.as_slice().iter()
-                    .map(|arg| argument(self.tcx, *arg)).collect::<Vec<_>>());
+                fact["selected_arguments"] = json!(bindings);
             }
             Ok(None) => fact["selection_error"] = json!("compiler instance remains unresolved"),
             Err(error) => fact["selection_error"] = json!(format!("compiler instance resolution failed: {error:?}")),
         }
+    }
+
+    fn shape_query(&self, def: rustc_hir::def_id::DefId, args: ty::GenericArgsRef<'tcx>,
+        operands: &[&'tcx rustc_hir::Expr<'tcx>]) -> Value {
+        let tcx = self.tcx;
+        let environment = ty::TypingEnv::post_analysis(tcx, self.body_owner);
+        let string_length = tcx.is_diagnostic_item(rustc_span::Symbol::intern(compiler_items::STRING_LENGTH), def);
+        if (tcx.lang_items().slice_len_fn() == Some(def) || string_length) && let [receiver] = operands {
+            let input = self.typeck.expr_ty(receiver);
+            let normalized = tcx.try_normalize_erasing_regions(environment,
+                ty::set_aliases_to_non_rigid(tcx, input)).ok();
+            let mut value = normalized.and_then(|value| match value.peel_refs().kind() {
+                ty::Array(_, extent) => extent.try_to_target_usize(tcx),
+                _ => None,
+            });
+            if value.is_none() && let rustc_hir::ExprKind::Path(ref path) = receiver.kind
+                && let Res::Def(DefKind::Const | DefKind::AssocConst, owner) =
+                    self.typeck.qpath_res(path, receiver.hir_id)
+            {
+                let arguments = self.typeck.node_args(receiver.hir_id);
+                if arguments.len() == tcx.generics_of(owner).count()
+                    && let Ok(constant) = tcx.const_eval_resolve(
+                        environment, rustc_middle::mir::UnevaluatedConst::new(owner, arguments), receiver.span)
+                {
+                    value = normalized.and_then(|input| slice_length(tcx, constant, input, environment));
+                }
+            }
+            if value.is_none() && let rustc_hir::ExprKind::Lit(literal) = receiver.kind
+                && let rustc_ast::LitKind::Str(text, _) = literal.node
+            {
+                value = Some(text.as_str().len() as u64);
+            }
+            return json!({"kind": if string_length { "string_length" } else { "slice_length" },
+                "definition": definition(tcx, def),
+                "input": type_identity(tcx, input), "value": value,
+                "error": value.is_none().then_some("slice length needs a resolved array or constant slice value")});
+        }
+        if tcx.is_diagnostic_item(rustc_span::Symbol::intern(compiler_items::TYPE_SIZE), def) && operands.is_empty()
+            && let Some(input) = args.as_slice().first().and_then(|arg| arg.as_type())
+        {
+            let value = tcx.try_normalize_erasing_regions(environment,
+                ty::set_aliases_to_non_rigid(tcx, input)).ok()
+                .and_then(|value| tcx.layout_of(environment.as_query_input(value)).ok())
+                .map(|layout| layout.size.bytes());
+            return json!({"kind": "type_size", "definition": definition(tcx, def),
+                "input": type_identity(tcx, input), "value": value,
+                "error": value.is_none().then_some("type size needs a resolved target layout")});
+        }
+        Value::Null
     }
 }
 
@@ -649,6 +818,9 @@ impl<'tcx> Visitor<'tcx> for Facts<'tcx, '_> {
             ExprKind::Cast(operand, _) | ExprKind::Type(operand, _) | ExprKind::DropTemps(operand) => {
                 fact["operands"] = json!([node_reference(self.tcx, operand.hir_id, operand.span)]);
             }
+            ExprKind::AddrOf(_, _, operand) => {
+                fact["operands"] = json!([node_reference(self.tcx, operand.hir_id, operand.span)]);
+            }
             ExprKind::Path(ref path) => {
                 let resolved = self.typeck.qpath_res(path, expr.hir_id);
                 fact["resolution"] = resolution(self.tcx, resolved);
@@ -665,6 +837,11 @@ impl<'tcx> Visitor<'tcx> for Facts<'tcx, '_> {
             }
             ExprKind::Call(callee, arguments) => {
                 fact["callee"] = node_reference(self.tcx, callee.hir_id, callee.span);
+                fact["shape_query"] = match self.typeck.expr_ty(callee).kind() {
+                    ty::FnDef(def, args) => args.no_bound_vars().map(|args|
+                        self.shape_query(*def, args, &arguments.iter().collect::<Vec<_>>())).unwrap_or(Value::Null),
+                    _ => Value::Null,
+                };
                 if let ty::FnDef(def, _) = *self.typeck.expr_ty(callee).kind()
                     && let kind @ DefKind::Ctor(_, rustc_hir::def::CtorKind::Fn) = self.tcx.def_kind(def)
                     && let ty::Adt(adt, _) = self.typeck.expr_ty(expr).kind()
@@ -685,9 +862,12 @@ impl<'tcx> Visitor<'tcx> for Facts<'tcx, '_> {
                 }
             }
             ExprKind::MethodCall(_, receiver, arguments, _) => {
+                fact["shape_query"] = Value::Null;
                 if let Some(def) = self.typeck.type_dependent_def_id(expr.hir_id) {
                     fact["resolution"] = resolution(self.tcx, Res::Def(self.tcx.def_kind(def), def));
                     self.select(&mut fact, expr.hir_id, def);
+                    let operands: Vec<_> = std::iter::once(receiver).chain(arguments.iter()).collect();
+                    fact["shape_query"] = self.shape_query(def, self.typeck.node_args(expr.hir_id), &operands);
                 }
                 fact["receiver"] = node_reference(self.tcx, receiver.hir_id, receiver.span);
                 fact["operands"] = json!(arguments.iter().map(|arg| node_reference(self.tcx, arg.hir_id, arg.span)).collect::<Vec<_>>());
