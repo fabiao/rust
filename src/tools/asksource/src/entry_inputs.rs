@@ -61,6 +61,51 @@ pub fn codegen_modules(tcx: TyCtxt<'_>, facts: &Value) -> Result<Vec<Value>, Str
     Ok(modules)
 }
 
+fn rust_entry_wrapper(tcx: TyCtxt<'_>, facts: &Value) -> Result<Value, String> {
+    let (main, _) = tcx.entry_fn(())
+        .ok_or("participating Rust final entry requires the compiler-generated main wrapper; remove no_main/custom main")?;
+    let instance = rustc_middle::ty::Instance::mono(tcx, main);
+    let units = tcx.collect_and_partition_mono_items(()).codegen_units;
+    let mut selected = units.iter().filter(|unit| {
+        if main.is_local() {
+            unit.contains_item(&rustc_middle::mono::MonoItem::Fn(instance))
+        } else {
+            unit.is_primary()
+        }
+    });
+    let unit = selected.next().ok_or("compiler Rust entry wrapper has no codegen unit")?;
+    if selected.next().is_some() {
+        return Err("compiler Rust entry wrapper has multiple codegen units".into());
+    }
+    let symbol = tcx.sess.target.entry_name.as_ref();
+    if symbol != "main" {
+        return Err("participating ASK Rust adapter requires compiler target entry main".into());
+    }
+    let start = tcx.lang_items().start_fn()
+        .ok_or("participating Rust entry requires the std start language item")?;
+    if start.is_local() || tcx.crate_name(start.krate).as_str() != "std" {
+        return Err("participating Rust entry cannot call an application start language item before GO".into());
+    }
+    let mut artifacts = BTreeMap::new();
+    let libraries = PathBuf::from(facts["sysroot"].as_str().ok_or("missing compiler sysroot")?)
+        .join("lib/rustlib").join(tcx.sess.opts.target_triple.tuple()).join("lib");
+    for source in tcx.used_crate_source(start.krate).paths() {
+        let path = fs::canonicalize(source).map_err(|error| error.to_string())?;
+        if !path.starts_with(&libraries) {
+            return Err("Rust start language item must come from the admitted std sysroot".into());
+        }
+        let hash = facts["dependency_artifacts"].get(path.to_str().ok_or("non-UTF8 std artifact")?)
+            .and_then(Value::as_str).ok_or("std start artifact was not captured")?;
+        artifacts.insert(path, hash.to_owned());
+    }
+    if artifacts.is_empty() {
+        return Err("std start language item has no captured native artifact".into());
+    }
+    let module = std::path::absolute(tcx.output_filenames(()).temp_path_ext_for_cgu("no-opt.bc", &unit.name().to_string()))
+        .map_err(|error| error.to_string())?;
+    Ok(json!({"symbol": symbol, "module": module, "std_start_artifacts": artifacts}))
+}
+
 pub struct Capture {
     request: Value,
     request_path: PathBuf,
@@ -295,6 +340,13 @@ impl Capture {
             );
         }
         let requires_primitive_admission = !module && self.policy["owner_input"].is_string();
+        let require_rust_entry_wrapper = self.policy["require_rust_entry_wrapper"].as_bool()
+            .ok_or("entry link policy omits Rust wrapper requirement")?;
+        let rust_entry_wrapper = if require_rust_entry_wrapper && !module {
+            rust_entry_wrapper(tcx, facts)?
+        } else {
+            Value::Null
+        };
         let allocator_kind = match tcx.allocator_kind(()) {
             Some(AllocatorKind::Global) => "global",
             Some(AllocatorKind::Default) => "default",
@@ -425,6 +477,7 @@ impl Capture {
         }
         let plan = json!({"state": "pending", "request": self.request,
             "requires_primitive_admission": requires_primitive_admission,
+            "rust_entry_wrapper": rust_entry_wrapper,
             "allocator_kind": allocator_kind, "allocator_owners": allocator_owners,
             "target": tcx.sess.opts.target_triple.tuple(),
             "request_sha256": self.request_sha256, "arguments": facts["arguments"],
