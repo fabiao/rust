@@ -123,6 +123,25 @@ can repair missing or stale facts even when Cargo considers the ordinary unit
 fresh, and reuse complete matching facts. Build dependencies and target
 dependencies retain their separate contexts.
 
+An optional absolute `unit_store` in the request moves library and build-script
+unit facts out of the request directory when the request has no owned sources
+and no compiler shims. Those facts bind to the store's fixed request and to the
+semantic unit key, so another build sharing the Cargo target directory reuses a
+fresh unit instead of repairing its facts by recompiling it.
+
+The key includes the unit's LTO mode. Cargo derives that mode from the roots
+that reach a dependency, not from the dependency itself, so two recipes with
+different `lto` settings build the same library as two Cargo units with equal
+descriptors. Without the mode, facts recorded for one unit would vouch for the
+other. Cargo computes the mode only inside `compile_with_exec`, so the
+executor reproduces that computation while planning. `init` then rebuilds the
+graph snapshot from the `BuildRunner`'s actual assignment, so any difference
+refuses the capture as a changed graph.
+
+Cargo announces a unit to the executor only when it compiles it. A binary that
+stays fresh is therefore identified by the single graph unit whose descriptor
+matches the one Cargo reports for it; no match or several matches refuse.
+
 The selected Cargo executable must report a source commit supported by an exact
 embedded adapter. The package currently contains adapters for its in-tree Cargo
 and pinned bootstrap Cargo, sharing one executor implementation. An unsupported

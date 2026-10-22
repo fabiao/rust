@@ -5,7 +5,9 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use self::cargo::compiler::{BuildRunner, CompileMode, DefaultExecutor, Executor, Unit, UnitInterner};
+use self::cargo::compiler::{
+    BuildContext, BuildRunner, CompileMode, CrateType, DefaultExecutor, Executor, Lto, Unit, UnitInterner,
+};
 use self::cargo::util::CargoResult;
 use self::cargo::util::command_prelude::*;
 use self::cargo::workspace::{PackageId, Target};
@@ -60,7 +62,7 @@ fn build_cli() -> cargo::util::command_prelude::Command {
         ))
 }
 
-fn descriptor(unit: &Unit) -> Value {
+fn unit_descriptor(unit: &Unit) -> Value {
     json!({"package": unit.pkg.package_id().to_spec(), "manifest": unit.pkg.manifest_path(),
         "target": unit.target, "profile": unit.profile, "platform": unit.kind,
         "mode": unit.mode, "features": unit.features, "rustflags": &*unit.rustflags,
@@ -71,8 +73,110 @@ fn descriptor(unit: &Unit) -> Value {
         "links_overrides_sha256": crate::digest(format!("{:?}", unit.links_overrides).as_bytes())})
 }
 
-fn base_key(unit: &Unit) -> String {
-    crate::digest(descriptor(unit).to_string().as_bytes())
+/// LTO mode per unit, keyed by the digest of its `unit_descriptor`. Cargo
+/// derives a dependency's mode from the roots that reach it rather than
+/// from the unit itself, so one descriptor compiles to bitcode for one
+/// recipe and to object code for another. The shared unit store therefore
+/// needs the mode in the unit's identity.
+type LtoPlan = HashMap<String, String>;
+
+fn lto_plan<'a>(assigned: impl IntoIterator<Item = (&'a Unit, &'a Lto)>) -> Result<LtoPlan, String> {
+    let mut plan = HashMap::new();
+    for (unit, lto) in assigned {
+        let mode = format!("{lto:?}");
+        let key = crate::digest(unit_descriptor(unit).to_string().as_bytes());
+        if plan.insert(key, mode.clone()).is_some_and(|previous| previous != mode) {
+            return Err("Cargo units sharing a descriptor receive different LTO modes".into());
+        }
+    }
+    Ok(plan)
+}
+
+/// Cargo's private `lto::generate`, which runs only inside `compile_with_exec`.
+/// Units are planned before that, so the mode is predicted here, and
+/// `init` checks every prediction against the `BuildRunner`'s actual map.
+fn predicted_lto(bcx: &BuildContext<'_, '_>) -> HashMap<Unit, Lto> {
+    use self::cargo::workspace::profiles::Lto as ProfileLto;
+    fn needs_object(types: &[CrateType]) -> bool {
+        types.iter().any(|kind| kind.can_lto() || kind.is_dynamic())
+    }
+    fn with_object(types: &[CrateType]) -> Lto {
+        if types.iter().all(|kind| *kind == CrateType::Dylib) { Lto::OnlyObject } else { Lto::ObjectAndBitcode }
+    }
+    fn calculate(bcx: &BuildContext<'_, '_>, map: &mut HashMap<Unit, Lto>, unit: &Unit, parent: Lto) {
+        let types = match unit.mode {
+            CompileMode::Test | CompileMode::Doctest => vec![CrateType::Bin],
+            _ => unit.target.rustc_crate_types(),
+        };
+        let lto = if unit.target.for_host() {
+            Lto::OnlyObject
+        } else if types.iter().all(CrateType::can_lto) {
+            match unit.profile.lto {
+                ProfileLto::Named(name) => Lto::Run(Some(name)),
+                ProfileLto::Off => Lto::Off,
+                ProfileLto::Bool(true) => Lto::Run(None),
+                ProfileLto::Bool(false) => Lto::OnlyObject,
+            }
+        } else {
+            match (parent, needs_object(&types)) {
+                (Lto::Run(_), false) => Lto::OnlyBitcode,
+                (Lto::Run(_), true) | (Lto::OnlyBitcode, true) => with_object(&types),
+                (Lto::Off, _) => Lto::Off,
+                (_, false) | (Lto::OnlyObject, true) | (Lto::ObjectAndBitcode, true) => parent,
+            }
+        };
+        let merged = match map.get(unit).copied() {
+            None => lto,
+            Some(previous) => {
+                let merged = match (lto, previous) {
+                    (Lto::OnlyBitcode, Lto::OnlyBitcode) => Lto::OnlyBitcode,
+                    (Lto::OnlyObject, Lto::OnlyObject) => Lto::OnlyObject,
+                    (Lto::Run(name), _) | (_, Lto::Run(name)) => Lto::Run(name),
+                    (Lto::Off, _) | (_, Lto::Off) => Lto::Off,
+                    (Lto::ObjectAndBitcode, _) | (_, Lto::ObjectAndBitcode) => Lto::ObjectAndBitcode,
+                    (Lto::OnlyObject, Lto::OnlyBitcode) | (Lto::OnlyBitcode, Lto::OnlyObject) => {
+                        Lto::ObjectAndBitcode
+                    }
+                };
+                if merged == previous { return; }
+                merged
+            }
+        };
+        map.insert(unit.clone(), merged);
+        for dependency in &bcx.unit_graph[unit] {
+            calculate(bcx, map, &dependency.unit, merged);
+        }
+    }
+    let mut map = HashMap::new();
+    for root in &bcx.roots {
+        let lto = match root.profile.lto {
+            ProfileLto::Bool(false) => Lto::OnlyObject,
+            ProfileLto::Off => Lto::Off,
+            _ => {
+                let types = root.target.rustc_crate_types();
+                if root.target.for_host() {
+                    Lto::OnlyObject
+                } else if needs_object(&types) {
+                    with_object(&types)
+                } else {
+                    Lto::OnlyBitcode
+                }
+            }
+        };
+        calculate(bcx, &mut map, root, lto);
+    }
+    map
+}
+
+fn descriptor(unit: &Unit, lto: &LtoPlan) -> Value {
+    let mut value = unit_descriptor(unit);
+    let key = crate::digest(value.to_string().as_bytes());
+    value["lto"] = lto.get(&key).map_or(Value::Null, |mode| json!(mode));
+    value
+}
+
+fn base_key(unit: &Unit, lto: &LtoPlan) -> String {
+    crate::digest(descriptor(unit, lto).to_string().as_bytes())
 }
 
 struct GraphSnapshot {
@@ -83,10 +187,12 @@ struct GraphSnapshot {
 fn graph_snapshot(
     graph: &cargo::compiler::unit_graph::UnitGraph,
     roots: &[Unit],
+    lto: &LtoPlan,
 ) -> Result<GraphSnapshot, String> {
     fn visit(
         unit: &Unit,
         graph: &cargo::compiler::unit_graph::UnitGraph,
+        lto: &LtoPlan,
         keys: &mut HashMap<Unit, String>,
         active: &mut HashSet<Unit>,
         units: &mut BTreeMap<String, Value>,
@@ -100,13 +206,13 @@ fn graph_snapshot(
         let dependencies = graph.get(unit).ok_or("missing selected Cargo dependency unit")?;
         let mut edges = Vec::new();
         for edge in dependencies {
-            let key = visit(&edge.unit, graph, keys, active, units)?;
+            let key = visit(&edge.unit, graph, lto, keys, active, units)?;
             edges.push(json!({"unit": key, "extern_name": edge.extern_crate_name,
                 "dependency_name": edge.dep_name, "public": edge.public,
                 "noprelude": edge.noprelude, "nounused": edge.nounused}));
         }
         edges.sort_by_cached_key(Value::to_string);
-        let value = json!({"unit": descriptor(unit), "dependencies": edges});
+        let value = json!({"unit": descriptor(unit, lto), "dependencies": edges});
         let key = crate::digest(value.to_string().as_bytes());
         if let Some(previous) = units.insert(key.clone(), value.clone()) {
             if previous != value {
@@ -121,7 +227,7 @@ fn graph_snapshot(
     let mut active = HashSet::new();
     let mut units = BTreeMap::new();
     for unit in graph.keys() {
-        visit(unit, graph, &mut keys, &mut active, &mut units)?;
+        visit(unit, graph, lto, &mut keys, &mut active, &mut units)?;
     }
     let roots: BTreeSet<_> = roots
         .iter()
@@ -165,10 +271,22 @@ fn publish(path: &Path, value: &Value) -> Result<(), String> {
     fs::rename(partial, path).map_err(|e| e.to_string())
 }
 
+/// Facts for shared library and build-script units, keyed by their semantic
+/// unit identity. They bind to this store's fixed request instead of one
+/// recipe's graph, so a later build of the same unit in a shared Cargo target
+/// directory reuses them rather than forcing Cargo to compile it again.
+struct UnitStore {
+    request: Value,
+    request_path: PathBuf,
+    directory: PathBuf,
+    keys: BTreeSet<String>,
+}
+
 struct CaptureExecutor {
     request: Value,
     request_path: PathBuf,
     directory: PathBuf,
+    units: Option<UnitStore>,
     graph: Value,
     graph_sha256: String,
     configuration_sha256: String,
@@ -177,6 +295,7 @@ struct CaptureExecutor {
     producer: Value,
     selected: BTreeSet<String>,
     selected_by_base: BTreeMap<String, BTreeSet<String>>,
+    lto: LtoPlan,
     dispatch: Mutex<BTreeMap<String, String>>,
     artifact_publications: Mutex<BTreeMap<String, Vec<(String, PathBuf)>>>,
     errors: Mutex<Vec<String>>,
@@ -219,19 +338,35 @@ impl CaptureExecutor {
         Ok(Some((path, hash)))
     }
 
+    fn shared(&self, key: &str) -> Option<&UnitStore> {
+        self.units.as_ref().filter(|store| store.keys.contains(key))
+    }
+    fn request_for(&self, key: &str) -> (&Value, &Path) {
+        match self.shared(key) {
+            Some(store) => (&store.request, &store.request_path),
+            None => (&self.request, &self.request_path),
+        }
+    }
+    /// A shared unit's key already digests its descriptor and dependency keys.
+    fn binding(&self, key: &str) -> String {
+        if self.shared(key).is_some() { format!("unit:{key}") } else { self.graph_sha256.clone() }
+    }
     fn record_path(&self, key: &str) -> PathBuf {
-        self.directory.join(format!("{key}.unit.json"))
+        self.shared(key).map_or(&self.directory, |store| &store.directory).join(format!("{key}.unit.json"))
     }
     fn fact_path(&self, key: &str) -> PathBuf {
-        self.directory.join(format!("{key}.facts.json"))
+        self.shared(key).map_or(&self.directory, |store| &store.directory).join(format!("{key}.facts.json"))
     }
 
     fn valid(&self, key: &str, command: Option<&ProcessBuilder>) -> bool {
+        let (request, request_path) = self.request_for(key);
         let validate = || -> Option<()> {
-            if read_json(&self.request_path).ok()? != self.request { return None; }
-            for (path, hash) in &self.graph_inputs {
-                if crate::digest(&fs::read(path).ok()?) != *hash {
-                    return None;
+            if read_json(request_path).ok()? != *request { return None; }
+            if self.shared(key).is_none() {
+                for (path, hash) in &self.graph_inputs {
+                    if crate::digest(&fs::read(path).ok()?) != *hash {
+                        return None;
+                    }
                 }
             }
             let record = read_json(&self.record_path(key)).ok()?;
@@ -261,11 +396,11 @@ impl CaptureExecutor {
                     return None;
                 }
             }
-            if record.get("request")? != &self.request
-                || record.get("graph_sha256")?.as_str()? != self.graph_sha256
+            if record.get("request")? != request
+                || record.get("binding")?.as_str()? != self.binding(key)
                 || record.get("producer")? != &self.producer
                 || facts.get("complete")? != true
-                || facts.get("capture_request")? != &self.request
+                || facts.get("capture_request")? != request
             {
                 return None;
             }
@@ -374,11 +509,14 @@ fn discriminator(source: &Path, suffix: &str) -> String {
 
 impl Executor for CaptureExecutor {
     fn init(&self, runner: &BuildRunner<'_, '_>, unit: &Unit) {
-        let selected = self.selected_by_base.contains_key(&base_key(unit));
+        let selected = self.selected_by_base.contains_key(&base_key(unit, &self.lto));
         let publication = unit.target.is_dylib() || unit.target.is_cdylib()
             || unit.target.is_bin() || unit.mode.is_any_test();
         if !selected && !publication { return; }
-        let snapshot = match graph_snapshot(&runner.bcx.unit_graph, &runner.bcx.roots) {
+        // Cargo's own LTO assignment: a wrong prediction changes the snapshot.
+        let snapshot = match lto_plan(&runner.lto)
+            .and_then(|lto| graph_snapshot(&runner.bcx.unit_graph, &runner.bcx.roots, &lto))
+        {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 self.note_error(error);
@@ -456,7 +594,7 @@ impl Executor for CaptureExecutor {
 
     fn force_rebuild(&self, unit: &Unit) -> bool {
         self.selected_by_base
-            .get(&base_key(unit))
+            .get(&base_key(unit, &self.lto))
             .is_some_and(|keys| keys.iter().any(|key| !self.valid(key, None)))
     }
 
@@ -486,21 +624,22 @@ impl Executor for CaptureExecutor {
         } else {
             "cargo-asksource"
         });
+        let (request, request_path) = self.request_for(&key);
         let shim = self.request["compiler_shims"].get(compiler.to_string_lossy().as_ref());
         if shim.is_some() {
             let launcher = crate::launcher::snapshot(&compiler, &args.iter().map(|arg| (*arg).clone()).collect::<Vec<_>>(),
                 cmd.get_cwd().unwrap_or(&self.cwd), &launcher_environment(cmd).map_err(cargo::util::errors::internal)?).map_err(cargo::util::errors::internal)?;
             crate::launcher::validate(&launcher, &self.request).map_err(cargo::util::errors::internal)?;
-            let capture = json!({"output": self.fact_path(&key), "request": self.request_path,
+            let capture = json!({"output": self.fact_path(&key), "request": request_path,
                 "entry_input_request": entry_request.as_ref().map(|(path, _)| path),
                 "entry_input_request_sha256": entry_request.as_ref().map(|(_, hash)| hash),
-                "request_sha256": crate::digest(&fs::read(&self.request_path)?), "launcher": launcher});
+                "request_sha256": crate::digest(&fs::read(request_path)?), "launcher": launcher});
             captured.arg(format!("{}{}", crate::launcher::control::PREFIX, capture));
         } else {
             let mut compiler_args = vec![
                 std::ffi::OsString::from("capture"), "--output".into(), self.fact_path(&key).into_os_string(),
-                "--request".into(), self.request_path.clone().into_os_string(),
-                "--request-sha256".into(), crate::digest(&fs::read(&self.request_path)?).into(),
+                "--request".into(), request_path.as_os_str().to_owned(),
+                "--request-sha256".into(), crate::digest(&fs::read(request_path)?).into(),
             ];
             if let Some((path, hash)) = &entry_request {
                 compiler_args.extend(["--entry-input-request".into(), path.clone().into_os_string(),
@@ -523,7 +662,7 @@ impl Executor for CaptureExecutor {
             .filter(|(name, _)| cmd.get_envs().contains_key(*name))
             .map(|(name, hash)| (name.clone(), hash.clone()))
             .collect();
-        let record = json!({"request": self.request, "graph_sha256": self.graph_sha256, "producer": self.producer,
+        let record = json!({"request": request, "binding": self.binding(&key), "producer": self.producer,
             "facts_sha256": crate::digest(&fs::read(self.fact_path(&key))?),
             "environment_inputs": facts["environment_inputs"],
             "environment_overrides": overrides,
@@ -669,7 +808,8 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
     }
     let interner = UnitInterner::new();
     let bcx = cargo::ops::create_bcx(&ws, &options, &interner, None).map_err(|e| e.to_string())?;
-    let graph_snapshot = graph_snapshot(&bcx.unit_graph, &bcx.roots)?;
+    let lto = lto_plan(&predicted_lto(&bcx))?;
+    let graph_snapshot = graph_snapshot(&bcx.unit_graph, &bcx.roots, &lto)?;
     let graph = graph_snapshot.value;
     let mut graph_paths: BTreeSet<_> =
         bcx.unit_graph.keys().map(|unit| unit.pkg.manifest_path().to_path_buf()).collect();
@@ -724,6 +864,25 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
             }
         }
     }
+    // Only a request without owned-source projections or launcher shims yields
+    // recipe-independent facts; final executables keep their recipe's policy.
+    let (mut units, _unit_lock) = match request.get("unit_store").and_then(Value::as_str) {
+        Some(store) if sources.is_empty() && shims.is_empty() => {
+            let directory = PathBuf::from(store);
+            fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+            let lock = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+                .open(directory.join("capture.lock")).map_err(|e| e.to_string())?;
+            lock.lock().map_err(|e| format!("cannot lock shared unit store: {e}"))?;
+            let unit_request = json!({"directory": directory, "sources": [], "candidate_manifests": [],
+                "graph": {"owner": "shared-unit-facts"}, "compiler_shims": {}});
+            let request_path = directory.join("request.json");
+            if read_json(&request_path).ok().as_ref() != Some(&unit_request) {
+                publish(&request_path, &unit_request)?;
+            }
+            (Some(UnitStore { request: unit_request, request_path, directory, keys: BTreeSet::new() }), Some(lock))
+        }
+        _ => (None, None),
+    };
     for unit in
         bcx.unit_graph.keys().filter(|unit| !unit.mode.is_run_custom_build()).filter(|unit| {
             primitive_units.contains(*unit) || unit.target.src_path().path().is_some_and(|path| {
@@ -734,13 +893,20 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
     {
         let key =
             graph_snapshot.keys.get(unit).ok_or("selected unit has no semantic identity")?.clone();
+        if let Some(store) = units.as_mut()
+            && unit.mode == CompileMode::Build
+            && (unit.target.is_lib() || unit.target.is_custom_build())
+        {
+            store.keys.insert(key.clone());
+        }
         selected.insert(key.clone());
-        selected_by_base.entry(base_key(unit)).or_default().insert(key);
+        selected_by_base.entry(base_key(unit, &lto)).or_default().insert(key);
     }
     let executor = Arc::new(CaptureExecutor {
         request,
         request_path,
         directory,
+        units,
         graph,
         graph_sha256,
         configuration_sha256,
@@ -749,6 +915,7 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
         producer,
         selected,
         selected_by_base,
+        lto,
         dispatch: Mutex::new(BTreeMap::new()),
         artifact_publications: Mutex::new(BTreeMap::new()),
         errors: Mutex::new(Vec::new()),
@@ -803,14 +970,31 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
                 if kind != "bin" || std::path::absolute(declared).map_err(|error| error.to_string())? != path {
                     continue;
                 }
-                if executor.graph["units"][key]["unit"] != descriptor(&output.unit)
+                if executor.graph["units"][key]["unit"] != descriptor(&output.unit, &executor.lto)
                     || identity.replace(key.clone()).is_some()
                 {
                     return Err("published Cargo binary has an ambiguous unit identity".into());
                 }
             }
         }
-        let key = identity.ok_or("published artifact has no captured Cargo unit identity")?;
+        // Cargo calls `Executor::init` only for dirty units, so a fresh binary has
+        // no declaration; its graph unit is then the one sharing its descriptor.
+        let key = match identity {
+            Some(key) => key,
+            None => {
+                let unit = descriptor(&output.unit, &executor.lto);
+                let mut matches = executor.graph["units"].as_object()
+                    .ok_or("capture graph omits units")?
+                    .iter()
+                    .filter(|(_, node)| node["unit"] == unit)
+                    .map(|(key, _)| key.clone());
+                let key = matches.next().ok_or("published artifact has no captured Cargo unit identity")?;
+                if matches.next().is_some() {
+                    return Err("published Cargo binary has an ambiguous unit identity".into());
+                }
+                key
+            }
+        };
         publications.push((key, "bin".to_owned(), path));
     }
     for (key, outputs) in declarations.iter() {
