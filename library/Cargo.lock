@@ -84,10 +84,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "asklog"
+version = "0.1.0"
+dependencies = [
+ "rustc-std-workspace-core",
+]
+
+[[package]]
 name = "asksys"
 version = "0.1.0"
 dependencies = [
  "askabi",
+ "asklog",
  "rustc-std-workspace-core",
 ]
 

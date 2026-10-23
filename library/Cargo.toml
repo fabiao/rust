@@ -94,6 +94,7 @@ windows-sys = { path = 'windows-sys' }
 # through ASK's explicit registry overlay; scope these transitive redirects
 # to this workspace rather than inheriting the superproject's full catalog.
 askabi = { path = '../../../../core/libs/askabi/source' }
+asklog = { path = '../../../../core/libs/asklog/source' }
 asksys = { path = '../../../../core/libs/asksys/source' }
 askio = { path = '../../../../core/libs/askio/source' }
 askfd = { path = '../../../../core/libs/askfd/source' }
