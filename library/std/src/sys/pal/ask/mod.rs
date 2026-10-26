@@ -1,8 +1,7 @@
-//! System bindings for ask (docs/10-rust-toolchain.md, docs/08's mixed-
-//! binaries decision: std binds `ask-abi` directly, never `askposix`).
+//! System bindings for ask. `std` binds `askabi`, `askfd`, and the other PAL
+//! crates directly. It does not depend on `askme` or `askposix`.
 //! Everything not implemented in a `sys/*/ask.rs` file falls through to the
-//! matching `sys/*/unsupported.rs` automatically — no `target_os = "ask"`
-//! arm is needed in those selectors for that to happen.
+//! matching `sys/*/unsupported.rs` automatically.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![allow(missing_docs, nonstandard_style)]
@@ -12,11 +11,20 @@ pub mod futex;
 
 use crate::io;
 
-/// `ask_abi::Error` carries no errno-shaped detail yet (docs/02's open
-/// syscall-enumeration question) — every failure reports the same generic
-/// OS-error code until that's designed.
-pub(crate) fn map_ask_error(_err: ask_abi::Error) -> io::Error {
-    io::Error::from_raw_os_error(1)
+/// Each kernel `Error` becomes one `io::ErrorKind`. The message names the
+/// kernel value. ASK has no errno table.
+pub(crate) fn map_ask_error(err: ask_abi::Error) -> io::Error {
+    let (kind, message) = match err {
+        ask_abi::Error::Denied => (io::ErrorKind::PermissionDenied, "ask: denied"),
+        ask_abi::Error::InvalidParams => (io::ErrorKind::InvalidInput, "ask: invalid params"),
+        ask_abi::Error::UnknownSyscall => (io::ErrorKind::Unsupported, "ask: unknown syscall"),
+        ask_abi::Error::Exhausted => (io::ErrorKind::QuotaExceeded, "ask: resource exhausted"),
+        ask_abi::Error::StaleAccount => (io::ErrorKind::NotFound, "ask: stale account"),
+        ask_abi::Error::StaleRevision => (io::ErrorKind::ResourceBusy, "ask: stale revision"),
+        ask_abi::Error::StaleTarget => (io::ErrorKind::NotFound, "ask: stale target"),
+        ask_abi::Error::Unsupported => (io::ErrorKind::Unsupported, "ask: unsupported"),
+    };
+    io::Error::new(kind, message)
 }
 
 pub fn unsupported<T>() -> io::Result<T> {
