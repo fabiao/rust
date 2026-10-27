@@ -40,18 +40,16 @@ impl Activation<'_> {
             .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))?;
         Ok(Duration::from_millis(remaining))
     }
-    fn pause(&self) -> io::Result<()> {
-        let remaining = self.remaining()?.as_millis() as u64;
-        let _ = ask_sys::park_timeout(remaining.min(crate::sys::channel::POLL_INTERVAL_MS));
-        Ok(())
+    fn pause(&self) {
+        let _ = ask_sys::park_timeout(crate::sys::channel::POLL_INTERVAL_MS);
     }
     fn exchange(
         &mut self,
         opcode: u32,
         bytes: &[u8],
     ) -> io::Result<crate::sys::channel::Completion> {
-        let remaining = self.remaining()?;
-        self.channel.call_timeout(opcode, bytes, Some(remaining))
+        // Accepted activation may commit before its reply; retain the matching completion.
+        self.channel.call(opcode, bytes)
     }
     fn command(&mut self, opcode: u32) -> io::Result<i32> {
         let mut bytes = [0; wire::NONCE_REQUEST_LEN];
@@ -64,23 +62,31 @@ impl Activation<'_> {
         }
         Ok(reply.result)
     }
-    fn query(&mut self) -> io::Result<wire::QueryReply> {
-        let mut bytes = [0; wire::NONCE_REQUEST_LEN];
-        let reply = self.exchange(
-            wire::OP_QUERY,
-            wire::encode_nonce_request(&mut bytes, self.nonce).ok_or_else(protocol)?,
-        )?;
-        let query = wire::decode_query_reply(reply.payload()).ok_or_else(protocol)?;
-        if query.result != reply.result || query.nonce != self.nonce {
-            return Err(protocol());
+    fn query(&mut self, ready: impl Fn(&wire::QueryReply) -> bool) -> io::Result<wire::QueryReply> {
+        loop {
+            let mut bytes = [0; wire::NONCE_REQUEST_LEN];
+            let reply = self.exchange(
+                wire::OP_QUERY,
+                wire::encode_nonce_request(&mut bytes, self.nonce).ok_or_else(protocol)?,
+            )?;
+            let query = wire::decode_query_reply(reply.payload()).ok_or_else(protocol)?;
+            if query.result != reply.result {
+                return Err(protocol());
+            }
+            if query.result < 0 {
+                return Err(map_process_result(query.result));
+            }
+            if query.nonce != self.nonce {
+                return Err(protocol());
+            }
+            if query.state == wire::state::ABORTED {
+                return Err(map_process_result(result::ABORTED));
+            }
+            if ready(&query) {
+                return Ok(query);
+            }
+            self.pause();
         }
-        if query.result < 0 {
-            return Err(map_process_result(query.result));
-        }
-        if query.state == wire::state::ABORTED {
-            return Err(map_process_result(result::ABORTED));
-        }
-        Ok(query)
     }
     fn view(&self, phase: u32) -> io::Result<ask_fd::ChildView> {
         let id = self.preparation.ok_or_else(protocol)?;
@@ -102,7 +108,7 @@ impl Activation<'_> {
                     return Ok(view);
                 }
             }
-            self.pause()?;
+            self.pause();
         }
     }
     fn resources(&mut self, view: ask_fd::ChildView, header: ask_io::fd::Header) -> io::Result<()> {
@@ -174,7 +180,7 @@ impl Activation<'_> {
                 if ack.result != result::PENDING {
                     return Err(protocol());
                 }
-                self.pause()?;
+                self.pause();
             }
             cursor = cursor.checked_add(1).ok_or_else(protocol)?;
         }
@@ -214,7 +220,7 @@ impl Activation<'_> {
             if status != ask_fd::status::CONTENDED {
                 return Err(protocol());
             }
-            self.pause()?;
+            self.pause();
         }
         let view = self.view(ask_fd::child_phase::PREPARED)?;
         let length = view.record.checked_len().ok_or_else(protocol)?;
@@ -258,13 +264,8 @@ impl Activation<'_> {
             return Err(map_process_result(launch.result));
         }
         self.resources(view, header)?;
-        let birth = loop {
-            let query = self.query()?;
-            if query.pid != 0 {
-                break wire::ProcessIdentity { pid: query.pid, generation: query.generation };
-            }
-            self.pause()?;
-        };
+        let query = self.query(|value| value.pid != 0)?;
+        let birth = wire::ProcessIdentity { pid: query.pid, generation: query.generation };
         loop {
             self.remaining()?;
             let status = unsafe { ask_fd::__askfd_bind_child(&preparation, &birth, &mut error) };
@@ -272,26 +273,22 @@ impl Activation<'_> {
             if status != ask_fd::status::CONTENDED {
                 break;
             }
-            self.pause()?;
+            self.pause();
         }
         self.view(ask_fd::child_phase::BOUND)?;
         let allowed = self.command(wire::OP_ALLOW)?;
         if allowed != result::OK && allowed != result::PENDING {
             return Err(map_process_result(allowed));
         }
-        loop {
-            if self.query()?.activation_committed {
-                self.committed = true;
-                self.finish();
-                let _ = self.command(wire::OP_ACKNOWLEDGE);
-                return Ok(wire::LaunchReply {
-                    result: result::OK,
-                    pid: birth.pid,
-                    generation: birth.generation,
-                });
-            }
-            self.pause()?;
-        }
+        self.query(|value| value.activation_committed)?;
+        self.committed = true;
+        self.finish();
+        let _ = self.command(wire::OP_ACKNOWLEDGE);
+        Ok(wire::LaunchReply {
+            result: result::OK,
+            pid: birth.pid,
+            generation: birth.generation,
+        })
     }
 
     fn finish(&mut self) {
