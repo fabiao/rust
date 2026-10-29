@@ -349,7 +349,7 @@ fn metadata_unit<const N: usize>(
 ) -> io::Result<()> {
     let completion = path_exchange(provider_token, op, encode)?;
     if completion.result < 0 {
-        return Err(io::Error::new(io::ErrorKind::NotFound, failure));
+        return Err(fs_error(completion.result, failure));
     }
     Ok(())
 }
@@ -716,16 +716,21 @@ pub fn readdir(path: &Path) -> io::Result<ReadDir> {
     })
 }
 
-pub fn unlink(path: &Path) -> io::Result<()> {
+fn remove_node(path: &Path, kind: ask_io::fs::RemoveKind, message: &'static str) -> io::Result<()> {
     let (provider_token, relative) = resolve_fs_path(path)?;
     metadata_unit(
         provider_token,
         ask_io::fs::OP_UNLINK,
-        |request: &mut [u8; ask_io::fs::FS_PATH_REQUEST_LEN], window| {
-            ask_io::fs::encode_fs_path_request(request, window, relative.as_bytes()).is_some()
+        |request: &mut [u8; ask_io::fs::FS_UNLINK_REQUEST_LEN], window| {
+            ask_io::fs::encode_fs_unlink_request(request, window, relative.as_bytes(), kind)
+                .is_some()
         },
-        "fs: unlink failed",
+        message,
     )
+}
+
+pub fn unlink(path: &Path) -> io::Result<()> {
+    remove_node(path, ask_io::fs::RemoveKind::NonDirectory, "fs: unlink failed")
 }
 
 pub fn rename(old: &Path, new: &Path) -> io::Result<()> {
@@ -753,10 +758,8 @@ pub fn rename(old: &Path, new: &Path) -> io::Result<()> {
     )
 }
 
-/// `askfs` removes an empty directory through the same `FS_OP_UNLINK` entry
-/// point it uses for files, rejecting a non-empty target provider-side.
 pub fn rmdir(path: &Path) -> io::Result<()> {
-    unlink(path)
+    remove_node(path, ask_io::fs::RemoveKind::Directory, "fs: rmdir failed")
 }
 
 /// `askfs` has no recursive-remove operation, so this walks the tree with
