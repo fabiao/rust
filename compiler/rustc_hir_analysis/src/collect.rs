@@ -328,16 +328,32 @@ impl<'tcx> ItemCtxt<'tcx> {
         &self,
         item: &hir::TestBinderBody<'tcx>,
     ) -> TestBinderBody<'tcx> {
-        let hir::TestBinderBody { foralls, exists, constraints, predicates } = item;
+        let hir::TestBinderBody {
+            span,
+            foralls,
+            exists,
+            region_equalities,
+            constraints,
+            predicates,
+        } = item;
         let foralls = foralls.iter().map(|forall| self.lower_test_binder_forall(forall)).collect();
         let exists = exists.iter().map(|exists| self.lower_test_binder_exists(exists)).collect();
+        let region_equalities = region_equalities
+            .iter()
+            .map(|(lhs, rhs)| {
+                let span = lhs.ident.span.to(rhs.ident.span);
+                let lhs = self.lowerer().lower_lifetime(lhs, RegionInferReason::RegionPredicate);
+                let rhs = self.lowerer().lower_lifetime(rhs, RegionInferReason::RegionPredicate);
+                (ty::RegionEqPredicate(lhs, rhs), span)
+            })
+            .collect();
         let constraints = self.lower_test_binder_constraint(&constraints);
         let mut clauses = Default::default();
         for predicate in *predicates {
             clauses_of::where_predicate_clauses(self, predicate, &mut clauses);
         }
         let predicates = clauses.into_iter().map(|(c, span)| (c.kind(), span)).collect();
-        TestBinderBody { foralls, exists, constraints, predicates }
+        TestBinderBody { span: *span, foralls, exists, region_equalities, constraints, predicates }
     }
 
     #[instrument(level = "debug", skip(self), ret)]
@@ -1760,28 +1776,27 @@ fn rendered_precise_capturing_args<'tcx>(
 
 fn const_param_default<'tcx>(
     tcx: TyCtxt<'tcx>,
-    local_def_id: LocalDefId,
+    param_def_id: LocalDefId,
 ) -> ty::EarlyBinder<'tcx, Const<'tcx>> {
     let hir::Node::GenericParam(hir::GenericParam {
-        kind: hir::GenericParamKind::Const { default: Some(default_ct), .. },
+        kind: hir::GenericParamKind::Const { default: Some(ct), .. },
         ..
-    }) = tcx.hir_node_by_def_id(local_def_id)
+    }) = tcx.hir_node_by_def_id(param_def_id)
     else {
         span_bug!(
-            tcx.def_span(local_def_id),
-            "`const_param_default` expected a generic parameter with a constant"
+            tcx.def_span(param_def_id),
+            "const_param_default: expected a const parameter with a default value"
         )
     };
 
-    let icx = ItemCtxt::new(tcx, local_def_id);
+    // FIXME: Don't lower in the context of parent. Blocked on the removal of GCE. See comment in
+    //        `type_of.rs` for details (Ctrl+F for `generics_of`).
+    let item_def_id = tcx.local_parent(param_def_id);
+    let icx = ItemCtxt::new(tcx, item_def_id);
 
-    let def_id = local_def_id.to_def_id();
-    let identity_args = ty::GenericArgs::identity_for_item(tcx, tcx.parent(def_id));
-
-    let ct = icx.lowerer().lower_const_arg(
-        default_ct,
-        tcx.type_of(def_id).instantiate(tcx, identity_args).skip_norm_wip(),
-    );
+    let ct = icx
+        .lowerer()
+        .lower_const_arg(ct, tcx.type_of(param_def_id).instantiate_identity().skip_norm_wip());
     ty::EarlyBinder::bind(tcx, ct)
 }
 

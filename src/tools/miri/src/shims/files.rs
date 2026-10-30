@@ -185,8 +185,11 @@ pub trait FileDescription: std::fmt::Debug + FileDescriptionExt {
     /// This is either host metadata, or a non-file-backed-FD type.
     /// The latter is for now represented as a string storing the `libc` name of the mode so we only
     /// support that kind of metadata on Unix targets.
-    fn metadata<'tcx>(&self) -> InterpResult<'tcx, Either<io::Result<fs::Metadata>, &'static str>> {
-        throw_unsup_format!("obtaining metadata is only supported on file-backed file descriptors");
+    fn metadata<'tcx>(
+        &self,
+        _communicate_allowed: bool,
+    ) -> InterpResult<'tcx, Either<io::Result<fs::Metadata>, &'static str>> {
+        throw_unsup_format!("obtaining metadata is not supported on {}", self.name());
     }
 
     fn is_tty(&self, _communicate_allowed: bool) -> bool {
@@ -247,8 +250,17 @@ impl FileDescription for Stdin {
         finish.call(ecx, result)
     }
 
+    fn metadata<'tcx>(
+        &self,
+        communicate_allowed: bool,
+    ) -> InterpResult<'tcx, Either<io::Result<std::fs::Metadata>, &'static str>> {
+        let ftype = if self.is_tty(communicate_allowed) { "S_IFCHR" } else { "S_IFIFO" };
+        interp_ok(Either::Right(ftype))
+    }
+
     fn is_tty(&self, communicate_allowed: bool) -> bool {
-        communicate_allowed && self.stdin.is_terminal()
+        // Without communication we assume that it is a terminal.
+        !communicate_allowed || self.stdin.is_terminal()
     }
 
     fn readiness_watched(&self) -> Option<&ReadinessWatched> {
@@ -306,8 +318,17 @@ impl FileDescription for Stdout {
         finish.call(ecx, result)
     }
 
+    fn metadata<'tcx>(
+        &self,
+        communicate_allowed: bool,
+    ) -> InterpResult<'tcx, Either<io::Result<std::fs::Metadata>, &'static str>> {
+        let ftype = if self.is_tty(communicate_allowed) { "S_IFCHR" } else { "S_IFIFO" };
+        interp_ok(Either::Right(ftype))
+    }
+
     fn is_tty(&self, communicate_allowed: bool) -> bool {
-        communicate_allowed && self.stdout.is_terminal()
+        // Without communication we assume that it is a terminal.
+        !communicate_allowed || self.stdout.is_terminal()
     }
 
     fn readiness_watched(&self) -> Option<&ReadinessWatched> {
@@ -357,8 +378,17 @@ impl FileDescription for Stderr {
         finish.call(ecx, result)
     }
 
+    fn metadata<'tcx>(
+        &self,
+        communicate_allowed: bool,
+    ) -> InterpResult<'tcx, Either<io::Result<std::fs::Metadata>, &'static str>> {
+        let ftype = if self.is_tty(communicate_allowed) { "S_IFCHR" } else { "S_IFIFO" };
+        interp_ok(Either::Right(ftype))
+    }
+
     fn is_tty(&self, communicate_allowed: bool) -> bool {
-        communicate_allowed && self.stderr.is_terminal()
+        // Without communication we assume that it is a terminal.
+        !communicate_allowed || self.stderr.is_terminal()
     }
 
     fn readiness_watched(&self) -> Option<&ReadinessWatched> {
@@ -404,6 +434,13 @@ impl FileDescription for NullOutput {
     ) -> InterpResult<'tcx> {
         // We just don't write anything, but report to the user that we did.
         finish.call(ecx, Ok(len))
+    }
+
+    fn metadata<'tcx>(
+        &self,
+        _communicate_allowed: bool,
+    ) -> InterpResult<'tcx, Either<io::Result<std::fs::Metadata>, &'static str>> {
+        interp_ok(Either::Right("S_IFIFO"))
     }
 
     fn readiness_watched(&self) -> Option<&ReadinessWatched> {
@@ -491,12 +528,17 @@ impl FileDescription for FileHandle {
         interp_ok((&mut &self.file).seek(offset))
     }
 
-    fn metadata<'tcx>(&self) -> InterpResult<'tcx, Either<io::Result<fs::Metadata>, &'static str>> {
+    fn metadata<'tcx>(
+        &self,
+        communicate_allowed: bool,
+    ) -> InterpResult<'tcx, Either<io::Result<fs::Metadata>, &'static str>> {
+        assert!(communicate_allowed);
         interp_ok(Either::Left(self.file.metadata()))
     }
 
     fn is_tty(&self, communicate_allowed: bool) -> bool {
-        communicate_allowed && self.file.is_terminal()
+        assert!(communicate_allowed);
+        self.file.is_terminal()
     }
 
     fn short_fd_operations(&self) -> bool {
@@ -518,23 +560,6 @@ pub struct DirHandle {
     pub(super) fallback: std::path::PathBuf,
 }
 
-impl DirHandle {
-    pub fn new(dir: Dir, path: &std::path::Path) -> Self {
-        cfg_select! {
-            bootstrap => {
-                // Only stage 1 builds need the fallback so panicking is fine.
-                let fallback =
-                    path.canonicalize().expect("canonicalizing directory fallback should succeed");
-                DirHandle { dir, fallback }
-            }
-            _ => {
-                let _unused = path;
-                DirHandle { dir }
-            }
-        }
-    }
-}
-
 impl FileDescription for DirHandle {
     fn name(&self) -> &'static str {
         "directory"
@@ -542,7 +567,10 @@ impl FileDescription for DirHandle {
 
     fn metadata<'tcx>(
         &self,
+        communicate_allowed: bool,
     ) -> InterpResult<'tcx, Either<io::Result<std::fs::Metadata>, &'static str>> {
+        assert!(communicate_allowed);
+
         #[cfg(bootstrap)]
         return interp_ok(Either::Left(self.dir.metadata()));
         #[cfg(not(bootstrap))]
@@ -704,12 +732,12 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
     /// Write data to a host `Write` type, with the bytes taken from machine memory.
     fn write_to_host(
-        &mut self,
+        &self,
         mut file: impl io::Write,
         len: usize,
         ptr: Pointer,
     ) -> InterpResult<'tcx, Result<usize, IoError>> {
-        let this = self.eval_context_mut();
+        let this = self.eval_context_ref();
 
         let bytes = this.read_bytes_ptr_strip_provenance(ptr, Size::from_bytes(len))?;
         let result = file.write(bytes);
@@ -719,38 +747,48 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
 /// Open something for which we don't know ahead of time whether it is a file or a directory.
 ///
-/// Custom flags need to be passed separately since they cannot be read from `opts`...
+/// Note that on Windows hosts, `custom_flags` is ignored if `root` is `Some`!
 pub fn open_file_or_dir(
+    root: Option<&fs::Dir>,
     path: &std::path::Path,
-    mut opts: fs::OpenOptions,
-    #[cfg(unix)] custom_flags: i32,
-    #[cfg(windows)] custom_flags: u32,
+    opts: &fs::OpenOptions,
 ) -> io::Result<Either<fs::File, fs::Dir>> {
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
-    #[cfg(windows)]
-    use std::os::windows::fs::OpenOptionsExt;
-
-    // On Unix, `open` works for files and directories.
-    // On Windows, that needs FILE_FLAG_BACKUP_SEMANTICS, but we don't want to set that by default.
-    // So we only set it when needed.
-    let file = match opts.custom_flags(custom_flags).open(path) {
-        Ok(file) => file,
-
-        #[cfg(windows)]
-        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
-            // This can happen when the file is actually a directory.
-            // So retry with FILE_FLAG_BACKUP_SEMANTICS.
-            opts.custom_flags(
-                custom_flags | windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS,
-            )
-            .open(path)?
-        }
-
-        Err(err) => return Err(err),
+    // On Unix, `open`/`openat` works for files and directories.
+    // On Windows, that fails with `PermissionDenied`, so we need to open an `fs::Dir` instead.
+    // (But that may succeed even on a file! So we still have to check the metadata.)
+    let file = match root {
+        Some(root) => root.open_file_with(path, opts),
+        None => opts.open(path),
     };
+    #[cfg(windows)]
+    let file = file.or_else(|err| {
+        use std::os::windows::io::OwnedHandle;
 
-    let metadata = file.metadata().expect("just-opened file should have metadata");
+        if err.kind() == io::ErrorKind::PermissionDenied {
+            // Retry via `fs::Dir`. Opening a directory via `Dir::open_file` does not work so we
+            // have to use `open_dir`.
+            let dir = match root {
+                Some(root) => root.open_dir_with(path, opts),
+                None => Dir::open_with(path, opts),
+            };
+            match dir {
+                // Convert back to file so it always has the same type.
+                Ok(dir) => Ok(File::from(OwnedHandle::from(dir))),
+                Err(err2) => {
+                    // If this 2nd attempt says "not a directory", preserve the original error. It's
+                    // possible that we lost a race twice if this keeps being changed from directory
+                    // to file and back. However, in that case it was entirely non-existent for a
+                    // little while, so returning an error is still fine.
+                    Err(if err2.kind() == io::ErrorKind::NotADirectory { err } else { err2 })
+                }
+            }
+        } else {
+            Err(err)
+        }
+    });
+    let file = file?;
+
+    let metadata = file.metadata().expect("just-opened file/dir should have metadata");
     if metadata.is_dir() {
         assert!(!metadata.is_symlink()); // Rust makes this mutually exclusive with `is_dir`
         // Convert to dir.

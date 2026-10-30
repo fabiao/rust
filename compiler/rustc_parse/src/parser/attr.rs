@@ -211,7 +211,12 @@ impl<'a> Parser<'a> {
             AttrWrapper::empty(),
             true,
             false,
-            FnParseMode { req_name: |_, _| true, context: FnContext::Free, req_body: true },
+            FnParseMode {
+                req_name: |_, _| true,
+                context: FnContext::Free,
+                req_body: true,
+                allow_const_params: true,
+            },
             ForceCollect::No,
             AllowConstBlockItems::Yes,
         ) {
@@ -388,7 +393,7 @@ impl<'a> Parser<'a> {
             if let Some(attr) = attr {
                 // If we are currently capturing tokens (i.e. we are within a call to
                 // `Parser::collect_tokens`) record the token positions of this inner attribute,
-                // for possible later processing in a `LazyAttrTokenStream`.
+                // for possible later processing in a `LazyTokenStream`.
                 if let Capturing::Yes = self.capture_state.capturing {
                     let end_pos = self.num_bump_calls;
                     let parser_range = ParserRange(start_pos..end_pos);

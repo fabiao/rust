@@ -1,6 +1,6 @@
 use std::borrow::{Borrow, Cow};
 use std::cell::{Cell, RefCell};
-use std::ffi::{CStr, c_char, c_uint};
+use std::ffi::{CStr, c_uint};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::str;
@@ -34,6 +34,7 @@ use rustc_target::spec::{
 use smallvec::SmallVec;
 
 use crate::abi::to_llvm_calling_convention;
+use crate::back::llvm_backend::ModuleRefs;
 use crate::back::write::to_llvm_code_model;
 use crate::builder::gpu_offload::{OffloadGlobals, OffloadKernelGlobals};
 use crate::callee::get_fn;
@@ -47,7 +48,7 @@ use crate::{attributes, common, coverageinfo, debuginfo, llvm_util};
 /// moved around more freely.
 pub(crate) struct SCx<'ll> {
     pub llmod: &'ll llvm::Module,
-    pub llcx: &'ll llvm::Context,
+    pub llcx: llvm::Context<'ll>,
     pub isize_ty: &'ll Type,
 }
 
@@ -183,13 +184,18 @@ fn to_llvm_tls_model(tls_model: TlsModel) -> llvm::ThreadLocalMode {
 
 pub(crate) unsafe fn create_module<'ll>(
     tcx: TyCtxt<'_>,
-    llcx: &'ll llvm::Context,
+    llcx: llvm::Context<'ll>,
     mod_name: &str,
-) -> &'ll llvm::Module {
-    let sess = tcx.sess;
-    let mod_name = SmallCStr::new(mod_name);
-    let llmod = unsafe { llvm::LLVMModuleCreateWithNameInContext(mod_name.as_ptr(), llcx) };
+) -> *const llvm::Module {
+    let mod_name_cstr = SmallCStr::new(mod_name);
+    let llmod_raw =
+        unsafe { llvm::LLVMModuleCreateWithNameInContext(mod_name_cstr.as_ptr(), llcx) };
+    init_module(tcx, llcx, unsafe { &*llmod_raw });
+    llmod_raw
+}
 
+fn init_module<'ll, 'tcx>(tcx: TyCtxt<'tcx>, llcx: llvm::Context<'ll>, llmod: &'ll llvm::Module) {
+    let sess = tcx.sess;
     let cx = SimpleCx::new(llmod, llcx, tcx.data_layout.pointer_size());
 
     let mut target_data_layout = sess.target.data_layout.to_string();
@@ -592,15 +598,13 @@ pub(crate) unsafe fn create_module<'ll>(
         };
         llvm::add_module_flag_u32(llmod, merge_behavior, key, *value);
     }
-
-    llmod
 }
 
 impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
     pub(crate) fn new(
         tcx: TyCtxt<'tcx>,
         codegen_unit: &'tcx CodegenUnit<'tcx>,
-        llvm_module: &'ll crate::ModuleLlvm,
+        module_refs: ModuleRefs<'ll>,
         bitcode_needed: bool,
     ) -> Self {
         // An interesting part of Windows which MSVC forces our hand on (and
@@ -659,7 +663,7 @@ impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
 
         let tls_model = to_llvm_tls_model(tcx.sess.tls_model());
 
-        let (llcx, llmod) = (&*llvm_module.llcx, llvm_module.llmod());
+        let ModuleRefs { llcx, llmod, .. } = module_refs;
 
         let coverage_cx =
             tcx.sess.instrument_coverage().then(coverageinfo::CguCoverageContext::new);
@@ -877,7 +881,7 @@ impl<'ll> SimpleCx<'ll> {
 impl<'ll> SimpleCx<'ll> {
     pub(crate) fn new(
         llmod: &'ll llvm::Module,
-        llcx: &'ll llvm::Context,
+        llcx: llvm::Context<'ll>,
         pointer_size: Size,
     ) -> Self {
         let isize_ty = llvm::LLVMIntTypeInContext(llcx, pointer_size.bits() as c_uint);
@@ -911,19 +915,11 @@ impl<'ll, CX: Borrow<SCx<'ll>>> GenericCx<'ll, CX> {
     }
 
     pub(crate) fn get_md_kind_id(&self, name: &str) -> llvm::MetadataKindId {
-        unsafe {
-            llvm::LLVMGetMDKindIDInContext(
-                self.llcx(),
-                name.as_ptr() as *const c_char,
-                name.len() as c_uint,
-            )
-        }
+        unsafe { llvm::LLVMGetMDKindIDInContext(self.llcx(), name.as_ptr(), name.len() as c_uint) }
     }
 
     pub(crate) fn create_metadata(&self, name: &[u8]) -> &'ll Metadata {
-        unsafe {
-            llvm::LLVMMDStringInContext2(self.llcx(), name.as_ptr() as *const c_char, name.len())
-        }
+        unsafe { llvm::LLVMMDStringInContext2(self.llcx(), name.as_ptr(), name.len()) }
     }
 
     pub(crate) fn get_functions(&self) -> Vec<&'ll Value> {
@@ -1031,7 +1027,14 @@ impl<'ll, 'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'ll, 'tcx> {
                 tcx.sess.pointer_authentication_functions(),
             ),
             _ => {
-                let name = name.unwrap_or("rust_eh_personality");
+                let mangled_symbol;
+                let name = match name {
+                    Some(name) => name,
+                    None => {
+                        mangled_symbol = rustc_symbol_mangling::eh_personality_symbol(tcx);
+                        mangled_symbol.as_str()
+                    }
+                };
                 if let Some(llfn) = self.get_declared_value(name) {
                     llfn
                 } else {

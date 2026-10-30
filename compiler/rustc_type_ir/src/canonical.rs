@@ -12,7 +12,7 @@ use thin_vec::ThinVec;
 
 use crate::data_structures::{DelayedMap, HashMap};
 use crate::inherent::*;
-use crate::{self as ty, Const, Interner, Region, TypingModeEqWrapper, UniverseIndex};
+use crate::{self as ty, Interner, TypingModeEqWrapper, UniverseIndex};
 
 #[derive_where(Clone, Hash, PartialEq, Debug; I: Interner, V)]
 #[derive_where(Copy; I: Interner, V: Copy)]
@@ -72,6 +72,10 @@ impl<I: Interner, V> Canonical<I, V> {
         let Canonical { max_universe, var_kinds, value } = self;
         Canonical { max_universe, var_kinds, value: map_op(value) }
     }
+
+    pub fn project<W>(self, f: impl FnOnce(V) -> W) -> Canonicalized<W> {
+        Canonicalized(f(self.value))
+    }
 }
 
 impl<I: Interner, V: fmt::Display> fmt::Display for Canonical<I, V> {
@@ -81,6 +85,31 @@ impl<I: Interner, V: fmt::Display> fmt::Display for Canonical<I, V> {
             f,
             "Canonical {{ value: {value}, max_universe: {max_universe:?}, var_kinds: {var_kinds:?} }}",
         )
+    }
+}
+
+/// A projection of a `Canonical<V>`, as produced by `Canonical::project`. Useful as a marker when
+/// dealing with fields within a `Canonical<V>`, because it indicates that `T` may contain
+/// canonical bound variables that must be instantiated before use.
+///
+/// The field is private and the contents can only be accessed directly with `into_uninstantiated`,
+/// which is easy to spot.
+#[derive(Copy, Clone, Debug)]
+pub struct Canonicalized<T>(T);
+
+impl<T> Canonicalized<T> {
+    pub fn into_uninstantiated(self) -> T {
+        self.0
+    }
+}
+
+impl<T: SliceLike> Canonicalized<T> {
+    pub fn len(self) -> usize {
+        self.0.len()
+    }
+
+    pub fn iter(self) -> impl Iterator<Item = Canonicalized<T::Item>> {
+        self.0.iter().map(|x| Canonicalized(x))
     }
 }
 
@@ -231,85 +260,6 @@ pub struct CanonicalVarValues<I: Interner> {
 impl<I: Interner> Eq for CanonicalVarValues<I> {}
 
 impl<I: Interner> CanonicalVarValues<I> {
-    pub fn is_identity(&self) -> bool {
-        self.var_values.iter().enumerate().all(|(bv, arg)| match arg.kind() {
-            ty::GenericArgKind::Lifetime(r) => {
-                matches!(r.kind(), ty::ReBound(ty::BoundVarIndexKind::Canonical, br) if br.var().as_usize() == bv)
-            }
-            ty::GenericArgKind::Type(ty) => {
-                matches!(ty.kind(), ty::Bound(ty::BoundVarIndexKind::Canonical, bt) if bt.var().as_usize() == bv)
-            }
-            ty::GenericArgKind::Const(ct) => {
-                matches!(ct.kind(), ty::ConstKind::Bound(ty::BoundVarIndexKind::Canonical, bc) if bc.var().as_usize() == bv)
-            }
-        })
-    }
-
-    pub fn is_identity_modulo_regions(&self) -> bool {
-        let mut var = ty::BoundVar::ZERO;
-        for arg in self.var_values.iter() {
-            match arg.kind() {
-                ty::GenericArgKind::Lifetime(r) => {
-                    if matches!(r.kind(), ty::ReBound(ty::BoundVarIndexKind::Canonical, br) if var == br.var())
-                    {
-                        var = var + 1;
-                    } else {
-                        // It's ok if this region var isn't an identity variable
-                    }
-                }
-                ty::GenericArgKind::Type(ty) => {
-                    if matches!(ty.kind(), ty::Bound(ty::BoundVarIndexKind::Canonical, bt) if var == bt.var())
-                    {
-                        var = var + 1;
-                    } else {
-                        return false;
-                    }
-                }
-                ty::GenericArgKind::Const(ct) => {
-                    if matches!(ct.kind(), ty::ConstKind::Bound(ty::BoundVarIndexKind::Canonical, bc) if var == bc.var())
-                    {
-                        var = var + 1;
-                    } else {
-                        return false;
-                    }
-                }
-            }
-        }
-
-        true
-    }
-
-    // Given a list of canonical variables, construct a set of values which are
-    // the identity response.
-    pub fn make_identity(cx: I, infos: I::CanonicalVarKinds) -> CanonicalVarValues<I> {
-        CanonicalVarValues {
-            var_values: cx.mk_args_from_iter(infos.iter().enumerate().map(
-                |(i, kind)| -> I::GenericArg {
-                    match kind {
-                        CanonicalVarKind::Ty { .. }
-                        | CanonicalVarKind::Int
-                        | CanonicalVarKind::Float
-                        | CanonicalVarKind::PlaceholderTy(_) => {
-                            Ty::new_canonical_bound(cx, ty::BoundVar::from_usize(i)).into()
-                        }
-                        CanonicalVarKind::Region(_) | CanonicalVarKind::PlaceholderRegion(_) => {
-                            Region::new_canonical_bound(cx, ty::BoundVar::from_usize(i)).into()
-                        }
-                        CanonicalVarKind::Const(_) | CanonicalVarKind::PlaceholderConst(_) => {
-                            Const::new_canonical_bound(cx, ty::BoundVar::from_usize(i)).into()
-                        }
-                    }
-                },
-            )),
-        }
-    }
-
-    /// Creates dummy var values which should not be used in a
-    /// canonical response.
-    pub fn dummy() -> CanonicalVarValues<I> {
-        CanonicalVarValues { var_values: Default::default() }
-    }
-
     pub fn instantiate(
         cx: I,
         var_kinds: I::CanonicalVarKinds,
@@ -344,15 +294,6 @@ impl<I: Interner> CanonicalVarValues<I> {
     #[inline]
     pub fn len(&self) -> usize {
         self.var_values.len()
-    }
-}
-
-impl<'a, I: Interner> IntoIterator for &'a CanonicalVarValues<I> {
-    type Item = I::GenericArg;
-    type IntoIter = <I::GenericArgs as SliceLike>::IntoIter;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.var_values.iter()
     }
 }
 

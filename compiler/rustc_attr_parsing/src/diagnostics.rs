@@ -121,6 +121,15 @@ pub(crate) struct UnsafeAttrOutsideUnsafeLint {
 }
 
 #[derive(Diagnostic)]
+#[diag("attribute should be applied to `const fn`")]
+pub(crate) struct RustcAllowConstFnUnstable {
+    #[primary_span]
+    pub attr_span: Span,
+    #[label("not a `const fn`")]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
 #[diag(
     "{$num_suggestions ->
         [1] attribute must be of the form {$suggestions}
@@ -321,13 +330,6 @@ pub(crate) struct DocTestUnknown {
 pub(crate) struct DocTestLiteral;
 
 #[derive(Diagnostic)]
-#[diag("this attribute can only be applied at the crate level")]
-#[note(
-    "read <https://doc.rust-lang.org/nightly/rustdoc/the-doc-attribute.html#at-the-crate-level> for more information"
-)]
-pub(crate) struct AttrCrateLevelOnly;
-
-#[derive(Diagnostic)]
 #[diag("conflicting doc inlining attributes")]
 #[help("remove one of the conflicting attributes")]
 pub(crate) struct DocInlineConflict {
@@ -346,6 +348,13 @@ pub(crate) struct DocInlineOnlyUse {
     #[label("not a `use` item")]
     pub item_span: Span,
 }
+
+#[derive(Diagnostic)]
+#[diag("this attribute can only be applied at the crate level")]
+#[note(
+    "read <https://doc.rust-lang.org/nightly/rustdoc/the-doc-attribute.html#at-the-crate-level> for more information"
+)]
+pub(crate) struct AttrCrateLevelOnly;
 
 #[derive(Diagnostic)]
 #[diag("`#[diagnostic::do_not_recommend]` does not expect any arguments")]
@@ -1389,6 +1398,8 @@ pub(crate) struct InvalidTarget {
     pub attr_span: Span,
     pub name: AttrPath,
     pub target: &'static str,
+    #[context]
+    pub target_span: Span,
     pub applied: DiagArgValue,
     pub only: &'static str,
     pub attribute_args: String,
@@ -2132,3 +2143,59 @@ pub(crate) enum MacroExport {
     #[note("declarative macros follow the same exporting rules as regular items")]
     OnDeclMacro,
 }
+
+#[derive(Diagnostic)]
+#[diag("malformed lint attribute input", code = E0452)]
+pub(crate) struct MalformedAttribute {
+    #[primary_span]
+    pub span: Span,
+    #[subdiagnostic]
+    pub kind: MalformedAttributeKind,
+}
+
+#[derive(Subdiagnostic)]
+pub(crate) enum MalformedAttributeKind {
+    #[label("bad attribute argument")]
+    BadAttributeArgument(#[primary_span] Span),
+    #[label("reason in lint attribute must come last")]
+    ReasonMustComeLast(#[primary_span] Span),
+}
+
+#[derive(Diagnostic)]
+#[diag("expected a lint, found literal")]
+pub(crate) struct BadAttributeLit {
+    #[primary_span]
+    #[label("not the name of a lint")]
+    pub span: Span,
+    #[subdiagnostic]
+    pub help: BadAttributeLitHelp,
+}
+
+#[derive(Subdiagnostic)]
+pub(crate) enum BadAttributeLitHelp {
+    #[help("try using `#[{$kind}({$sym})]`")]
+    StrLit { sym: Symbol, kind: Symbol },
+    #[help("for example, write `#[{$kind}(dead_code)]` for `dead_code`")]
+    Other { kind: Symbol },
+}
+
+#[derive(Subdiagnostic)]
+pub(crate) enum UnusedNote {
+    #[note("attribute `{$name}` with an empty list has no effect")]
+    EmptyList { name: Symbol },
+    #[note("attribute `{$name}` without any lints has no effect")]
+    NoLints { name: Symbol },
+}
+
+#[derive(Diagnostic)]
+#[diag("unused attribute")]
+pub(crate) struct Unused {
+    #[suggestion("remove this attribute", code = "", applicability = "machine-applicable")]
+    pub attr_span: Span,
+    #[subdiagnostic]
+    pub note: UnusedNote,
+}
+
+#[derive(Diagnostic)]
+#[diag("use of deprecated `no_link` attribute")]
+pub(crate) struct NoLinkAttrUsed;

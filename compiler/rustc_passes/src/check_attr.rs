@@ -8,13 +8,13 @@
 use std::cell::Cell;
 use std::slice;
 
-use rustc_ast::MetaItemKind;
 use rustc_attr_ir::diagnostic::Directive;
 use rustc_attr_ir::lang_items::LangItem;
+use rustc_attr_ir::lint::LintCheck;
 use rustc_attr_ir::target::{AssocCtxt, MethodKind, Target};
 use rustc_attr_ir::{
     Attribute, AttributeKind, DocAttribute, EiiDecl, EiiImpl, EiiImplResolution, InlineAttr,
-    OptimizeAttr, ReprAttr, find_attr,
+    OptimizeAttr, ReprAttr, RustcAssertVarianceKind, find_attr,
 };
 use rustc_attr_parsing::AttributeParser;
 use rustc_data_structures::thin_vec::ThinVec;
@@ -37,8 +37,7 @@ use rustc_middle::hir::nested_filter;
 use rustc_middle::query::Providers;
 use rustc_middle::traits::ObligationCause;
 use rustc_middle::ty::error::{ExpectedFound, TypeError};
-use rustc_middle::ty::{self, TyCtxt, TypingMode, Unnormalized};
-use rustc_session::diagnostics::feature_err;
+use rustc_middle::ty::{self, TyCtxt, TypingMode, Unnormalized, Variance};
 use rustc_span::edition::Edition;
 use rustc_span::{DUMMY_SP, Ident, Span, Symbol, bug, kw, span_bug, sym};
 use rustc_structures::CrateType;
@@ -136,13 +135,9 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
             match attr {
                 Attribute::Parsed(attr_kind) => {
                     self.check_one_parsed_attribute(hir_id, span, target, item, attr_kind);
-                    self.check_unused_attribute(hir_id, attr);
                 }
-                Attribute::Unparsed(_) => {
-                    match attr.path().as_slice() {
-                        // ok
-                        [sym::allow | sym::expect | sym::warn | sym::deny | sym::forbid, ..] => {}
-
+                Attribute::Tool(u) | Attribute::DeriveHelper(u) => {
+                    match &*u.path.segments {
                         [name, rest @ ..] => {
                             if BUILTIN_ATTRIBUTE_SET.contains(name) {
                                 if rest.len() > 0
@@ -156,7 +151,7 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
                                 }
 
                                 span_bug!(
-                                    attr.span(),
+                                    u.span,
                                     "builtin attribute {name:?} not handled by `CheckAttrVisitor`"
                                 )
                             }
@@ -164,8 +159,6 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
 
                         [] => unreachable!(),
                     }
-
-                    self.check_unused_attribute(hir_id, attr);
                 }
             }
         }
@@ -198,10 +191,6 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
             AttributeKind::ProcMacroDerive { .. } => {
                 self.check_proc_macro(hir_id, target, ProcMacroKind::Derive)
             }
-            AttributeKind::RustcAllowConstFnUnstable(_, first_span) => {
-                self.check_rustc_allow_const_fn_unstable(hir_id, *first_span, span, target)
-            }
-            AttributeKind::Naked(..) => self.check_naked(hir_id, target),
             AttributeKind::MayDangle(attr_span) => self.check_may_dangle(hir_id, *attr_span),
             AttributeKind::Doc(attr) => self.check_doc_attrs(attr, hir_id, target),
             AttributeKind::EiiImpl(eii_impl) => self.check_eii_impl(eii_impl),
@@ -223,6 +212,10 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
             AttributeKind::Linkage(_linkage, span) => {
                 self.check_linkage(*span, hir_id, target, item)
             }
+            AttributeKind::RustcAssertVariance { span: attr_span, kind } => {
+                self.check_rustc_assert_variance(span, *attr_span, hir_id, target, *kind);
+            }
+            AttributeKind::LintCheck(lints) => self.check_lint_check(hir_id, lints),
 
             // All of the following attributes have no specific checks.
             // tidy-alphabetical-start
@@ -272,6 +265,7 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
             AttributeKind::MoveSizeLimit { .. } => (),
             AttributeKind::MustNotSupend { .. } => (),
             AttributeKind::MustUse { .. } => (),
+            AttributeKind::Naked(..) => (),
             AttributeKind::NeedsAllocator => (),
             AttributeKind::NeedsPanicRuntime => (),
             AttributeKind::NoBuiltins => (),
@@ -303,6 +297,7 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
             AttributeKind::RustcAllocator => (),
             AttributeKind::RustcAllocatorZeroed => (),
             AttributeKind::RustcAllocatorZeroedVariant { .. } => (),
+            AttributeKind::RustcAllowConstFnUnstable(..) => (),
             AttributeKind::RustcAllowIncoherentImpl(..) => (),
             AttributeKind::RustcAllowLifetimeDependentSpecialization => (),
             AttributeKind::RustcAsPtr => (),
@@ -383,9 +378,9 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
             AttributeKind::RustcRegions => (),
             AttributeKind::RustcScalableVector { .. } => (),
             AttributeKind::RustcShouldNotBeCalledOnConstItems => (),
+            AttributeKind::RustcShowSpans(_) => (),
             AttributeKind::RustcSimdMonomorphizeLaneLimit(..) => (),
             AttributeKind::RustcSkipDuringMethodDispatch { .. } => (),
-
             AttributeKind::RustcSpecializationTrait => (),
             AttributeKind::RustcStdInternalSymbol => (),
             AttributeKind::RustcStrictCoherence(..) => (),
@@ -401,6 +396,7 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
             AttributeKind::ThreadLocal => (),
             AttributeKind::TrackCaller(_) => (),
             AttributeKind::TypeLengthLimit { .. } => (),
+            AttributeKind::UncheckedTypeAlias => (),
             AttributeKind::Unroll(..) => (),
             AttributeKind::UnstableFeatureBound(..) => (),
             AttributeKind::UnstableRemoved(..) => (),
@@ -718,7 +714,7 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
                         }
                     });
 
-                    let is_allowed = argument_name == sym::Expected || argument_name == sym::Found;
+                    let is_allowed = argument_name == sym::expected || argument_name == sym::found;
                     if !(has_generic | is_allowed) {
                         self.tcx.emit_node_span_lint(
                             MALFORMED_DIAGNOSTIC_FORMAT_LITERALS,
@@ -729,32 +725,6 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
                     }
                 });
             }
-        }
-    }
-
-    /// Checks if `#[naked]` is applied to a function definition.
-    fn check_naked(&self, hir_id: HirId, target: Target) {
-        match target {
-            Target::Fn
-            | Target::Method(
-                MethodKind::Trait { body: true } | MethodKind::TraitImpl | MethodKind::Inherent,
-            ) => {
-                let fn_sig = self.tcx.hir_node(hir_id).fn_sig().unwrap();
-                let abi = fn_sig.header.abi;
-                if abi.is_rustic_abi() && !self.tcx.features().naked_functions_rustic_abi() {
-                    feature_err(
-                        &self.tcx.sess,
-                        sym::naked_functions_rustic_abi,
-                        fn_sig.span,
-                        format!(
-                            "`#[naked]` is currently unstable on `extern \"{}\"` functions",
-                            abi.as_str()
-                        ),
-                    )
-                    .emit();
-                }
-            }
-            _ => {}
         }
     }
 
@@ -1127,96 +1097,6 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
         }
     }
 
-    /// Outputs an error for `#[allow_internal_unstable]` which can only be applied to macros.
-    /// (Allows proc_macro functions)
-    fn check_rustc_allow_const_fn_unstable(
-        &self,
-        hir_id: HirId,
-        attr_span: Span,
-        span: Span,
-        target: Target,
-    ) {
-        match target {
-            Target::Fn | Target::Method(_) => {
-                if !self.tcx.is_const_fn(hir_id.expect_owner().to_def_id()) {
-                    self.tcx
-                        .dcx()
-                        .emit_err(diagnostics::RustcAllowConstFnUnstable { attr_span, span });
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn check_unused_attribute(&self, hir_id: HirId, attr: &Attribute) {
-        // Warn on useless empty attributes.
-        // FIXME(jdonszelmann): this lint should be moved to attribute parsing, see `AcceptContext::warn_empty_attribute`
-        let note =
-            if attr.has_any_name(&[sym::allow, sym::expect, sym::warn, sym::deny, sym::forbid])
-                && attr.meta_item_list().is_some_and(|list| list.is_empty())
-            {
-                diagnostics::UnusedNote::EmptyList { name: attr.name().unwrap() }
-            } else if attr.has_any_name(&[
-                sym::allow,
-                sym::warn,
-                sym::deny,
-                sym::forbid,
-                sym::expect,
-            ]) && let Some(meta) = attr.meta_item_list()
-                && let [meta] = meta.as_slice()
-                && let Some(item) = meta.meta_item()
-                && let MetaItemKind::NameValue(_) = &item.kind
-                && item.path == sym::reason
-            {
-                diagnostics::UnusedNote::NoLints { name: attr.name().unwrap() }
-            } else if attr.has_any_name(&[
-                sym::allow,
-                sym::warn,
-                sym::deny,
-                sym::forbid,
-                sym::expect,
-            ]) && let Some(meta) = attr.meta_item_list()
-                && meta.iter().any(|meta| {
-                    meta.meta_item().is_some_and(|item| {
-                        item.path == sym::linker_messages || item.path == sym::linker_info
-                    })
-                })
-            {
-                if hir_id != CRATE_HIR_ID {
-                    return;
-                } else {
-                    let never_needs_link = self
-                        .tcx
-                        .crate_types()
-                        .iter()
-                        .all(|kind| matches!(kind, CrateType::Rlib | CrateType::StaticLib));
-                    if never_needs_link {
-                        diagnostics::UnusedNote::LinkerMessagesBinaryCrateOnly
-                    } else {
-                        return;
-                    }
-                }
-            } else if hir_id == CRATE_HIR_ID
-                && attr.has_any_name(&[sym::allow, sym::warn, sym::deny, sym::forbid, sym::expect])
-                && let Some(meta) = attr.meta_item_list()
-                && meta.iter().any(|meta| {
-                    meta.meta_item().is_some_and(|item| item.path == sym::dead_code_pub_in_binary)
-                })
-                && !self.tcx.crate_types().contains(&CrateType::Executable)
-            {
-                diagnostics::UnusedNote::NoEffectDeadCodePubInBinary
-            } else {
-                return;
-            };
-
-        self.tcx.emit_node_span_lint(
-            UNUSED_ATTRIBUTES,
-            hir_id,
-            attr.span(),
-            diagnostics::Unused { attr_span: attr.span(), note },
-        );
-    }
-
     /// A best effort attempt to create an error for a mismatching proc macro signature.
     ///
     /// If this best effort goes wrong, it will just emit a worse error later (see #102923)
@@ -1415,6 +1295,122 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
                 self.tcx.dcx().emit_err(diagnostics::ConstFnLinkage { span });
             }
             _ => {}
+        }
+    }
+
+    fn check_rustc_assert_variance(
+        &self,
+        span: Span,
+        attr_span: Span,
+        hir_id: HirId,
+        target: Target,
+        kind: RustcAssertVarianceKind,
+    ) {
+        // If the target is invalid the parser has already emitted an error
+        if !matches!(target, Target::TypeParam | Target::LifetimeParam | Target::ConstParam) {
+            return;
+        }
+
+        let Node::GenericParam(param) = self.tcx.hir_node(hir_id) else { return };
+        let owner = hir_id.owner.to_def_id();
+        let variances = self.tcx.variances_of(owner);
+        let generics = self.tcx.generics_of(owner);
+
+        let variance = generics
+            .own_params
+            .iter()
+            .zip(variances.iter())
+            .filter(|(other_param, _)| other_param.def_id == param.def_id.to_def_id())
+            .map(|(_, variance)| variance)
+            .nth(0)
+            .expect("generic parameter should have variance");
+
+        match (kind, variance) {
+            (RustcAssertVarianceKind::Covariant, Variance::Covariant) => {}
+            (RustcAssertVarianceKind::Invariant, Variance::Invariant) => {}
+            (RustcAssertVarianceKind::Contravariant, Variance::Contravariant) => {}
+            (RustcAssertVarianceKind::Bivariant, Variance::Bivariant) => {}
+            (asserted, actual) => {
+                let expected_variance = match asserted {
+                    RustcAssertVarianceKind::Covariant => sym::covariant,
+                    RustcAssertVarianceKind::Invariant => sym::invariant,
+                    RustcAssertVarianceKind::Contravariant => sym::contravariant,
+                    RustcAssertVarianceKind::Bivariant => sym::bivariant,
+                };
+
+                let actual_variance = match actual {
+                    Variance::Covariant => sym::covariant,
+                    Variance::Invariant => sym::invariant,
+                    Variance::Contravariant => sym::contravariant,
+                    Variance::Bivariant => sym::bivariant,
+                };
+
+                let item_ident = self.tcx.item_ident(owner);
+
+                let note = diagnostics::RustcAssertVarianceFailedNote { span: attr_span };
+                self.tcx.dcx().emit_err(diagnostics::RustcAssertVarianceFailed {
+                    item_span: self.tcx.def_span(owner),
+                    note,
+                    param_ident: param.name.ident(),
+                    param_span: span,
+                    item_ident,
+                    expected_variance,
+                    actual_variance,
+                });
+            }
+        }
+    }
+
+    fn check_lint_check(&self, hir_id: HirId, lints: &[LintCheck]) {
+        for lint in lints {
+            let LintCheck {
+                tool: None,
+                lint_name,
+                lint_span,
+                kind: _,
+                reason: _,
+                attr_id: _,
+                attr_span: _,
+            } = *lint
+            else {
+                continue;
+            };
+
+            match lint_name {
+                sym::dead_code_pub_in_binary => {
+                    if !self.tcx.crate_types().contains(&CrateType::Executable) {
+                        self.tcx.emit_node_span_lint(
+                            UNUSED_ATTRIBUTES,
+                            hir_id,
+                            lint_span,
+                            diagnostics::Unused {
+                                attr_span: lint_span,
+                                note: diagnostics::UnusedNote::NoEffectDeadCodePubInBinary,
+                            },
+                        );
+                    }
+                }
+                sym::linker_messages | sym::linker_info => {
+                    if hir_id == CRATE_HIR_ID
+                        && self
+                            .tcx
+                            .crate_types()
+                            .iter()
+                            .all(|kind| matches!(kind, CrateType::Rlib | CrateType::StaticLib))
+                    {
+                        self.tcx.emit_node_span_lint(
+                            UNUSED_ATTRIBUTES,
+                            hir_id,
+                            lint_span,
+                            diagnostics::Unused {
+                                attr_span: lint_span,
+                                note: diagnostics::UnusedNote::LinkerMessagesBinaryCrateOnly,
+                            },
+                        );
+                    }
+                }
+                _ => {}
+            }
         }
     }
 }

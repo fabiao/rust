@@ -14,7 +14,6 @@ pub(crate) use self::CodeGenOptSize::*;
 pub(crate) use self::conversions::*;
 pub(crate) use self::ffi::*;
 pub(crate) use self::metadata_kind::*;
-use crate::common::AsCCharPtr;
 
 mod conversions;
 pub(crate) mod diagnostic;
@@ -46,11 +45,11 @@ pub(crate) fn AddFunctionAttributes<'ll>(
 }
 
 pub(crate) fn HasStringAttribute<'ll>(llfn: &'ll Value, name: &str) -> bool {
-    unsafe { LLVMRustHasFnAttribute(llfn, name.as_c_char_ptr(), name.len()) }
+    unsafe { LLVMRustHasFnAttribute(llfn, name.as_ptr(), name.len()) }
 }
 
 pub(crate) fn RemoveStringAttrFromFn<'ll>(llfn: &'ll Value, name: &str) {
-    unsafe { LLVMRustRemoveFnAttribute(llfn, name.as_c_char_ptr(), name.len()) }
+    unsafe { LLVMRustRemoveFnAttribute(llfn, name.as_ptr(), name.len()) }
 }
 
 pub(crate) fn AddCallSiteAttributes<'ll>(
@@ -64,41 +63,43 @@ pub(crate) fn AddCallSiteAttributes<'ll>(
 }
 
 pub(crate) fn CreateAttrStringValue<'ll>(
-    llcx: &'ll Context,
+    llcx: Context<'ll>,
     attr: &str,
     value: &str,
 ) -> &'ll Attribute {
     unsafe {
         LLVMCreateStringAttribute(
             llcx,
-            attr.as_c_char_ptr(),
+            attr.as_ptr(),
             attr.len().try_into().unwrap(),
-            value.as_c_char_ptr(),
+            value.as_ptr(),
             value.len().try_into().unwrap(),
         )
     }
 }
 pub(crate) fn CreateAttrStringValueFromCStr<'ll>(
-    llcx: &'ll Context,
+    llcx: Context<'ll>,
     attr: &std::ffi::CStr,
     value: &std::ffi::CStr,
 ) -> &'ll Attribute {
+    let attr = attr.to_bytes();
+    let value = value.to_bytes();
     unsafe {
         LLVMCreateStringAttribute(
             llcx,
-            (*attr).as_ptr(),
-            (*attr).to_bytes().len() as c_uint,
-            (*value).as_ptr(),
-            (*value).to_bytes().len() as c_uint,
+            attr.as_ptr(),
+            attr.len() as c_uint,
+            value.as_ptr(),
+            value.len() as c_uint,
         )
     }
 }
 
-pub(crate) fn CreateAttrString<'ll>(llcx: &'ll Context, attr: &str) -> &'ll Attribute {
+pub(crate) fn CreateAttrString<'ll>(llcx: Context<'ll>, attr: &str) -> &'ll Attribute {
     unsafe {
         LLVMCreateStringAttribute(
             llcx,
-            attr.as_c_char_ptr(),
+            attr.as_ptr(),
             attr.len().try_into().unwrap(),
             std::ptr::null(),
             0,
@@ -106,43 +107,53 @@ pub(crate) fn CreateAttrString<'ll>(llcx: &'ll Context, attr: &str) -> &'ll Attr
     }
 }
 
-pub(crate) fn CreateAlignmentAttr(llcx: &Context, bytes: u64) -> &Attribute {
+pub(crate) fn CreateAlignmentAttr<'ll>(llcx: Context<'ll>, bytes: u64) -> &'ll Attribute {
     unsafe { LLVMRustCreateAlignmentAttr(llcx, bytes) }
 }
 
-pub(crate) fn CreateDereferenceableAttr(llcx: &Context, bytes: u64) -> &Attribute {
+pub(crate) fn CreateDereferenceableAttr<'ll>(llcx: Context<'ll>, bytes: u64) -> &'ll Attribute {
     unsafe { LLVMRustCreateDereferenceableAttr(llcx, bytes) }
 }
 
-pub(crate) fn CreateDereferenceableOrNullAttr(llcx: &Context, bytes: u64) -> &Attribute {
+pub(crate) fn CreateDereferenceableOrNullAttr<'ll>(
+    llcx: Context<'ll>,
+    bytes: u64,
+) -> &'ll Attribute {
     unsafe { LLVMRustCreateDereferenceableOrNullAttr(llcx, bytes) }
 }
 
-pub(crate) fn CreateByValAttr<'ll>(llcx: &'ll Context, ty: &'ll Type) -> &'ll Attribute {
+pub(crate) fn CreateByValAttr<'ll>(llcx: Context<'ll>, ty: &'ll Type) -> &'ll Attribute {
     unsafe { LLVMRustCreateByValAttr(llcx, ty) }
 }
 
-pub(crate) fn CreateByRefAttr<'ll>(llcx: &'ll Context, ty: &'ll Type) -> &'ll Attribute {
+pub(crate) fn CreateByRefAttr<'ll>(llcx: Context<'ll>, ty: &'ll Type) -> &'ll Attribute {
     unsafe { LLVMRustCreateByRefAttr(llcx, ty) }
 }
 
-pub(crate) fn CreateStructRetAttr<'ll>(llcx: &'ll Context, ty: &'ll Type) -> &'ll Attribute {
+pub(crate) fn CreateStructRetAttr<'ll>(llcx: Context<'ll>, ty: &'ll Type) -> &'ll Attribute {
     unsafe { LLVMRustCreateStructRetAttr(llcx, ty) }
 }
 
-pub(crate) fn CreateUWTableAttr(llcx: &Context, async_: bool) -> &Attribute {
+pub(crate) fn CreateUWTableAttr<'ll>(llcx: Context<'ll>, async_: bool) -> &'ll Attribute {
     unsafe { LLVMRustCreateUWTableAttr(llcx, async_) }
 }
 
-pub(crate) fn CreateAllocSizeAttr(llcx: &Context, size_arg: u32) -> &Attribute {
+pub(crate) fn CreateAllocSizeAttr<'ll>(llcx: Context<'ll>, size_arg: u32) -> &'ll Attribute {
     unsafe { LLVMRustCreateAllocSizeAttr(llcx, size_arg) }
 }
 
-pub(crate) fn CreateAllocKindAttr(llcx: &Context, kind_arg: AllocKindFlags) -> &Attribute {
+pub(crate) fn CreateAllocKindAttr<'ll>(
+    llcx: Context<'ll>,
+    kind_arg: AllocKindFlags,
+) -> &'ll Attribute {
     unsafe { LLVMRustCreateAllocKindAttr(llcx, kind_arg.bits()) }
 }
 
-pub(crate) fn CreateRangeAttr(llcx: &Context, size: Size, range: WrappingRange) -> &Attribute {
+pub(crate) fn CreateRangeAttr<'ll>(
+    llcx: Context<'ll>,
+    size: Size,
+    range: WrappingRange,
+) -> &'ll Attribute {
     let lower = range.start;
     // LLVM treats the upper bound as exclusive, but allows wrapping.
     let upper = range.end.wrapping_add(1);
@@ -228,14 +239,14 @@ pub(crate) fn set_thread_local_mode(global: &Value, mode: ThreadLocalMode) {
 
 impl AttributeKind {
     /// Create an LLVM Attribute with no associated value.
-    pub(crate) fn create_attr(self, llcx: &Context) -> &Attribute {
+    pub(crate) fn create_attr<'ll>(self, llcx: Context<'ll>) -> &'ll Attribute {
         unsafe { LLVMRustCreateAttrNoValue(llcx, self) }
     }
 }
 
 impl MemoryEffects {
     /// Create an LLVM Attribute with these memory effects.
-    pub(crate) fn create_attr(self, llcx: &Context) -> &Attribute {
+    pub(crate) fn create_attr<'ll>(self, llcx: Context<'ll>) -> &'ll Attribute {
         unsafe { LLVMRustCreateMemoryEffectsAttr(llcx, self) }
     }
 }
@@ -340,7 +351,7 @@ pub(crate) struct Intrinsic {
 
 impl Intrinsic {
     pub(crate) fn lookup(name: &[u8]) -> Option<Self> {
-        let id = unsafe { LLVMLookupIntrinsicID(name.as_c_char_ptr(), name.len()) };
+        let id = unsafe { LLVMLookupIntrinsicID(name.as_ptr(), name.len()) };
         NonZero::new(id).map(|id| Self { id })
     }
 
@@ -365,10 +376,7 @@ impl Intrinsic {
 
 /// Safe wrapper for `LLVMSetValueName2` from a byte slice
 pub(crate) fn set_value_name(value: &Value, name: &[u8]) {
-    unsafe {
-        let data = name.as_c_char_ptr();
-        LLVMSetValueName2(value, data, name.len());
-    }
+    unsafe { LLVMSetValueName2(value, name.as_ptr(), name.len()) };
 }
 
 pub(crate) fn build_string(f: impl FnOnce(&RustString)) -> Result<String, FromUtf8Error> {
@@ -408,12 +416,7 @@ pub(crate) struct OperandBundleBox<'a> {
 impl<'a> OperandBundleBox<'a> {
     pub(crate) fn new(name: &str, vals: &[&'a Value]) -> Self {
         let raw = unsafe {
-            LLVMCreateOperandBundle(
-                name.as_c_char_ptr(),
-                name.len(),
-                vals.as_ptr(),
-                vals.len() as c_uint,
-            )
+            LLVMCreateOperandBundle(name.as_ptr(), name.len(), vals.as_ptr(), vals.len() as c_uint)
         };
         Self { raw: ptr::NonNull::new(raw).unwrap() }
     }
@@ -444,7 +447,7 @@ pub(crate) fn add_module_flag_u32(
     value: u32,
 ) {
     unsafe {
-        LLVMRustAddModuleFlagU32(module, merge_behavior, key.as_c_char_ptr(), key.len(), value);
+        LLVMRustAddModuleFlagU32(module, merge_behavior, key.as_ptr(), key.len(), value);
     }
 }
 
@@ -458,9 +461,9 @@ pub(crate) fn add_module_flag_str(
         LLVMRustAddModuleFlagString(
             module,
             merge_behavior,
-            key.as_c_char_ptr(),
+            key.as_ptr(),
             key.len(),
-            value.as_c_char_ptr(),
+            value.as_ptr(),
             value.len(),
         );
     }

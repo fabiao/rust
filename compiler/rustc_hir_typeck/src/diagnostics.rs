@@ -687,6 +687,30 @@ pub(crate) struct SuggestPtrNullMut {
     pub span: Span,
 }
 
+#[derive(Subdiagnostic)]
+#[suggestion(
+    "consider using `&mut` instead",
+    applicability = "maybe-incorrect",
+    style = "verbose",
+    code = "&mut "
+)]
+pub(crate) struct SuggestRefMut {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Subdiagnostic)]
+#[suggestion(
+    "consider using `&raw mut` instead",
+    applicability = "maybe-incorrect",
+    style = "verbose",
+    code = "&raw mut "
+)]
+pub(crate) struct SuggestRawMut {
+    #[primary_span]
+    pub span: Span,
+}
+
 #[derive(Diagnostic)]
 #[diag(
     "trivial {$numeric ->
@@ -870,7 +894,7 @@ pub(crate) struct NoAssociatedItem<'tcx> {
 )]
 pub(crate) struct CandidateTraitNote {
     #[primary_span]
-    pub span: Span,
+    pub span: MultiSpan,
     pub trait_name: String,
     pub item_name: Ident,
     pub action_or_ty: String,
@@ -1369,4 +1393,12 @@ pub(crate) struct WrapConstBlock {
     pub left: Span,
     #[suggestion_part(code = " }}")]
     pub right: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag("the `{$adt_name}` must contain one field for wrapping the return value in delegation")]
+pub(crate) struct DelegationInvalidAdtForReturnWrapping {
+    #[primary_span]
+    pub span: Span,
+    pub adt_name: String,
 }

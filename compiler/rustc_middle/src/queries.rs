@@ -308,7 +308,7 @@ rustc_queries! {
 
     /// Returns the *type* of the definition given by `DefId`.
     ///
-    /// For type aliases (whether eager or lazy) and associated types, this returns
+    /// For type aliases (whether unchecked or checked) and associated types, this returns
     /// the underlying aliased type (not the corresponding [alias type]).
     ///
     /// For opaque types, this returns and thus reveals the hidden type! If you
@@ -1608,7 +1608,7 @@ rustc_queries! {
         desc { "finding all vtable entries for trait `{}`", tcx.def_path_str(key.def_id) }
     }
 
-    query first_method_vtable_slot(key: ty::TraitRef<'tcx>) -> usize {
+    query first_method_vtable_slot(key: ty::TraitRef<'tcx>) -> Option<usize> {
         desc { "finding the slot within the vtable of `{}` for the implementation of `{}`", key.self_ty(), key.print_only_trait_name() }
     }
 
@@ -2721,6 +2721,7 @@ rustc_queries! {
     }
 
     query limits(key: ()) -> Limits {
+        feedable
         desc { "looking up limits" }
     }
 

@@ -8,7 +8,7 @@ use rustc_ast_ir::Mutability;
 #[cfg(feature = "nightly")]
 use rustc_data_structures::stable_hash::{StableHash, StableHashCtxt, StableHasher};
 #[cfg(feature = "nightly")]
-use rustc_macros::{Decodable_NoContext, Encodable_NoContext, StableHash_NoContext};
+use rustc_macros::{Decodable_NoContext, Encodable_NoContext, StableHash, StableHash_NoContext};
 use rustc_type_ir::data_structures::{NoError, UnifyKey, UnifyValue};
 use rustc_type_ir_macros::{
     GenericTypeVisitable, Lift_Generic, TypeFoldable_Generic, TypeVisitable_Generic,
@@ -115,7 +115,7 @@ impl<I: Interner> AliasTyKind<I> {
 /// Rigidness becomes outdated when the surrounding typing mode or param env changes,
 /// because further normalization might be possible.
 /// We should also note that rigidness can be shared within some typing mode groups
-/// if the param env is the same, e.g., `Typeck/PostTypeckUntilBorrowck` and
+/// if the param env is the same, e.g., `Typeck/PostTypeckThroughBorrowck` and
 /// `PostAnalysis/Codegen`.
 ///
 /// We always reveal auto traits for rigid aliases and this can cause query cycle in
@@ -857,12 +857,31 @@ impl UnifyKey for FloatVid {
 impl StableHash for InferTy {
     fn stable_hash<Hcx: StableHashCtxt>(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
         use InferTy::*;
-        std::mem::discriminant(self).stable_hash(hcx, hasher);
+
+        #[derive(StableHash)]
+        enum Tag {
+            FreshTy,
+            FreshIntTy,
+            FreshFloatTy,
+        }
+
         match self {
             TyVar(_) | IntVar(_) | FloatVar(_) => {
                 panic!("type variables should not be hashed: {self:?}")
             }
-            FreshTy(v) | FreshIntTy(v) | FreshFloatTy(v) => v.stable_hash(hcx, hasher),
+
+            FreshTy(v) => {
+                Tag::FreshTy.stable_hash(hcx, hasher);
+                v.stable_hash(hcx, hasher);
+            }
+            FreshIntTy(v) => {
+                Tag::FreshIntTy.stable_hash(hcx, hasher);
+                v.stable_hash(hcx, hasher);
+            }
+            FreshFloatTy(v) => {
+                Tag::FreshFloatTy.stable_hash(hcx, hasher);
+                v.stable_hash(hcx, hasher);
+            }
         }
     }
 }

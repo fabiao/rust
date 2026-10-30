@@ -118,7 +118,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             return;
         };
 
-        if !found_expr.span.eq_ctxt(expected_expr.span) {
+        if found_expr.span.ctxt() != expected_expr.span.ctxt() {
             return;
         }
 
@@ -190,8 +190,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         expected: Ty<'tcx>,
         actual: Ty<'tcx>,
     ) -> Result<(), Diag<'a>> {
-        self.at(cause, self.param_env)
-            .sup(DefineOpaqueTypes::Yes, expected, actual)
+        self.sup_raw(cause, self.param_env, DefineOpaqueTypes::Yes, expected, actual)
             .map(|infer_ok| self.register_infer_ok_obligations(infer_ok))
             .map_err(|e| {
                 self.err_ctxt().report_mismatched_types(cause, self.param_env, expected, actual, e)

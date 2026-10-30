@@ -915,10 +915,11 @@ impl CommandLineStep for Priroda {
             Mode::ToolRustcPrivate,
             host,
             Kind::Test,
-            "src/tools/miri/priroda",
+            "src/tools/miri",
             SourceType::InTree,
-            &[],
+            &["priroda".into()],
         );
+        cargo.args(["--test", "priroda"]);
 
         cargo.add_rustc_lib_path(builder);
 
@@ -3560,6 +3561,18 @@ fn prepare_cargo_test(
         helpers::add_dylib_path(dylib_paths, &mut cargo);
     }
 
+    add_cargo_target_runner(&mut cargo, target, builder);
+
+    cargo
+}
+
+/// Tells cargo how to execute binaries built for `target`, e.g. under an emulator or on a remote
+/// device.
+fn add_cargo_target_runner(
+    cargo: &mut BootstrapCommand,
+    target: TargetSelection,
+    builder: &Builder<'_>,
+) {
     if builder.remote_tested(target) {
         cargo.env(
             format!("CARGO_TARGET_{}_RUNNER", envify(&target.triple)),
@@ -3568,8 +3581,6 @@ fn prepare_cargo_test(
     } else if let Some(tool) = builder.runner(target) {
         cargo.env(format!("CARGO_TARGET_{}_RUNNER", envify(&target.triple)), tool);
     }
-
-    cargo
 }
 
 /// Runs `cargo test` for standard library crates.
@@ -4145,9 +4156,6 @@ impl CommandLineStep for Bootstrap {
         let build_compiler = builder.compiler(0, host);
         let record_failed_tests = builder.ensure(SetupFailedTestsFile);
 
-        // Some tests require cargo submodule to be present.
-        builder.sess.require_submodule("src/tools/cargo", None);
-
         let mut cargo = tool::prepare_tool_cargo(
             builder,
             build_compiler,
@@ -4169,10 +4177,9 @@ impl CommandLineStep for Bootstrap {
             .env("RUSTC_BOOTSTRAP", "1");
 
         if builder.config.cmd.bless() {
-            // Tell `insta` to automatically bless any failing `.snap` files.
-            // Unlike compiletest blessing, the tests might still report failure.
-            // Does not bless inline snapshots.
-            cargo.env("INSTA_UPDATE", "always");
+            // Tell `expect-test` to automatically bless any failing `.snap` files
+            // and inline snapshots.
+            cargo.env("UPDATE_EXPECT", "1");
         }
 
         run_cargo_test(cargo, &[], &[], None, host, builder, record_failed_tests);
@@ -4587,14 +4594,6 @@ impl CommandLineStep for CodegenGCC {
             return;
         }
 
-        let triple = run.target.triple;
-        let target_supported =
-            if triple.contains("linux") { triple.contains("x86_64") } else { false };
-        if !target_supported {
-            builder.info("target not supported by rustc_codegen_gcc. skipping");
-            return;
-        }
-
         if builder.remote_tested(run.target) {
             builder.info("remote testing is not supported by rustc_codegen_gcc. skipping");
             return;
@@ -4698,7 +4697,7 @@ pub struct TestFloatParse {
 
 impl CommandLineStep for TestFloatParse {
     type Output = ();
-    const IS_HOST: bool = true;
+    const IS_HOST: bool = false;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
         run.path("src/tools/test-float-parse")
@@ -4709,8 +4708,15 @@ impl CommandLineStep for TestFloatParse {
     }
 
     fn make_run(run: RunConfig<'_>) {
-        run.builder.ensure(Self {
-            build_compiler: get_compiler_to_test(run.builder, run.target),
+        let builder = run.builder;
+
+        // Other targets usually run under an emulator, which is too slow to do by default.
+        if run.target != run.build_triple() && !builder.was_invoked_explicitly::<Self>(Kind::Test) {
+            return;
+        }
+
+        builder.ensure(Self {
+            build_compiler: builder.compiler(builder.top_stage, run.build_triple()),
             target: run.target,
         });
     }
@@ -4722,6 +4728,8 @@ impl CommandLineStep for TestFloatParse {
         // Build the standard library that will be tested, and a stdlib for host code
         builder.std(build_compiler, target);
         builder.std(build_compiler, builder.host_target);
+        // Start the emulator or remote test server, if the tests need one.
+        builder.ensure(RemoteCopyLibs { build_compiler, target });
         let record_failed_tests = builder.ensure(SetupFailedTestsFile);
 
         // Run any unit tests in the crate
@@ -4764,7 +4772,13 @@ impl CommandLineStep for TestFloatParse {
             cargo_run.args(["--", "--skip-huge"]);
         }
 
-        cargo_run.into_cmd().run(builder);
+        let mut cargo_run = cargo_run.into_cmd();
+        add_cargo_target_runner(&mut cargo_run, target, builder);
+        cargo_run.run(builder);
+    }
+
+    fn metadata(&self) -> Option<StepMetadata> {
+        Some(StepMetadata::test("test-float-parse", self.target))
     }
 }
 
@@ -4976,7 +4990,7 @@ impl CommandLineStep for StdSemverCheck {
                         res.stdout()
                     );
                     if builder.fail_fast {
-                        eprintln!("{error}",);
+                        eprintln!("{error}");
                         helpers::exit_process(1);
                     } else {
                         builder.config.exec_ctx().add_to_delay_failure(error);

@@ -638,7 +638,7 @@ fn clean_generic_param_def(
                 },
             )
         }
-        ty::GenericParamDefKind::Const { has_default } => (
+        ty::GenericParamDefKind::Const { has_default, arg_pos: _ } => (
             def.name,
             GenericParamDefKind::Const {
                 ty: Box::new(clean_middle_ty(
@@ -717,7 +717,7 @@ fn clean_generic_param<'tcx>(
                 },
             )
         }
-        hir::GenericParamKind::Const { ty, default } => (
+        hir::GenericParamKind::Const { ty, default, arg_pos: _ } => (
             param.name.ident().name,
             GenericParamDefKind::Const {
                 ty: Box::new(clean_ty(ty, cx)),
@@ -3221,7 +3221,7 @@ fn clean_use_statement<'tcx>(
             for (tree, hir_id, def_id) in items {
                 let mut segments = path.segments.to_vec();
                 segments.extend(tree.prefix.segments.iter());
-                if segments.last().unwrap().ident.name == kw::SelfLower {
+                if segments.last().is_some_and(|seg| seg.ident.name == kw::SelfLower) {
                     segments.pop();
                 }
                 let path = hir::UsePath {

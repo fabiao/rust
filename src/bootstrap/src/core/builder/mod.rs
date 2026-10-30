@@ -807,13 +807,14 @@ impl<'a> Builder<'a> {
                 llvm::Enzyme,
                 llvm::RustOffload,
                 llvm::CrtBeginEnd,
+                llvm::Tpde,
                 tool::RustdocGUITest,
                 tool::OptimizedDist,
                 tool::CoverageDump,
                 tool::LlvmBitcodeLinker,
                 tool::RustcPerf,
                 tool::WasmComponentLd,
-                tool::LldWrapper
+                tool::LldWrapper,
             ),
             Kind::Clippy => describe!(
                 clippy::Std,
@@ -852,7 +853,6 @@ impl<'a> Builder<'a> {
                 check::Clippy,
                 check::Miri,
                 check::CargoMiri,
-                check::Priroda,
                 check::MiroptTestTools,
                 check::Rustfmt,
                 check::RustAnalyzer,
@@ -1011,7 +1011,7 @@ impl<'a> Builder<'a> {
                 dist::BuildManifest,
                 dist::ReproducibleArtifacts,
                 dist::GccDev,
-                dist::Gcc
+                dist::Gcc,
             ),
             Kind::Install => describe!(
                 install::Docs,

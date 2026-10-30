@@ -18,6 +18,7 @@ use rustc_type_ir::{
 
 use crate::dep_graph::{DepKind, DepNodeIndex};
 use crate::infer::canonical::CanonicalVarKinds;
+use crate::mir::interpret::Scalar;
 use crate::traits::cache::WithDepNode;
 use crate::traits::solve::{
     self, CanonicalInput, ExternalConstraints, ExternalConstraintsData, QueryResult, inspect,
@@ -66,6 +67,7 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
     type GenericArg = ty::GenericArg<'tcx>;
     type Term = ty::Term<'tcx>;
     type BoundVarKinds = &'tcx List<ty::BoundVariableKind<'tcx>>;
+    type TypingEnv = ty::TypingEnv<'tcx>;
 
     type PredefinedOpaques = solve::PredefinedOpaques<'tcx>;
 
@@ -116,6 +118,7 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
     type ExprConst = ty::Expr<'tcx>;
     type ValTree = ty::ValTree<'tcx>;
     type ScalarInt = ty::ScalarInt;
+    type Scalar = Scalar;
     type InternedRegionKind = Interned<'tcx, ty::RegionKind<'tcx>>;
     type InternedConstKind = Interned<'tcx, WithCachedTypeInfo<ty::ConstKind<'tcx>>>;
     type EarlyParamRegion = ty::EarlyParamRegion;
@@ -155,6 +158,26 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
     fn assert_evaluation_is_concurrent(&self) {
         // Turns out, the assumption for this function isn't perfect.
         // See trait-system-refactor-initiative#234.
+    }
+
+    fn erase_and_anonymize_regions<T: TypeFoldable<Self>>(self, value: T) -> T {
+        self.erase_and_anonymize_regions(value)
+    }
+
+    fn const_eval_resolve_for_typeck(
+        self,
+        typing_env: Self::TypingEnv,
+        ct: ty::AliasConst<'tcx>,
+        span: Self::Span,
+    ) -> ty::ConstEvalResult<Self> {
+        use crate::mir::interpret::ErrorHandled;
+
+        match self.const_eval_resolve_for_typeck(typing_env, ct, span) {
+            Ok(Ok(vt)) => Ok(vt),
+            Ok(Err(ty)) => Err(ty::ConstEvalErr::NonValtreeable(ty)),
+            Err(ErrorHandled::Reported(e, _)) => Err(ty::ConstEvalErr::Reported(e.into())),
+            Err(ErrorHandled::TooGeneric(_)) => Err(ty::ConstEvalErr::TooGeneric),
+        }
     }
 
     fn expand_abstract_consts<T: TypeFoldable<TyCtxt<'tcx>>>(self, t: T) -> T {
@@ -207,6 +230,7 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
             ty::AliasConstKind::Anon { .. } => None,
         }
     }
+
     fn anon_const_kind(self, def_id: DefId) -> ty::AnonConstKind {
         self.anon_const_kind(def_id)
     }
@@ -494,10 +518,6 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
         self.is_lang_item(def_id, solver_trait_lang_item_to_lang_item(lang_item))
     }
 
-    fn is_adt_lang_item(self, def_id: DefId, lang_item: SolverAdtLangItem) -> bool {
-        self.is_lang_item(def_id, solver_adt_lang_item_to_lang_item(lang_item))
-    }
-
     fn is_default_trait(self, def_id: DefId) -> bool {
         self.is_default_trait(def_id)
     }
@@ -604,10 +624,6 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
         self.trait_def(trait_def_id).safety.is_unsafe()
     }
 
-    fn is_impl_trait_in_trait(self, def_id: DefId) -> bool {
-        self.is_impl_trait_in_trait(def_id)
-    }
-
     fn delay_bug(self, msg: impl ToString) -> ErrorGuaranteed {
         self.dcx().span_delayed_bug(DUMMY_SP, msg.to_string())
     }
@@ -683,18 +699,6 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
         })
     }
 
-    fn get_anon_re_bounds_lifetime(self, idx: usize, var_idx: usize) -> Option<Region<'tcx>> {
-        if let Some(inner) = self.lifetimes.anon_re_bounds.get(idx) {
-            inner.get(var_idx).copied()
-        } else {
-            None
-        }
-    }
-
-    fn get_anon_re_canonical_bounds_lifetime(self, idx: usize) -> Option<Region<'tcx>> {
-        self.lifetimes.anon_re_canonical_bounds.get(idx).copied()
-    }
-
     fn get_re_static_lifetime(self) -> Region<'tcx> {
         self.lifetimes.re_static
     }
@@ -719,7 +723,7 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
     ) -> Region<'tcx> {
         // Use a pre-interned one when possible.
         if let ty::BoundRegion { var, kind: ty::BoundRegionKind::Anon } = bound_region
-            && let Some(inner) = self.lifetimes.anon_re_bounds.get(debruijn.as_usize())
+            && let Some(inner) = self.lifetimes.re_bound_bound_anons.get(debruijn.as_usize())
             && let Some(re) = inner.get(var.as_usize()).copied()
         {
             re
@@ -730,7 +734,7 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
 
     fn intern_canonical_bound(self, var: BoundVar) -> Region<'tcx> {
         // Use a pre-interned one when possible.
-        if let Some(re) = self.lifetimes.anon_re_canonical_bounds.get(var.as_usize()).copied() {
+        if let Some(re) = self.lifetimes.re_bound_canonical_anons.get(var.as_usize()).copied() {
             re
         } else {
             self.intern_region(ty::ReBound(
@@ -738,6 +742,14 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
                 BoundRegion { var, kind: ty::BoundRegionKind::Anon },
             ))
         }
+    }
+
+    fn intern_valtree(self, valtree_kind: ty::ValTreeKind<TyCtxt<'tcx>>) -> ty::ValTree<'tcx> {
+        self.intern_valtree(valtree_kind)
+    }
+
+    fn const_zst(self) -> ty::ValTree<'tcx> {
+        self.consts.valtree_zst
     }
 }
 
@@ -819,6 +831,7 @@ bidirectional_lang_item_map! {
     FnMut,
     FnOnce,
     FnPtrTrait,
+    Freeze,
     FusedIterator,
     Future,
     Iterator,

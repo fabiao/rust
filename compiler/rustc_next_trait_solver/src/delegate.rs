@@ -2,10 +2,13 @@ use std::fmt::Debug;
 use std::ops::Deref;
 
 use rustc_type_ir::solve::{
-    Certainty, ComputeGoalFastPathOutcome, FetchEligibleAssocItemResponse, Goal, NoSolution,
+    ComputeGoalFastPathOutcome, FetchEligibleAssocItemResponse, Goal, NoSolution,
     VisibleForLeakCheck,
 };
-use rustc_type_ir::{self as ty, CanonicalizerState, Const, InferCtxtLike, Interner, TypeFoldable};
+use rustc_type_ir::transmute::Answer;
+use rustc_type_ir::{
+    self as ty, CanonicalizerState, Const, InferCtxtLike, Interner, Region, TypeFoldable,
+};
 
 /// `SolverDelegate` is one of the two traits in the `rustc_type_ir` shared abstraction layer
 /// between rustc and rust-analyzer abstracting over the [InferCtxt][inferctxt-doc], which had to be
@@ -53,6 +56,9 @@ pub trait SolverDelegate: Deref<Target = Self::Infcx> + Sized {
     // FIXME: Uplift the leak check into this crate.
     fn leak_check(&self, max_input_universe: ty::UniverseIndex) -> Result<(), NoSolution>;
 
+    /// FIXME: Only used in `evaluate_const` on `EvalCtxt` to delegate evaluation of GCE consts and
+    /// should be removed once GCE is gone.
+    ///
     /// Evaluate a const, normalizing the type of the resulting value with `normalize_ty`.
     /// Returns `Ok(None)` if the const is too generic, and `Err(_)` only if `normalize_ty`
     /// failed.
@@ -75,6 +81,14 @@ pub trait SolverDelegate: Deref<Target = Self::Infcx> + Sized {
     fn make_deduplicated_region_constraints(
         &self,
     ) -> Vec<(ty::RegionConstraint<Self::Interner>, VisibleForLeakCheck)>;
+
+    fn instantiate_value<V>(
+        &self,
+        value: ty::Canonicalized<V>,
+        values: ty::CanonicalVarValues<Self::Interner>,
+    ) -> V
+    where
+        V: TypeFoldable<Self::Interner>;
 
     fn instantiate_canonical<V>(
         &self,
@@ -113,7 +127,7 @@ pub trait SolverDelegate: Deref<Target = Self::Infcx> + Sized {
         src: <Self::Interner as Interner>::Ty,
         dst: <Self::Interner as Interner>::Ty,
         assume: Const<Self::Interner>,
-    ) -> Result<Certainty, NoSolution>;
+    ) -> Result<Answer<Region<Self::Interner>, <Self::Interner as Interner>::Ty>, NoSolution>;
 
     /// Obtain canonicalizer state, either by allocating it afresh (the default) or by reusing
     /// previously allocated state.

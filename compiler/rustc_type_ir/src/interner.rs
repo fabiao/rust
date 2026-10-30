@@ -22,7 +22,8 @@ use crate::solve::{
 use crate::visit::{Flags, TypeVisitable};
 use crate::{
     self as ty, AliasTermKind, BoundRegion, BoundVar, CanonicalParamEnvCache, Const, ConstKind,
-    DebruijnIndex, Region, RegionKind, RegionVid, TraitRef, WithCachedTypeInfo, search_graph,
+    DebruijnIndex, Region, RegionKind, RegionVid, TraitRef, ValTreeKind, WithCachedTypeInfo,
+    search_graph,
 };
 
 /// The central trait in the shared abstraction layer, specifying all implementation-specific
@@ -117,6 +118,7 @@ pub trait Interner:
     type Term: Term<Self>;
 
     type BoundVarKinds: BoundVarKinds<Self>;
+    type TypingEnv: TypingEnv<Self>;
 
     type PredefinedOpaques: Copy
         + Debug
@@ -207,7 +209,8 @@ pub trait Interner:
     type ValueConst: ValueConst<Self> + TypeFoldable<Self> + Display;
     type ExprConst: ExprConst<Self>;
     type ValTree: Copy + Debug + Hash + Eq + IntoKind<Kind = ty::ValTreeKind<Self>>;
-    type ScalarInt: Copy + Debug + Hash + Eq;
+    type ScalarInt: ScalarInt<Self>;
+    type Scalar: Copy + Debug + Hash + Eq;
 
     // Kinds of regions
     /// (2026/08/13)
@@ -350,6 +353,15 @@ pub trait Interner:
 
     fn renormalize_rigid_aliases(self) -> bool;
 
+    fn erase_and_anonymize_regions<T: TypeFoldable<Self>>(self, value: T) -> T;
+
+    fn const_eval_resolve_for_typeck(
+        self,
+        typing_env: Self::TypingEnv,
+        ct: ty::AliasConst<Self>,
+        span: Self::Span,
+    ) -> ty::ConstEvalResult<Self>;
+
     fn coroutine_hidden_types(
         self,
         def_id: Self::CoroutineId,
@@ -445,8 +457,6 @@ pub trait Interner:
 
     fn is_trait_lang_item(self, def_id: Self::TraitId, lang_item: SolverTraitLangItem) -> bool;
 
-    fn is_adt_lang_item(self, def_id: Self::AdtId, lang_item: SolverAdtLangItem) -> bool;
-
     fn is_default_trait(self, def_id: Self::TraitId) -> bool;
 
     fn is_sizedness_trait(self, def_id: Self::TraitId) -> bool;
@@ -504,8 +514,6 @@ pub trait Interner:
     /// Returns `true` if this is an `unsafe trait`.
     fn trait_is_unsafe(self, trait_def_id: Self::TraitId) -> bool;
 
-    fn is_impl_trait_in_trait(self, def_id: Self::DefId) -> bool;
-
     fn delay_bug(self, msg: impl ToString) -> Self::ErrorGuaranteed;
     fn span_delayed_bug(self, span: Self::Span, msg: impl ToString) -> Self::ErrorGuaranteed;
 
@@ -539,10 +547,6 @@ pub trait Interner:
 
     fn item_name(self, item_index: Self::DefId) -> Self::Symbol;
 
-    fn get_anon_re_bounds_lifetime(self, idx: usize, var_idx: usize) -> Option<Region<Self>>;
-
-    fn get_anon_re_canonical_bounds_lifetime(self, idx: usize) -> Option<Region<Self>>;
-
     fn get_re_static_lifetime(self) -> Region<Self>;
 
     fn intern_re_var(self, rv: RegionVid) -> Region<Self>;
@@ -557,8 +561,12 @@ pub trait Interner:
 
     fn intern_canonical_bound(self, var: BoundVar) -> Region<Self>;
 
+    fn intern_valtree(self, valtree_kind: ValTreeKind<Self>) -> Self::ValTree;
+
     type CanonicalInput: Copy + Debug + Hash + Eq + Deref<Target = CanonicalInputData<Self>>;
     fn mk_canonical_input(self, data: CanonicalInputData<Self>) -> Self::CanonicalInput;
+
+    fn const_zst(self) -> Self::ValTree;
 }
 
 macro_rules! declare_lift_into {
