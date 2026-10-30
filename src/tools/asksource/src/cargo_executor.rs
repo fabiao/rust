@@ -370,6 +370,13 @@ impl CaptureExecutor {
                 }
             }
             let record = read_json(&self.record_path(key)).ok()?;
+            for publication in record["publication_declarations"].as_array()? {
+                let kind = publication["kind"].as_str()?;
+                let path = Path::new(publication["path"].as_str()?);
+                if !matches!(kind, "bin" | "dylib" | "cdylib" | "rlib" | "staticlib") || !path.is_absolute() {
+                    return None;
+                }
+            }
             let facts = read_json(&self.fact_path(key)).ok()?;
             crate::records::validate(&facts, &self.fact_path(key)).ok()?;
             if let Some(plan) = facts["entry_input_plan_path"].as_str() {
@@ -510,7 +517,7 @@ fn discriminator(source: &Path, suffix: &str) -> String {
 impl Executor for CaptureExecutor {
     fn init(&self, runner: &BuildRunner<'_, '_>, unit: &Unit) {
         let selected = self.selected_by_base.contains_key(&base_key(unit, &self.lto));
-        let publication = unit.target.is_dylib() || unit.target.is_cdylib()
+        let publication = unit.target.is_lib()
             || unit.target.is_bin() || unit.mode.is_any_test();
         if !selected && !publication { return; }
         // Cargo's own LTO assignment: a wrong prediction changes the snapshot.
@@ -548,6 +555,8 @@ impl Executor for CaptureExecutor {
                         Some(cargo::compiler::CrateType::Bin) => "bin",
                         Some(cargo::compiler::CrateType::Dylib) => "dylib",
                         Some(cargo::compiler::CrateType::Cdylib) => "cdylib",
+                        Some(cargo::compiler::CrateType::Lib | cargo::compiler::CrateType::Rlib) => "rlib",
+                        Some(cargo::compiler::CrateType::Staticlib) => "staticlib",
                         _ => continue,
                     };
                     let source = runner.files().output_dir(unit)
@@ -662,7 +671,13 @@ impl Executor for CaptureExecutor {
             .filter(|(name, _)| cmd.get_envs().contains_key(*name))
             .map(|(name, hash)| (name.clone(), hash.clone()))
             .collect();
+        let publications = self.artifact_publications.lock()
+            .map_err(|_| cargo::util::errors::internal("Cargo artifact publication lock poisoned"))?
+            .get(&key).cloned().unwrap_or_default();
+        let publications: Result<Vec<_>, _> = publications.into_iter().map(|(kind, path)|
+            std::path::absolute(path).map(|path| json!({"kind": kind, "path": path}))).collect();
         let record = json!({"request": request, "binding": self.binding(&key), "producer": self.producer,
+            "publication_declarations": publications?,
             "facts_sha256": crate::digest(&fs::read(self.fact_path(&key))?),
             "environment_inputs": facts["environment_inputs"],
             "environment_overrides": overrides,
@@ -1000,6 +1015,17 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
     for (key, outputs) in declarations.iter() {
         for (kind, path) in outputs {
             if kind != "bin" { publications.push((key.clone(), kind.clone(), path.clone())); }
+        }
+    }
+    for key in &executor.selected {
+        if declarations.contains_key(key) { continue; }
+        let record = read_json(&executor.record_path(key))?;
+        for declaration in record["publication_declarations"].as_array()
+            .ok_or("captured unit omits Cargo publication declarations; recapture selected build")? {
+            let kind = declaration["kind"].as_str().ok_or("captured publication omits kind")?;
+            if kind == "bin" { continue; }
+            let path = declaration["path"].as_str().ok_or("captured publication omits path")?;
+            publications.push((key.clone(), kind.to_owned(), PathBuf::from(path)));
         }
     }
     for (key, kind, path) in publications {
