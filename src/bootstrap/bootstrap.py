@@ -600,7 +600,10 @@ class RustBuild(object):
         self.download_url = (
             os.getenv("RUSTUP_DIST_SERVER") or self.stage0_data["dist_server"]
         )
-        self.jobs = self.get_toml("jobs", "build") or "default"
+        if args.ask_source_request and sys.platform == "linux":
+            self.jobs = args.jobs or os.environ.get("CARGO_BUILD_JOBS", "1")
+        else:
+            self.jobs = self.get_toml("jobs", "build") or "default"
 
         self.build = args.build or self.build_triple()
 
@@ -1318,6 +1321,7 @@ def parse_args(args):
     parser.add_argument("--clean", action="store_true")
     parser.add_argument("--ask-source-request")
     parser.add_argument("--ask-source-run")
+    parser.add_argument("-j", "--jobs")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--json-output", action="store_true")
     parser.add_argument(
@@ -1438,6 +1442,18 @@ def main():
         sys.argv[1] = "-h"
 
     args = parse_args(sys.argv)
+
+    if args.ask_source_request and sys.platform == "linux":
+        import runpy
+
+        owner = os.path.join(os.path.dirname(__file__), "..", "tools", "asksource", "src", "resource_budget.py")
+        try:
+            runpy.run_path(owner)["ensure"]([sys.executable] + sys.argv)
+        except (OSError, ValueError) as error:
+            sys.exit("asksource: shared memory containment refused: " + str(error))
+        if args.jobs is None:
+            sys.argv.append("--jobs=" + os.environ["CARGO_BUILD_JOBS"])
+            args = parse_args(sys.argv)
 
     # Root help (e.g., x.py --help) prints help from the saved file to save the time
     if len(sys.argv) == 1 or sys.argv[1] in ["-h", "--help"]:

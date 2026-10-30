@@ -23,6 +23,10 @@ use crate::utils::change_tracker::{
 };
 use crate::utils::helpers::t;
 
+#[path = "../../tools/asksource/src/resource_budget.rs"]
+#[allow(dead_code, reason = "shared source-analysis resource owner")]
+mod resource_budget;
+
 fn is_tracing_enabled() -> bool {
     cfg!(feature = "tracing")
 }
@@ -66,7 +70,18 @@ pub fn main() {
     }
 
     debug!("parsing flags");
-    let flags = Flags::parse(&args);
+    let mut flags = Flags::parse(&args);
+    if flags.ask_source_request.is_some() {
+        match resource_budget::enter() {
+            Ok(Some(code)) => process::exit(code),
+            Ok(None) => {},
+            Err(error) => { eprintln!("asksource: {error}"); process::exit(1); }
+        }
+        if cfg!(target_os = "linux") && flags.jobs.is_none() {
+            flags.jobs = Some(env::var("CARGO_BUILD_JOBS").ok().and_then(|value| value.parse().ok())
+                .filter(|value| *value > 0).unwrap_or(1));
+        }
+    }
     debug!("parsing config based on flags");
     let config = Config::parse(flags);
 

@@ -15,6 +15,8 @@ mod syntax;
 mod semantic;
 mod entry_inputs;
 mod records;
+#[allow(dead_code, reason = "resource owner is shared with Askchef")]
+mod resource_budget;
 mod launcher;
 mod cargo_build;
 #[path = "bootstrap_config.rs"]
@@ -35,6 +37,13 @@ fn main() -> ExitCode {
         }
     }
     if args.get(1).is_some_and(|arg| arg == "asksource") { args.remove(1); }
+    if args.get(1).is_some_and(|arg| matches!(arg.as_str(), "source" | "build" | "sdk-frontend" | "capture")) {
+        match resource_budget::enter() {
+            Ok(Some(code)) => return if code == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE },
+            Ok(None) => {},
+            Err(error) => { eprintln!("asksource: {error}"); return ExitCode::FAILURE; }
+        }
+    }
     let result = match args.get(1).map(String::as_str) {
         Some("source") => syntax::run(),
         Some("identity") => cargo_build::identity(),
