@@ -190,10 +190,19 @@ pub struct FileAttr {
 /// server-side, so readonly is decided by the same bit `OP_CHMOD` sets.
 const MODE_OWNER_WRITE: u32 = 0o200;
 
-/// Permission bits requested for a `DirBuilder`-created directory: owner
-/// read/write/execute plus group and other read/execute, matching the POSIX
-/// `0777 & ~umask` default shells expect. `askfs` applies its own mask.
-const DEFAULT_DIR_MODE: u32 = 0o755;
+/// POSIX creation modes before the process umask removes bits: files are
+/// readable and writable by all, directories also searchable.
+mod creation_mode {
+    pub const FILE: u32 = 0o666;
+    pub const DIRECTORY: u32 = 0o777;
+}
+
+/// The resident owner's umask applied to a creation mode.
+fn masked_mode(mode: u32) -> io::Result<u32> {
+    let mut mask = 0;
+    crate::sys::fd::retry(|error| unsafe { ask_fd::__askfd_get_umask(&mut mask, error) })?;
+    Ok(mode & !mask)
+}
 
 /// Native timestamps are signed nanoseconds from the Unix epoch.
 fn system_time_from_protocol_ns(nanoseconds: i64) -> SystemTime {
@@ -302,10 +311,13 @@ impl OpenOptions {
         self.create_new = create_new;
     }
 
-    fn wire_flags(&self) -> u32 {
+    /// A creating open carries the umask-masked file mode.
+    fn wire_flags(&self) -> io::Result<u32> {
         let mut flags = 0;
         if self.create || self.create_new {
-            flags |= ask_io::fs::OPEN_CREATE;
+            flags |= ask_io::fs::OPEN_CREATE
+                | ask_io::fs::OPEN_MODE_PRESENT
+                | (masked_mode(creation_mode::FILE)? << ask_io::fs::OPEN_MODE_SHIFT);
         }
         if self.truncate {
             flags |= ask_io::fs::OPEN_TRUNCATE;
@@ -316,7 +328,7 @@ impl OpenOptions {
         if self.create_new {
             flags |= ask_io::fs::OPEN_EXCL;
         }
-        flags
+        Ok(flags)
     }
 }
 
@@ -457,7 +469,7 @@ impl File {
             let payload = ask_io::fs::encode_fs_open_request(
                 &mut request,
                 window,
-                opts.wire_flags(),
+                opts.wire_flags()?,
                 rights,
                 relative.as_bytes(),
             )
@@ -642,11 +654,11 @@ impl DirBuilder {
         DirBuilder {}
     }
 
-    /// `askfs` masks the mode to its permission bits server-side; `std`'s
-    /// `DirBuilder` exposes no mode on this target, so request the usual
-    /// owner-writable directory permissions.
+    /// `DirBuilder` exposes no mode on this target, so request the POSIX
+    /// directory mode with the process umask applied.
     pub fn mkdir(&self, path: &Path) -> io::Result<()> {
         let (provider_token, relative) = resolve_fs_path(path)?;
+        let directory_mode = masked_mode(creation_mode::DIRECTORY)?;
         metadata_unit(
             provider_token,
             ask_io::fs::OP_MKDIR,
@@ -654,7 +666,7 @@ impl DirBuilder {
                 ask_io::fs::encode_fs_mkdir_request(
                     request,
                     window,
-                    DEFAULT_DIR_MODE,
+                    directory_mode,
                     relative.as_bytes(),
                 )
                 .is_some()
