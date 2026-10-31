@@ -16,12 +16,56 @@ fn startup_view() -> io::Result<ask_io::view::View> {
     ask_io::view::View::decode_startup(&bytes).map_err(|_| unsupported_err())
 }
 
-/// Map a bound process path to `(provider_token, provider-relative path bytes)`.
+/// Copies the process working directory, a normalized absolute view path.
+pub(crate) fn working_directory(buffer: &mut [u8; ask_io::fs::PATH_MAX]) -> io::Result<&str> {
+    let mut length = 0;
+    crate::sys::fd::retry(|error| unsafe {
+        ask_fd::__askfd_get_cwd(buffer.as_mut_ptr(), buffer.len(), &mut length, error)
+    })?;
+    let bytes = buffer.get(..length).ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+    crate::str::from_utf8(bytes).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))
+}
+
+/// Applies the shared path rule: scheme-less and `file:` paths name the view,
+/// and relative paths follow the working directory.
+pub(crate) fn absolute_view_path<'b>(
+    path: &Path,
+    output: &'b mut [u8; ask_io::fs::PATH_MAX],
+) -> io::Result<&'b str> {
+    use ask_io::path::Error;
+    let path = path.to_str().ok_or_else(|| io::Error::from(io::ErrorKind::InvalidFilename))?;
+    let mut cwd = [0u8; ask_io::fs::PATH_MAX];
+    let cwd = working_directory(&mut cwd)?;
+    ask_io::path::resolve(path, cwd, output).map_err(|error| match error {
+        Error::UnsupportedScheme | Error::NonEmptyAuthority => {
+            io::const_error!(io::ErrorKind::Unsupported, "path names an unsupported location")
+        }
+        Error::Invalid => io::const_error!(io::ErrorKind::InvalidInput, "malformed path"),
+        Error::InvalidWorkingDirectory => io::Error::from(io::ErrorKind::InvalidData),
+        Error::BufferTooSmall => io::Error::from(io::ErrorKind::InvalidFilename),
+    })
+}
+
+/// Maps a view routing refusal to the closest `io::ErrorKind`.
+fn view_error(error: ask_io::view::Error) -> io::Error {
+    use ask_io::view::Error;
+    match error {
+        Error::MissingBinding => io::Error::from(io::ErrorKind::NotFound),
+        Error::ReadOnly => io::Error::from(io::ErrorKind::ReadOnlyFilesystem),
+        Error::BufferTooSmall | Error::RootTableFull => {
+            io::Error::from(io::ErrorKind::InvalidFilename)
+        }
+        Error::InvalidPath | Error::InvalidAccess => io::Error::from(io::ErrorKind::InvalidInput),
+        Error::MalformedStartupView => unsupported_err(),
+    }
+}
+
+/// Map a process path to `(provider_token, provider-relative path bytes)`.
 fn resolve_fs_path(path: &Path) -> io::Result<(u32, heapless_path::PathBuf)> {
-    let path = path.to_str().ok_or_else(unsupported_err)?;
+    let mut absolute = [0u8; ask_io::fs::PATH_MAX];
+    let path = absolute_view_path(path, &mut absolute)?;
     let view = startup_view()?;
-    let resolved =
-        view.resolve(path, ask_io::view::Operation::Read).map_err(|_| unsupported_err())?;
+    let resolved = view.resolve(path, ask_io::view::Operation::Read).map_err(view_error)?;
     let mut encoded = [0u8; ask_io::fs::PATH_MAX];
     let relative = resolved.encode_path(&mut encoded).map_err(|_| unsupported_err())?;
     let mut out = heapless_path::PathBuf::new();

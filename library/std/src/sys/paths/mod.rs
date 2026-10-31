@@ -11,6 +11,18 @@ cfg_select! {
             };
         }
     }
+    target_os = "ask" => {
+        mod ask;
+        #[expect(dead_code)]
+        mod unsupported;
+        mod imp {
+            pub use super::ask::{chdir, getcwd};
+            pub use super::unsupported::{
+                JoinPathsError, SplitPaths, SplitPathsRef, current_exe, home_dir, join_paths,
+                split_paths, split_paths_ref, temp_dir,
+            };
+        }
+    }
     target_os = "motor" => {
         mod motor;
         #[expect(dead_code)]
