@@ -16,7 +16,11 @@ submission to Rust upstream. The current integration contract is in
 [Rust toolchain](../../../../../../../docs/rust-toolchain.md). The
 [RC-00 source-model contract](../../../../../../../docs/implementations/core/static-resource-capacity.md#source-model-cutover-contract)
 owns the unfinished inventory and admission replacement; this README describes
-the implemented tool rather than changing that contract.
+the implemented tool rather than changing that contract. The
+[preview assurance policy](../../../../../../../docs/testing.md#pre-alpha-capacity-assurance)
+limits which capacity evidence must block first publication. This tool still
+produces complete facts for a requested capture; its correctness and freshness
+checks are not relaxed. Shared admission migration remains pending.
 
 ## Purpose and boundaries
 
