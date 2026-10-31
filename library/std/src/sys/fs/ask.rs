@@ -63,7 +63,18 @@ fn view_error(error: ask_io::view::Error) -> io::Error {
 /// Map a process path to `(provider_token, provider-relative path bytes)`.
 fn resolve_fs_path(path: &Path) -> io::Result<(u32, heapless_path::PathBuf)> {
     let mut absolute = [0u8; ask_io::fs::PATH_MAX];
-    let path = absolute_view_path(path, &mut absolute)?;
+    resolve_absolute(absolute_view_path(path, &mut absolute)?)
+}
+
+/// No provider serves the view root, so every provider operation on it is
+/// refused; `stat` and listing answer it locally.
+fn resolve_absolute(path: &str) -> io::Result<(u32, heapless_path::PathBuf)> {
+    if path == ask_io::path::ROOT {
+        return Err(io::const_error!(
+            io::ErrorKind::ReadOnlyFilesystem,
+            "fs: the view root holds only mount points",
+        ));
+    }
     let view = startup_view()?;
     let resolved = view.resolve(path, ask_io::view::Operation::Read).map_err(view_error)?;
     let mut encoded = [0u8; ask_io::fs::PATH_MAX];
@@ -402,7 +413,12 @@ fn metadata_unit<const N: usize>(
 /// Shared path query; the provider performs final-symlink traversal according
 /// to the request flag in the same namespace operation as metadata lookup.
 fn stat_path(path: &Path, nofollow: bool) -> io::Result<FileAttr> {
-    let (provider_token, relative) = resolve_fs_path(path)?;
+    let mut absolute = [0u8; ask_io::fs::PATH_MAX];
+    let absolute = absolute_view_path(path, &mut absolute)?;
+    if absolute == ask_io::path::ROOT {
+        return Ok(FileAttr::from_metadata(ask_io::path::root_metadata()));
+    }
+    let (provider_token, relative) = resolve_absolute(absolute)?;
     metadata_call(
         provider_token,
         ask_io::fs::OP_METADATA,
@@ -658,6 +674,9 @@ pub struct ReadDir {
     root: PathBuf,
     cookie: ask_io::fs::DirCookie,
     exhausted: bool,
+    /// For the view root: which mounts are bound, listed in `MOUNTS` order.
+    mounts: Option<[bool; ask_abi::view::BINDINGS]>,
+    next_mount: usize,
 }
 
 impl crate::fmt::Debug for ReadDir {
@@ -671,6 +690,22 @@ impl Iterator for ReadDir {
 
     fn next(&mut self) -> Option<io::Result<DirEntry>> {
         if self.exhausted {
+            return None;
+        }
+        if let Some(bound) = self.mounts {
+            while let (Some(&present), Some(&mount)) =
+                (bound.get(self.next_mount), ask_io::view::MOUNTS.get(self.next_mount))
+            {
+                self.next_mount += 1;
+                if present {
+                    return Some(Ok(DirEntry {
+                        path: self.root.join(mount.name()),
+                        name: OsString::from(mount.name()),
+                        kind: ask_io::fs::NodeKind::Directory as u8,
+                    }));
+                }
+            }
+            self.exhausted = true;
             return None;
         }
         let cookie = self.cookie;
@@ -751,13 +786,29 @@ impl DirEntry {
 }
 
 pub fn readdir(path: &Path) -> io::Result<ReadDir> {
-    let (provider_token, relative) = resolve_fs_path(path)?;
+    let mut absolute = [0u8; ask_io::fs::PATH_MAX];
+    let absolute = absolute_view_path(path, &mut absolute)?;
+    if absolute == ask_io::path::ROOT {
+        let view = startup_view()?;
+        return Ok(ReadDir {
+            provider_token: 0,
+            relative: heapless_path::PathBuf::new(),
+            root: path.to_path_buf(),
+            cookie: ask_io::fs::DirCookie::default(),
+            exhausted: false,
+            mounts: Some(ask_io::view::MOUNTS.map(|mount| view.binding_present(mount))),
+            next_mount: 0,
+        });
+    }
+    let (provider_token, relative) = resolve_absolute(absolute)?;
     Ok(ReadDir {
         provider_token,
         relative,
         root: path.to_path_buf(),
         cookie: ask_io::fs::DirCookie::default(),
         exhausted: false,
+        mounts: None,
+        next_mount: 0,
     })
 }
 
