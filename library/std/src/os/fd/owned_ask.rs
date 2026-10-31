@@ -132,6 +132,14 @@ impl From<OwnedFd> for crate::fs::File {
         Self::from_inner(FromInner::from_inner(FromInner::from_inner(fd)))
     }
 }
+#[stable(feature = "io_safety", since = "1.63.0")]
+impl From<OwnedFd> for crate::process::Stdio {
+    fn from(fd: OwnedFd) -> Self {
+        use crate::sys::FromInner;
+        let fd = crate::sys::fd::FileDesc::from_inner(fd);
+        Self::from_inner(crate::sys::process::Stdio::Fd(fd))
+    }
+}
 #[stable(feature = "is_terminal", since = "1.70.0")]
 impl io::IsTerminal for OwnedFd {
     fn is_terminal(&self) -> bool {

@@ -3,6 +3,7 @@
 #![stable(feature = "rust1", since = "1.0.0")]
 
 pub mod ffi;
+pub mod fs;
 
 /// Drain buffered standard output without driving an executor.
 #[doc(hidden)]
@@ -19,4 +20,7 @@ pub mod prelude {
     #[doc(no_inline)]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub use super::ffi::{OsStrExt, OsStringExt};
+    #[doc(no_inline)]
+    #[stable(feature = "rust1", since = "1.0.0")]
+    pub use super::fs::MetadataExt;
 }

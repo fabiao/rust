@@ -100,35 +100,30 @@ impl FilePermissions {
     }
 }
 
+/// The provider's `ask_io::fs::NodeKind` byte, from metadata or a directory entry.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FileType {
-    is_dir: bool,
+    kind: u8,
 }
 
 impl FileType {
     pub fn is_dir(&self) -> bool {
-        self.is_dir
+        self.kind == ask_io::fs::NodeKind::Directory as u8
     }
 
     pub fn is_file(&self) -> bool {
-        !self.is_dir
+        self.kind == ask_io::fs::NodeKind::File as u8
     }
 
-    /// Symlink targets are currently resolved provider-side before this PAL.
     pub fn is_symlink(&self) -> bool {
-        false
+        self.kind == ask_io::fs::NodeKind::Symlink as u8
     }
 }
 
-/// Provider metadata for a path or open handle. `askfs` carries no creation
-/// timestamp, so `created()` stays unsupported.
+/// Provider metadata for a path or open handle.
 #[derive(Clone)]
 pub struct FileAttr {
-    size: u64,
-    mode: u32,
-    is_dir: bool,
-    accessed_ns: i64,
-    modified_ns: i64,
+    metadata: ask_io::fs::Metadata,
 }
 
 /// The native metadata mode's owner-write bit.
@@ -164,39 +159,40 @@ fn protocol_ns_from_system_time(time: SystemTime) -> io::Result<i64> {
 
 impl FileAttr {
     fn from_metadata(metadata: ask_io::fs::Metadata) -> FileAttr {
-        FileAttr {
-            size: metadata.size,
-            mode: metadata.mode,
-            is_dir: metadata.kind == ask_io::fs::NodeKind::Directory as u8,
-            accessed_ns: metadata.atime_ns,
-            modified_ns: metadata.mtime_ns,
-        }
+        FileAttr { metadata }
+    }
+
+    /// The complete provider record behind `std::os::ask::fs::MetadataExt`.
+    pub fn native(&self) -> &ask_io::fs::Metadata {
+        &self.metadata
     }
 
     pub fn size(&self) -> u64 {
-        self.size
+        self.metadata.size
     }
 
     pub fn perm(&self) -> FilePermissions {
-        FilePermissions { readonly: self.mode & MODE_OWNER_WRITE == 0 }
+        FilePermissions { readonly: self.metadata.mode & MODE_OWNER_WRITE == 0 }
     }
 
     pub fn file_type(&self) -> FileType {
-        FileType { is_dir: self.is_dir }
+        FileType { kind: self.metadata.kind }
     }
 
     pub fn modified(&self) -> io::Result<SystemTime> {
-        Ok(system_time_from_protocol_ns(self.modified_ns))
+        Ok(system_time_from_protocol_ns(self.metadata.mtime_ns))
     }
 
     pub fn accessed(&self) -> io::Result<SystemTime> {
-        Ok(system_time_from_protocol_ns(self.accessed_ns))
+        Ok(system_time_from_protocol_ns(self.metadata.atime_ns))
     }
 
-    /// `askfs` stores a change time, not a creation time, so no value here
-    /// would satisfy `std`'s "created" contract.
+    /// Providers without a birth time leave its metadata flag clear.
     pub fn created(&self) -> io::Result<SystemTime> {
-        unsupported()
+        if self.metadata.flags & ask_io::fs::METADATA_HAS_BIRTH_TIME == 0 {
+            return unsupported();
+        }
+        Ok(system_time_from_protocol_ns(self.metadata.btime_ns))
     }
 }
 
@@ -503,7 +499,7 @@ impl File {
         self.descriptor.try_clone().map(|descriptor| Self { descriptor })
     }
     pub fn set_permissions(&self, permissions: FilePermissions) -> io::Result<()> {
-        let mut mode = self.file_attr()?.mode;
+        let mut mode = self.file_attr()?.metadata.mode;
         if permissions.readonly {
             mode &= !MODE_OWNER_WRITE;
         } else {
@@ -675,7 +671,7 @@ impl Iterator for ReadDir {
         Some(Ok(DirEntry {
             path: self.root.join(name),
             name: OsString::from(name),
-            is_dir: kind == ask_io::fs::NodeKind::Directory as u8,
+            kind,
         }))
     }
 }
@@ -683,7 +679,7 @@ impl Iterator for ReadDir {
 pub struct DirEntry {
     path: PathBuf,
     name: OsString,
-    is_dir: bool,
+    kind: u8,
 }
 
 impl DirEntry {
@@ -701,7 +697,7 @@ impl DirEntry {
     }
 
     pub fn file_type(&self) -> io::Result<FileType> {
-        Ok(FileType { is_dir: self.is_dir })
+        Ok(FileType { kind: self.kind })
     }
 }
 
@@ -742,18 +738,11 @@ pub fn rename(old: &Path, new: &Path) -> io::Result<()> {
     if old_provider != new_provider {
         return Err(io::const_error!(io::ErrorKind::CrossesDevices, "fs: rename across providers"));
     }
-    metadata_unit(
+    two_path_unit(
         old_provider,
         ask_io::fs::OP_RENAME,
-        |request: &mut [u8; ask_io::fs::FS_TWO_PATH_REQUEST_LEN], window| {
-            ask_io::fs::encode_fs_two_path_request(
-                request,
-                window,
-                old_relative.as_bytes(),
-                new_relative.as_bytes(),
-            )
-            .is_some()
-        },
+        old_relative.as_bytes(),
+        new_relative.as_bytes(),
         "fs: rename failed",
     )
 }
@@ -788,16 +777,90 @@ pub fn exists(path: &Path) -> io::Result<bool> {
     }
 }
 
-pub fn readlink(_path: &Path) -> io::Result<PathBuf> {
-    unsupported()
+/// Returns the stored target bytes; an absolute target was stored provider-relative.
+pub fn readlink(path: &Path) -> io::Result<PathBuf> {
+    let (provider_token, relative) = resolve_fs_path(path)?;
+    let mut channel =
+        SyncChannel::create_leased(provider_token, ask_io::fs::path_window::CHANNEL_PAGES)
+            .map_err(|_| io::const_error!(io::ErrorKind::NotFound, "fs provider unreachable"))?;
+    let mut request = [0u8; ask_io::fs::FS_PATH_REQUEST_LEN];
+    let window = channel
+        .shared_region_mut(ask_io::fs::path_window::OFFSET, ask_io::fs::path_window::LEN)
+        .ok_or_else(unsupported_err)?;
+    if ask_io::fs::encode_fs_path_request(&mut request, window, relative.as_bytes()).is_none() {
+        return Err(io::const_error!(io::ErrorKind::InvalidFilename, "fs: path too long"));
+    }
+    let completion = channel.call(ask_io::fs::OP_READLINK, &request)?;
+    if completion.result < 0 {
+        return Err(fs_error(completion.result, "fs: readlink failed"));
+    }
+    let window = channel
+        .shared_region_mut(ask_io::fs::path_window::OFFSET, ask_io::fs::path_window::LEN)
+        .ok_or_else(unsupported_err)?;
+    let target = ask_io::fs::decode_fs_readlink_reply(completion.payload(), window)
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+    let target = crate::str::from_utf8(target)
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
+    Ok(PathBuf::from(target))
 }
 
-pub fn symlink(_original: &Path, _link: &Path) -> io::Result<()> {
-    unsupported()
+/// A relative target is stored verbatim; an absolute one must name the
+/// link's own provider and is stored provider-relative, as askposix does.
+pub fn symlink(original: &Path, link: &Path) -> io::Result<()> {
+    let (provider_token, link_relative) = resolve_fs_path(link)?;
+    let target = if original.is_absolute() {
+        let (target_provider, target_relative) = resolve_fs_path(original)?;
+        if target_provider != provider_token {
+            return Err(io::const_error!(
+                io::ErrorKind::CrossesDevices,
+                "fs: symlink target on another provider",
+            ));
+        }
+        target_relative
+    } else {
+        let mut target = heapless_path::PathBuf::new();
+        target.push(original.to_str().ok_or_else(unsupported_err)?.as_bytes())?;
+        target
+    };
+    two_path_unit(
+        provider_token,
+        ask_io::fs::OP_SYMLINK,
+        target.as_bytes(),
+        link_relative.as_bytes(),
+        "fs: symlink failed",
+    )
 }
 
-pub fn link(_src: &Path, _dst: &Path) -> io::Result<()> {
-    unsupported()
+pub fn link(original: &Path, link: &Path) -> io::Result<()> {
+    let (provider_token, original_relative) = resolve_fs_path(original)?;
+    let (link_provider, link_relative) = resolve_fs_path(link)?;
+    if link_provider != provider_token {
+        return Err(io::const_error!(io::ErrorKind::CrossesDevices, "fs: link across providers"));
+    }
+    two_path_unit(
+        provider_token,
+        ask_io::fs::OP_LINK,
+        original_relative.as_bytes(),
+        link_relative.as_bytes(),
+        "fs: link failed",
+    )
+}
+
+fn two_path_unit(
+    provider_token: u32,
+    op: u32,
+    first: &[u8],
+    second: &[u8],
+    failure: &'static str,
+) -> io::Result<()> {
+    metadata_unit(
+        provider_token,
+        op,
+        |request: &mut [u8; ask_io::fs::FS_TWO_PATH_REQUEST_LEN], window| {
+            ask_io::fs::encode_fs_two_path_request(request, window, first, second).is_some()
+        },
+        failure,
+    )
 }
 
 pub fn stat(path: &Path) -> io::Result<FileAttr> {
