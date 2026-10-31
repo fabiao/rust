@@ -118,6 +118,11 @@ impl FileType {
     pub fn is_symlink(&self) -> bool {
         self.kind == ask_io::fs::NodeKind::Symlink as u8
     }
+
+    /// The `ask_io::fs::NodeKind` byte behind `std::os::ask::fs::FileTypeExt`.
+    pub fn kind(&self) -> u8 {
+        self.kind
+    }
 }
 
 /// Provider metadata for a path or open handle.

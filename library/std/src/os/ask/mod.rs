@@ -22,5 +22,5 @@ pub mod prelude {
     pub use super::ffi::{OsStrExt, OsStringExt};
     #[doc(no_inline)]
     #[stable(feature = "rust1", since = "1.0.0")]
-    pub use super::fs::MetadataExt;
+    pub use super::fs::{FileTypeExt, MetadataExt};
 }

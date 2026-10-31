@@ -79,6 +79,40 @@ impl MetadataExt for fs::Metadata {
     }
 }
 
+/// ASK-specific extensions to [`fs::FileType`] for the node kinds a provider
+/// reports beyond files, directories and symbolic links.
+#[stable(feature = "rust1", since = "1.0.0")]
+pub trait FileTypeExt {
+    /// Returns `true` if this file type is a block device.
+    #[stable(feature = "rust1", since = "1.0.0")]
+    fn is_block_device(&self) -> bool;
+    /// Returns `true` if this file type is a character device.
+    #[stable(feature = "rust1", since = "1.0.0")]
+    fn is_char_device(&self) -> bool;
+    /// Returns `true` if this file type is a FIFO.
+    #[stable(feature = "rust1", since = "1.0.0")]
+    fn is_fifo(&self) -> bool;
+    /// Returns `true` if this file type is a socket.
+    #[stable(feature = "rust1", since = "1.0.0")]
+    fn is_socket(&self) -> bool;
+}
+
+#[stable(feature = "rust1", since = "1.0.0")]
+impl FileTypeExt for fs::FileType {
+    fn is_block_device(&self) -> bool {
+        self.as_inner().kind() == ask_io::fs::NodeKind::Block as u8
+    }
+    fn is_char_device(&self) -> bool {
+        self.as_inner().kind() == ask_io::fs::NodeKind::Character as u8
+    }
+    fn is_fifo(&self) -> bool {
+        self.as_inner().kind() == ask_io::fs::NodeKind::Fifo as u8
+    }
+    fn is_socket(&self) -> bool {
+        self.as_inner().kind() == ask_io::fs::NodeKind::Socket as u8
+    }
+}
+
 /// Creates a new symbolic link at `link` pointing to `original`.
 ///
 /// A relative `original` is stored as given. An absolute `original` must be
