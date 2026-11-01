@@ -163,6 +163,17 @@ class GenerateAndParseConfig(unittest.TestCase):
         self.assertEqual(build.get_toml("profile"), "dist")
         self.assertIsNone(build.get_toml("llvm.download-ci-llvm"))
 
+    def test_capture_preserves_bootstrap_parallelism(self):
+        args = bootstrap.FakeArgs()
+        args.ask_source_request = "capture.json"
+        with patch.dict(os.environ, {}, clear=True):
+            for options, expected in (([], "default"), (["--set", "build.jobs=7"], "7")):
+                with self.subTest(options=options):
+                    ordinary = serialize_and_parse(options)
+                    captured = serialize_and_parse(options, args)
+                    self.assertEqual(ordinary.jobs, expected)
+                    self.assertEqual(captured.jobs, ordinary.jobs)
+
     def test_set_section(self):
         build = serialize_and_parse(["--set", "llvm.download-ci-llvm"])
         self.assertEqual(build.get_toml("download-ci-llvm", section="llvm"), "true")

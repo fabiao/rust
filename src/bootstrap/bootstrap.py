@@ -600,10 +600,7 @@ class RustBuild(object):
         self.download_url = (
             os.getenv("RUSTUP_DIST_SERVER") or self.stage0_data["dist_server"]
         )
-        if args.ask_source_request and sys.platform == "linux":
-            self.jobs = args.jobs or os.environ.get("CARGO_BUILD_JOBS", "1")
-        else:
-            self.jobs = self.get_toml("jobs", "build") or "default"
+        self.jobs = self.get_toml("jobs", "build") or "default"
 
         self.build = args.build or self.build_triple()
 
@@ -1451,9 +1448,6 @@ def main():
             runpy.run_path(owner)["ensure"]([sys.executable] + sys.argv)
         except (OSError, ValueError) as error:
             sys.exit("asksource: shared memory containment refused: " + str(error))
-        if args.jobs is None:
-            sys.argv.append("--jobs=" + os.environ["CARGO_BUILD_JOBS"])
-            args = parse_args(sys.argv)
 
     # Root help (e.g., x.py --help) prints help from the saved file to save the time
     if len(sys.argv) == 1 or sys.argv[1] in ["-h", "--help"]:

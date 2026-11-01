@@ -70,16 +70,12 @@ pub fn main() {
     }
 
     debug!("parsing flags");
-    let mut flags = Flags::parse(&args);
+    let flags = Flags::parse(&args);
     if flags.ask_source_request.is_some() {
         match resource_budget::enter() {
             Ok(Some(code)) => process::exit(code),
             Ok(None) => {},
             Err(error) => { eprintln!("asksource: {error}"); process::exit(1); }
-        }
-        if cfg!(target_os = "linux") && flags.jobs.is_none() {
-            flags.jobs = Some(env::var("CARGO_BUILD_JOBS").ok().and_then(|value| value.parse().ok())
-                .filter(|value| *value > 0).unwrap_or(1));
         }
     }
     debug!("parsing config based on flags");
