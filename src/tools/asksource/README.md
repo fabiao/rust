@@ -142,9 +142,15 @@ executor reproduces that computation while planning. `init` then rebuilds the
 graph snapshot from the `BuildRunner`'s actual assignment, so any difference
 refuses the capture as a changed graph.
 
-Cargo announces a unit to the executor only when it compiles it. A binary that
-stays fresh is therefore identified by the single graph unit whose descriptor
-matches the one Cargo reports for it; no match or several matches refuse.
+Output declarations are collected from Cargo's prepared layout for every
+library, binary and test unit, including fresh registry dependencies outside
+the compiler-fact selection. Dirty-unit callbacks verify the same declarations;
+publication retains the typed producer and hashes the exact output. Archive
+paths are never reconstructed from sibling metadata filenames.
+
+Cargo reports binary outputs after compilation. Each reported binary must
+match one prepared typed declaration and its exact unit descriptor; missing or
+ambiguous declarations refuse, including when every unit stays fresh.
 
 The selected Cargo executable must report a source commit supported by an exact
 embedded adapter. The package currently contains adapters for its in-tree Cargo

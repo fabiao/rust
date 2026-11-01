@@ -80,12 +80,6 @@ def contained(memory, swap):
     return True
 
 
-def jobs():
-    value = os.environ.setdefault("CARGO_BUILD_JOBS", "1")
-    if not value.isascii() or not value.isdecimal() or int(value) < 1:
-        raise BudgetError("CARGO_BUILD_JOBS must be a positive integer for analysis")
-
-
 def metrics(group):
     values = []
     for filename in ("memory.peak", "memory.swap.peak", "memory.events"):
@@ -125,8 +119,7 @@ def launch(command, memory, swap):
         if group is None:
             raise BudgetError("user manager did not activate the analysis slice")
         validate_group(group, memory, swap)
-        print(f"asksource: shared budget memory={memory} swap={swap} jobs="
-              + os.environ["CARGO_BUILD_JOBS"], file=sys.stderr, flush=True)
+        print(f"asksource: shared budget memory={memory} swap={swap}", file=sys.stderr, flush=True)
         before = metrics(group)
         try:
             result = subprocess.run(["systemd-run", "--user", "--scope", "--quiet",
@@ -142,7 +135,6 @@ def ensure(command):
     if sys.platform != "linux":
         return
     memory, swap = budgets()
-    jobs()
     if not contained(memory, swap):
         raise SystemExit(launch(command, memory, swap))
 
@@ -152,7 +144,6 @@ def main(arguments):
         if sys.platform != "linux":
             return 0
         memory, swap = budgets()
-        jobs()
         return 0 if contained(memory, swap) else 1
     if len(arguments) < 2 or arguments[0] != "--":
         raise BudgetError("usage: resource_budget.py -- COMMAND [ARGUMENTS...]")

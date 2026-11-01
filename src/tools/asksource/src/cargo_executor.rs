@@ -514,6 +514,37 @@ fn discriminator(source: &Path, suffix: &str) -> String {
     format!("{}:{suffix}", source.display())
 }
 
+fn publication_outputs(runner: &BuildRunner<'_, '_>, unit: &Unit)
+    -> Result<Vec<(String, PathBuf)>, String>
+{
+    let info = runner.bcx.target_data.info(unit.kind);
+    let target = runner.bcx.target_data.short_name(&unit.kind);
+    let (types, _) = info.rustc_outputs(unit.mode, unit.target.kind(), target)
+        .map_err(|error| error.to_string())?;
+    let outputs = runner.outputs(unit).map_err(|error| error.to_string())?;
+    let metadata = runner.files().metadata(unit).c_extra_filename().map(|hash| hash.to_string());
+    let mut result = Vec::new();
+    for file_type in types {
+        if !matches!(file_type.flavor, cargo::compiler::FileFlavor::Normal | cargo::compiler::FileFlavor::Linkable) {
+            continue;
+        }
+        let kind = match file_type.crate_type {
+            Some(cargo::compiler::CrateType::Bin) => "bin",
+            Some(cargo::compiler::CrateType::Dylib) => "dylib",
+            Some(cargo::compiler::CrateType::Cdylib) => "cdylib",
+            Some(cargo::compiler::CrateType::Lib | cargo::compiler::CrateType::Rlib) => "rlib",
+            Some(cargo::compiler::CrateType::Staticlib) => "staticlib",
+            _ => continue,
+        };
+        let source = runner.files().output_dir(unit)
+            .join(file_type.output_filename(&unit.target, metadata.as_deref()));
+        let output = outputs.iter().find(|output| output.path == source)
+            .ok_or("typed Cargo artifact output has no publication record")?;
+        result.push((kind.to_owned(), output.bin_dst().clone()));
+    }
+    Ok(result)
+}
+
 impl Executor for CaptureExecutor {
     fn init(&self, runner: &BuildRunner<'_, '_>, unit: &Unit) {
         let selected = self.selected_by_base.contains_key(&base_key(unit, &self.lto));
@@ -539,34 +570,7 @@ impl Executor for CaptureExecutor {
             return;
         };
         if publication {
-            let publication = (|| -> Result<Vec<(String, PathBuf)>, String> {
-                let info = runner.bcx.target_data.info(unit.kind);
-                let target = runner.bcx.target_data.short_name(&unit.kind);
-                let (types, _) = info.rustc_outputs(unit.mode, unit.target.kind(), target)
-                    .map_err(|error| error.to_string())?;
-                let outputs = runner.outputs(unit).map_err(|error| error.to_string())?;
-                let metadata = runner.files().metadata(unit).c_extra_filename().map(|hash| hash.to_string());
-                let mut result = Vec::new();
-                for file_type in types {
-                    if !matches!(file_type.flavor, cargo::compiler::FileFlavor::Normal | cargo::compiler::FileFlavor::Linkable) {
-                        continue;
-                    }
-                    let kind = match file_type.crate_type {
-                        Some(cargo::compiler::CrateType::Bin) => "bin",
-                        Some(cargo::compiler::CrateType::Dylib) => "dylib",
-                        Some(cargo::compiler::CrateType::Cdylib) => "cdylib",
-                        Some(cargo::compiler::CrateType::Lib | cargo::compiler::CrateType::Rlib) => "rlib",
-                        Some(cargo::compiler::CrateType::Staticlib) => "staticlib",
-                        _ => continue,
-                    };
-                    let source = runner.files().output_dir(unit)
-                        .join(file_type.output_filename(&unit.target, metadata.as_deref()));
-                    let output = outputs.iter().find(|output| output.path == source)
-                        .ok_or("typed Cargo artifact output has no publication record")?;
-                    result.push((kind.to_owned(), output.bin_dst().clone()));
-                }
-                Ok(result)
-            })();
+            let publication = publication_outputs(runner, unit);
             match publication {
                 Ok(outputs) => match self.artifact_publications.lock() {
                     Ok(mut declarations) => {
@@ -917,6 +921,17 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
         selected.insert(key.clone());
         selected_by_base.entry(base_key(unit, &lto)).or_default().insert(key);
     }
+    let mut artifact_publications = BTreeMap::new();
+    {
+        let mut runner = BuildRunner::new(&bcx).map_err(|error| error.to_string())?;
+        runner.lto = predicted_lto(&bcx).into_iter().collect();
+        runner.prepare_units().map_err(|error| error.to_string())?;
+        for (unit, key) in &graph_snapshot.keys {
+            if unit.target.is_lib() || unit.target.is_bin() || unit.mode.is_any_test() {
+                artifact_publications.insert(key.clone(), publication_outputs(&runner, unit)?);
+            }
+        }
+    }
     let executor = Arc::new(CaptureExecutor {
         request,
         request_path,
@@ -932,7 +947,7 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
         selected_by_base,
         lto,
         dispatch: Mutex::new(BTreeMap::new()),
-        artifact_publications: Mutex::new(BTreeMap::new()),
+        artifact_publications: Mutex::new(artifact_publications),
         errors: Mutex::new(Vec::new()),
         compiled_build_script: AtomicBool::new(false),
     });
@@ -992,40 +1007,12 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
                 }
             }
         }
-        // Cargo calls `Executor::init` only for dirty units, so a fresh binary has
-        // no declaration; its graph unit is then the one sharing its descriptor.
-        let key = match identity {
-            Some(key) => key,
-            None => {
-                let unit = descriptor(&output.unit, &executor.lto);
-                let mut matches = executor.graph["units"].as_object()
-                    .ok_or("capture graph omits units")?
-                    .iter()
-                    .filter(|(_, node)| node["unit"] == unit)
-                    .map(|(key, _)| key.clone());
-                let key = matches.next().ok_or("published artifact has no captured Cargo unit identity")?;
-                if matches.next().is_some() {
-                    return Err("published Cargo binary has an ambiguous unit identity".into());
-                }
-                key
-            }
-        };
+        let key = identity.ok_or("published Cargo binary has no typed output declaration")?;
         publications.push((key, "bin".to_owned(), path));
     }
     for (key, outputs) in declarations.iter() {
         for (kind, path) in outputs {
             if kind != "bin" { publications.push((key.clone(), kind.clone(), path.clone())); }
-        }
-    }
-    for key in &executor.selected {
-        if declarations.contains_key(key) { continue; }
-        let record = read_json(&executor.record_path(key))?;
-        for declaration in record["publication_declarations"].as_array()
-            .ok_or("captured unit omits Cargo publication declarations; recapture selected build")? {
-            let kind = declaration["kind"].as_str().ok_or("captured publication omits kind")?;
-            if kind == "bin" { continue; }
-            let path = declaration["path"].as_str().ok_or("captured publication omits path")?;
-            publications.push((key.clone(), kind.to_owned(), PathBuf::from(path)));
         }
     }
     for (key, kind, path) in publications {
