@@ -118,6 +118,14 @@ impl AsFd for crate::fs::File {
         crate::sys::AsInner::as_inner(self).as_fd()
     }
 }
+
+/// An ASK `Dir` is a resident directory descriptor, so it can be inspected as one.
+#[unstable(feature = "dirfd", issue = "120426")]
+impl AsFd for crate::fs::Dir {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        crate::sys::AsInner::as_inner(self).as_fd()
+    }
+}
 #[stable(feature = "io_safety", since = "1.63.0")]
 impl From<crate::fs::File> for OwnedFd {
     fn from(file: crate::fs::File) -> Self {

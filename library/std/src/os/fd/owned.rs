@@ -324,16 +324,6 @@ impl AsFd for fs::File {
     }
 }
 
-/// An ASK `Dir` is a resident directory descriptor, so it can be inspected as one.
-#[unstable(feature = "dirfd", issue = "120426")]
-#[cfg(target_os = "ask")]
-impl AsFd for fs::Dir {
-    #[inline]
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        self.as_inner().as_fd()
-    }
-}
-
 #[stable(feature = "io_safety", since = "1.63.0")]
 #[cfg(not(target_os = "trusty"))]
 impl From<fs::File> for OwnedFd {
