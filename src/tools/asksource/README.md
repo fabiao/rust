@@ -46,30 +46,42 @@ raw source. Askchef owns recipe selection and build preparation. Rust bootstrap
 owns SDK build preparation and helper installation. Native Cargo owns dependency
 resolution, unit scheduling, freshness, locks, and compilation.
 
-## Validation cadence and run scope
+## Authorization and optional long analysis
 
-Use `asksource` periodically to assess substantial integrated code across defined
-contexts, rather than configuring capture for every implementation. Before every
-invocation, including syntax-only and diagnostic runs, state the purpose,
-source/build scope, targets/features/compiler roles, exclusions, expected
-rebuilds and estimated elapsed-time range. Reuse valid facts and existing graph
-selectors; report actual elapsed cost, coverage and memory observations afterward.
-Follow the [run procedure](../../../../../../../docs/development-workflow.md#periodic-validation-and-declared-runs).
-For broad or overnight work, use the
-[unattended batch procedure](../../../../../../../docs/development-workflow.md#unattended-analysis-batches):
-prepare contexts and stable inputs, coordinate pauses of conflicting editing
-agents, complete the declared sequence and record per-context outcomes without
-intermediate user prompts, then release owned pauses. The diary is not a session
-suspension mechanism; unattended readiness requires the necessary host controls.
-Estimates never authorize a Cargo timeout; required current publication facts
-retain their exact-input checks.
+`asksource` is an optional enhancement, never an implementation dependency,
+completion gate or routine validator. Missing/stale analysis, absent helpers,
+failed analysis and withheld approval do not stop feature work, independent
+functional tests, release builds or integration. The tool's own complete-fact
+requirements constrain only a requested analysis claim.
 
-Memory monitoring/containment applies only to explicit analysis and its reader,
-compiler and bootstrap descendants. CPU use must remain unrestricted, including
-Cargo parallelism; ordinary Cargo builds and assembly need no special resource
-limits. The launcher preserves Cargo's parallelism configuration. Ordinary
-admission and syntax snapshots inherit caller resources. Explicit analysis
-entry points own containment; compiler-capture APIs still require it.
+Only long checks over a substantial integrated code surface after multiple
+completed features are eligible. Before any direct or indirect invocation,
+prepare exact commands/contexts/graphs, exclusions, evidence reuse, expected
+rebuilds, time/resource estimates, stable inputs and failure handling; then
+receive explicit user approval of that named batch. Syntax-only, diagnostic,
+test, SDK/bootstrap, Python reader and preflight calls have no exemption.
+General implementation/test/publication permission is insufficient. New batches
+and retries outside the approved sequence require fresh approval. Follow the
+[authorization procedure](../../../../../../../docs/development-workflow.md#periodic-validation-and-declared-runs).
+Commands and examples below are reference material for approved batches only;
+small examples do not establish an eligible batch.
+
+Approved batches require an exclusive agent window: all other agents sharing
+the host, including disjoint work and other checkouts/worktrees, acknowledge
+safe-boundary pauses before invocation. Prevent new activities until every
+analysis descendant exits and the coordinator explicitly releases the hold.
+Do not spawn agents or start unrelated work. If the host cannot enforce the
+hold, release acquired pauses and defer analysis, not implementation. Let
+existing Cargo finish naturally; internal Cargo parallelism stays unrestricted.
+Approved batches use the
+[unattended procedure](../../../../../../../docs/development-workflow.md#unattended-analysis-batches),
+retain memory containment over readers/compiler/bootstrap descendants and leave
+CPU unrestricted. Report actual elapsed cost, coverage, failures and memory
+observations. No Cargo deadlines or artificial job caps apply. Existing ordinary
+admission can still launch the syntax helper outside containment; this
+[implementation gap](../../../../../../../docs/rust-toolchain.md#linux-analysis-memory-budget)
+is not permission for routine validation. Executable consent enforcement and
+preflight repair are not implemented by this documentation change.
 
 ## Implemented capabilities
 
@@ -378,6 +390,8 @@ receipt validation consistent across those callers.
 
 The retained host contract suite is
 [`tools/test_rust_source_model.py`](../../../../../../../tools/test_rust_source_model.py).
+This suite invokes the tool. Run it only as a listed stage of an explicitly
+user-approved qualifying long analysis batch, never as an implementation check.
 From the ASK checkout root, after provisioning matching helpers:
 
 ```sh
