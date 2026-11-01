@@ -186,7 +186,7 @@ impl Capture {
         }
         let request: Value = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
         let fields = request.as_object().ok_or("entry input request must be an object")?;
-        if fields.len() != 6
+        if fields.len() != 7
             || fields.keys().any(|key| {
                 !matches!(
                     key.as_str(),
@@ -196,6 +196,7 @@ impl Capture {
                         | "facts_path"
                         | "policy_path"
                         | "policy_sha256"
+                        | "client_archive"
                 )
             })
         {
@@ -278,6 +279,18 @@ impl Capture {
                 byte == b'_' || byte.is_ascii_alphabetic() || (index != 0 && byte.is_ascii_digit())) {
             return Err("invalid controlled client extern name".into());
         }
+        let client_archive = &self.request["client_archive"];
+        if !module && !client_archive.is_null() {
+            let path = absolute(client_archive, "path")?;
+            if crate::digest(&fs::read(&path).map_err(|error| error.to_string())?)
+                != client_archive["sha256"].as_str().ok_or("missing Cargo startup client hash")? {
+                return Err("Cargo startup client changed before compiler admission".into());
+            }
+            if !requested.contains_key(client_name) {
+                return Err("Cargo startup client has no controlled extern policy".into());
+            }
+            requested.insert(client_name.to_owned(), path);
+        }
         let mut realized = BTreeMap::new();
         for (name, path) in requested {
             if (name != "askfdowner" && name != client_name) || !path.is_absolute() {
@@ -290,7 +303,7 @@ impl Capture {
                     .ok_or("controlled extern must name an exact archive")?
                     .map(|path| path.canonicalized().to_path_buf())
                     .collect::<Vec<_>>();
-                if files.len() != 1 || (name == "askfdowner" && files[0] != path) {
+                if files.len() != 1 || ((name == "askfdowner" || !client_archive.is_null()) && files[0] != path) {
                     return Err("controlled owner extern differs from approved archive".into());
                 }
                 realized.insert(name.clone(), files);

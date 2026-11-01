@@ -325,6 +325,40 @@ impl CaptureExecutor {
         let final_kind = kinds.is_some_and(|kinds| kinds.split(',').any(|kind|
             matches!(kind, "bin" | "cdylib" | "dylib")));
         if !final_kind { return Ok(None); }
+        let policy_value: Value = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        let client = policy_value["client_extern_name"].as_str().ok_or("missing startup client name")?;
+        let approved: BTreeSet<PathBuf> = serde_json::from_value(policy_value["primitive_manifests"].clone())
+            .map_err(|error| error.to_string())?;
+        let mut pending = vec![key.to_owned()];
+        let mut visited = BTreeSet::new();
+        let mut clients = BTreeSet::new();
+        let platform = &self.graph["units"][key]["unit"]["platform"];
+        while let Some(unit) = pending.pop() {
+            if !visited.insert(unit.clone()) { continue; }
+            let node = &self.graph["units"][&unit];
+            let descriptor = &node["unit"];
+            if descriptor["platform"] != *platform { continue; }
+            if descriptor["target"]["name"] == client && descriptor["mode"] == "build"
+                && descriptor["target"]["kind"].as_array().is_some_and(|kinds| kinds.iter().any(|kind| kind == "lib")) {
+                let manifest = PathBuf::from(descriptor["manifest"].as_str().ok_or("startup client omits manifest")?);
+                if !approved.contains(&manifest) {
+                    return Err("startup client does not belong to an approved native manifest".into());
+                }
+                clients.insert(unit.clone());
+            }
+            for dependency in node["dependencies"].as_array().ok_or("missing startup dependency graph")? {
+                pending.push(dependency["unit"].as_str().ok_or("missing startup dependency identity")?.to_owned());
+            }
+        }
+        if clients.len() > 1 { return Err("ambiguous startup client in Cargo dependency closure".into()); }
+        let client_archive = if let Some(client) = clients.first() {
+            let publications = self.artifact_publications.lock().map_err(|_| "Cargo artifact publication lock poisoned")?;
+            let archives = publications.get(client).ok_or("startup client has no typed Cargo outputs")?
+                .iter().filter(|(kind, _)| kind == "rlib").collect::<Vec<_>>();
+            if archives.len() != 1 { return Err("startup client requires one exact Cargo archive".into()); }
+            let path = fs::canonicalize(&archives[0].1).map_err(|error| error.to_string())?;
+            json!({"path": path, "sha256": crate::digest(&fs::read(&path).map_err(|error| error.to_string())?)})
+        } else { Value::Null };
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
             .map_err(|error| error.to_string())?.as_nanos();
         let identity = crate::digest(format!("{key}:{}:{now}:{}", std::process::id(), crate::digest(&bytes)).as_bytes());
@@ -332,7 +366,8 @@ impl CaptureExecutor {
         let request = json!({"request_id": identity,
             "plan_path": self.directory.join(format!("{key}.entry-plan.json")),
             "receipt_path": self.directory.join(format!("{key}.entry-receipt.json")),
-            "facts_path": self.fact_path(key), "policy_path": policy, "policy_sha256": crate::digest(&bytes)});
+            "facts_path": self.fact_path(key), "policy_path": policy, "policy_sha256": crate::digest(&bytes),
+            "client_archive": client_archive});
         publish(&path, &request)?;
         let hash = crate::digest(&fs::read(&path).map_err(|error| error.to_string())?);
         Ok(Some((path, hash)))
