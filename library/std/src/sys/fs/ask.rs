@@ -786,6 +786,10 @@ impl Dir {
         self.file.file_attr()
     }
 
+    pub fn as_fd(&self) -> crate::os::fd::BorrowedFd<'_> {
+        crate::os::fd::AsFd::as_fd(&self.file)
+    }
+
     fn relative_metadata(&self, path: &Path, nofollow: bool) -> io::Result<FileAttr> {
         let path = beneath(path)?;
         let mut reply = [0; ask_io::fs::METADATA_LEN];
