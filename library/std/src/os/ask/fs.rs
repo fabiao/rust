@@ -6,7 +6,7 @@
 
 use crate::ffi::OsString;
 use crate::path::Path;
-use crate::sys::{AsInner, FromInner};
+use crate::sys::{AsInner, AsInnerMut, FromInner};
 use crate::{fs, io, sys};
 
 /// ASK-specific extensions to [`fs::Metadata`].
@@ -181,5 +181,21 @@ impl DirExt for fs::Dir {
         follow: bool,
     ) -> io::Result<()> {
         self.as_inner().set_permissions_at(path.as_ref(), perm.as_inner().clone(), follow)
+    }
+}
+
+/// ASK-specific extensions to [`fs::OpenOptions`].
+#[stable(feature = "rust1", since = "1.0.0")]
+pub trait OpenOptionsExt {
+    /// Refuses a final symlink instead of following it, as POSIX `O_NOFOLLOW`.
+    #[stable(feature = "rust1", since = "1.0.0")]
+    fn nofollow(&mut self, nofollow: bool) -> &mut Self;
+}
+
+#[stable(feature = "rust1", since = "1.0.0")]
+impl OpenOptionsExt for fs::OpenOptions {
+    fn nofollow(&mut self, nofollow: bool) -> &mut Self {
+        self.as_inner_mut().nofollow(nofollow);
+        self
     }
 }

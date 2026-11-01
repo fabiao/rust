@@ -296,6 +296,7 @@ pub struct OpenOptions {
     truncate: bool,
     create: bool,
     create_new: bool,
+    nofollow: bool,
 }
 
 impl OpenOptions {
@@ -307,7 +308,12 @@ impl OpenOptions {
             truncate: false,
             create: false,
             create_new: false,
+            nofollow: false,
         }
+    }
+
+    pub fn nofollow(&mut self, nofollow: bool) {
+        self.nofollow = nofollow;
     }
 
     pub fn read(&mut self, read: bool) {
@@ -350,6 +356,9 @@ impl OpenOptions {
         }
         if self.create_new {
             flags |= ask_io::fs::OPEN_EXCL;
+        }
+        if self.nofollow {
+            flags |= ask_io::fs::OPEN_NOFOLLOW;
         }
         Ok(flags)
     }
