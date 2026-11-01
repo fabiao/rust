@@ -4,9 +4,10 @@
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
+use crate::ffi::OsString;
 use crate::path::Path;
-use crate::sys::AsInner;
-use crate::{fs, io};
+use crate::sys::{AsInner, FromInner};
+use crate::{fs, io, sys};
 
 /// ASK-specific extensions to [`fs::Metadata`].
 ///
@@ -120,4 +121,55 @@ impl FileTypeExt for fs::FileType {
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> io::Result<()> {
     crate::sys::fs::symlink(original.as_ref(), link.as_ref())
+}
+
+/// ASK-specific extensions to [`fs::Permissions`], carrying the full mode as
+/// on Unix.
+#[stable(feature = "rust1", since = "1.0.0")]
+pub trait PermissionsExt {
+    /// Returns the permission, set-id and sticky bits.
+    #[stable(feature = "rust1", since = "1.0.0")]
+    fn mode(&self) -> u32;
+    /// Replaces the mode bits.
+    #[stable(feature = "rust1", since = "1.0.0")]
+    fn set_mode(&mut self, mode: u32);
+    /// Creates permissions from mode bits.
+    #[stable(feature = "rust1", since = "1.0.0")]
+    fn from_mode(mode: u32) -> Self;
+}
+
+#[stable(feature = "rust1", since = "1.0.0")]
+impl PermissionsExt for fs::Permissions {
+    fn mode(&self) -> u32 {
+        self.as_inner().mode()
+    }
+    fn set_mode(&mut self, mode: u32) {
+        *self = fs::Permissions::from_inner(sys::fs::FilePermissions::from_mode(mode));
+    }
+    fn from_mode(mode: u32) -> Self {
+        fs::Permissions::from_inner(sys::fs::FilePermissions::from_mode(mode))
+    }
+}
+
+/// ASK-specific operations on an open [`fs::Dir`], resolved beneath that
+/// directory by its provider rather than through a path from the root.
+#[unstable(feature = "dirfd", issue = "120426")]
+pub trait DirExt {
+    /// Returns the names directly beneath this directory.
+    #[unstable(feature = "dirfd", issue = "120426")]
+    fn entry_names(&self) -> io::Result<crate::vec::Vec<OsString>>;
+    /// Replaces the permissions of `path` beneath this directory, following a
+    /// final symlink.
+    #[unstable(feature = "dirfd", issue = "120426")]
+    fn set_permissions_at<P: AsRef<Path>>(&self, path: P, perm: fs::Permissions) -> io::Result<()>;
+}
+
+#[unstable(feature = "dirfd", issue = "120426")]
+impl DirExt for fs::Dir {
+    fn entry_names(&self) -> io::Result<crate::vec::Vec<OsString>> {
+        self.as_inner().entry_names()
+    }
+    fn set_permissions_at<P: AsRef<Path>>(&self, path: P, perm: fs::Permissions) -> io::Result<()> {
+        self.as_inner().set_permissions_at(path.as_ref(), perm.as_inner().clone())
+    }
 }

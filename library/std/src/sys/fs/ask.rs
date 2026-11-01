@@ -5,7 +5,7 @@ use crate::hash::Hash;
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut, SeekFrom};
 use crate::path::{Path, PathBuf};
 use crate::sys::channel::SyncChannel;
-pub use crate::sys::fs::common::{Dir, ExtraHomeDirs, ExtraMediaDirs};
+pub use crate::sys::fs::common::{ExtraHomeDirs, ExtraMediaDirs};
 use crate::sys::pal::unsupported_err;
 use crate::sys::time::SystemTime;
 use crate::sys::unsupported;
@@ -142,16 +142,32 @@ impl FileTimes {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FilePermissions {
-    readonly: bool,
+    mode: u32,
 }
 
 impl FilePermissions {
     pub fn readonly(&self) -> bool {
-        self.readonly
+        self.mode & MODE_WRITE == 0
     }
 
     pub fn set_readonly(&mut self, readonly: bool) {
-        self.readonly = readonly;
+        if readonly {
+            self.mode &= !MODE_WRITE;
+        } else {
+            self.mode |= MODE_WRITE;
+        }
+    }
+
+    pub fn mode(&self) -> u32 {
+        self.mode
+    }
+
+    pub fn set_mode(&mut self, mode: u32) {
+        self.mode = mode;
+    }
+
+    pub fn from_mode(mode: u32) -> FilePermissions {
+        FilePermissions { mode }
     }
 }
 
@@ -186,9 +202,11 @@ pub struct FileAttr {
     metadata: ask_io::fs::Metadata,
 }
 
-/// The native metadata mode's owner-write bit.
-/// server-side, so readonly is decided by the same bit `OP_CHMOD` sets.
-const MODE_OWNER_WRITE: u32 = 0o200;
+/// Write bits for every class, cleared and set together by `set_readonly` as
+/// on Unix.
+const MODE_WRITE: u32 = 0o222;
+/// The permission, set-id and sticky bits a native mode carries beside its type.
+const MODE_PERMISSIONS: u32 = 0o7777;
 
 /// POSIX creation modes before the process umask removes bits: files are
 /// readable and writable by all, directories also searchable.
@@ -246,7 +264,7 @@ impl FileAttr {
     }
 
     pub fn perm(&self) -> FilePermissions {
-        FilePermissions { readonly: self.metadata.mode & MODE_OWNER_WRITE == 0 }
+        FilePermissions { mode: self.metadata.mode & MODE_PERMISSIONS }
     }
 
     pub fn file_type(&self) -> FileType {
@@ -455,8 +473,19 @@ fn stat_path(path: &Path, nofollow: bool) -> io::Result<FileAttr> {
 
 impl File {
     pub fn open(path: &Path, opts: &OpenOptions) -> io::Result<File> {
+        let (provider_token, relative) = resolve_fs_path(path)?;
+        File::open_native(provider_token, None, relative.as_bytes(), opts)
+    }
+
+    /// Opens `path` from the provider's session root or, with a directory
+    /// token, beneath that directory; both bind a fresh lifetime session.
+    fn open_native(
+        provider_token: u32,
+        directory: Option<u64>,
+        path: &[u8],
+        opts: &OpenOptions,
+    ) -> io::Result<File> {
         crate::sys::fd::blocking(async {
-            let (provider_token, relative) = resolve_fs_path(path)?;
             let source = crate::sys::fd::mount_source(provider_token)?;
             let pages = ask_io::fs::path_window::CHANNEL_PAGES;
             let mut channel = ask_ipc::SyncChannel::create_leased(source.record.token.0, pages)
@@ -468,16 +497,22 @@ impl File {
                 return Err(io::Error::from(io::ErrorKind::InvalidInput));
             }
             let mut request = [0; ask_io::fs::FS_OPEN_REQUEST_LEN];
+            let mut relative_request = [0; ask_io::fs::FS_OPEN_RELATIVE_REQUEST_LEN];
             let window = channel
                 .shared_region_mut(ask_io::fs::path_window::OFFSET, ask_io::fs::path_window::LEN)
                 .ok_or_else(unsupported_err)?;
-            let payload = ask_io::fs::encode_fs_open_request(
-                &mut request,
-                window,
-                opts.wire_flags()?,
-                rights,
-                relative.as_bytes(),
-            )
+            let flags = opts.wire_flags()?;
+            let payload = match directory {
+                None => ask_io::fs::encode_fs_open_request(&mut request, window, flags, rights, path),
+                Some(token) => ask_io::fs::encode_fs_open_relative_request(
+                    &mut relative_request,
+                    window,
+                    flags,
+                    rights,
+                    token,
+                    path,
+                ),
+            }
             .ok_or_else(unsupported_err)?;
             let deadline = ask_sys::get_monotonic_ms()
                 .checked_add(ask_ipc::directory::policy::DEADLINE_MS)
@@ -581,14 +616,8 @@ impl File {
         self.descriptor.try_clone().map(|descriptor| Self { descriptor })
     }
     pub fn set_permissions(&self, permissions: FilePermissions) -> io::Result<()> {
-        let mut mode = self.file_attr()?.metadata.mode;
-        if permissions.readonly {
-            mode &= !MODE_OWNER_WRITE;
-        } else {
-            mode |= MODE_OWNER_WRITE;
-        }
         let mut bytes = [0; ask_io::fs::FS_CHMOD_ATTACHMENT_REQUEST_LEN];
-        let payload = ask_io::fs::encode_fs_chmod_attachment_request(&mut bytes, mode);
+        let payload = ask_io::fs::encode_fs_chmod_attachment_request(&mut bytes, permissions.mode);
         crate::sys::fd::blocking(crate::sys::fd::native(
             self.as_raw_fd(),
             ask_io::fs::OP_CHMOD,
@@ -648,6 +677,200 @@ impl crate::sys::FromInner<crate::sys::fd::FileDesc> for File {
 impl crate::fmt::Debug for File {
     fn fmt(&self, f: &mut crate::fmt::Formatter<'_>) -> crate::fmt::Result {
         f.debug_struct("File").field("fd", &self.as_raw_fd()).finish()
+    }
+}
+
+/// An open directory: its descriptor, and its mount's provider token so a
+/// relative open binds a session on the same provider.
+pub struct Dir {
+    file: File,
+    provider_token: u32,
+}
+
+/// A name beneath a `Dir`: the provider grammar is descendant-only, so an
+/// absolute path has no meaning relative to the directory.
+fn beneath(path: &Path) -> io::Result<&[u8]> {
+    let path = path.to_str().ok_or_else(|| io::Error::from(io::ErrorKind::InvalidFilename))?;
+    if path.starts_with('/') || path.len() > ask_io::fs::PATH_MAX {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+    Ok(path.as_bytes())
+}
+
+impl Dir {
+    pub fn open(path: &Path, opts: &OpenOptions) -> io::Result<Self> {
+        let (provider_token, relative) = resolve_fs_path(path)?;
+        Dir::from_file(File::open_native(provider_token, None, relative.as_bytes(), opts)?, provider_token)
+    }
+
+    pub fn open_for_traversal(path: &Path) -> io::Result<Self> {
+        let mut opts = OpenOptions::new();
+        opts.read(true);
+        Dir::open(path, &opts)
+    }
+
+    fn from_file(file: File, provider_token: u32) -> io::Result<Self> {
+        if !file.file_attr()?.file_type().is_dir() {
+            return Err(io::Error::from(io::ErrorKind::NotADirectory));
+        }
+        Ok(Dir { file, provider_token })
+    }
+
+    pub fn duplicate(&self) -> io::Result<Self> {
+        Ok(Dir { file: self.file.duplicate()?, provider_token: self.provider_token })
+    }
+
+    /// The single-use token a relative open presents; creation needs `WRITE`
+    /// on the directory, a lookup `READ`.
+    fn token(&self, rights: u32) -> io::Result<u64> {
+        let mut request = [0; ask_io::fs::FS_DIRECTORY_TOKEN_REQUEST_LEN];
+        let payload = ask_io::fs::encode_fs_directory_token_request(&mut request, rights)
+            .ok_or_else(unsupported_err)?;
+        let mut reply = [0; ask_io::fs::FS_DIRECTORY_TOKEN_REPLY_LEN];
+        let length = crate::sys::fd::blocking(crate::sys::fd::native(
+            self.file.as_raw_fd(),
+            ask_io::fs::OP_DIRECTORY_TOKEN,
+            payload,
+            &mut reply,
+        ))??;
+        reply
+            .get(..length)
+            .and_then(ask_io::fs::decode_fs_directory_token_reply)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))
+    }
+
+    /// A relative request carries its path after the request; the resident
+    /// owner stages it into the Operation Channel window it alone maps.
+    fn relative_native<const N: usize>(
+        &self,
+        opcode: u32,
+        path: &[u8],
+        encode: impl FnOnce(&mut [u8; N], &mut [u8]) -> bool,
+        output: &mut [u8],
+    ) -> io::Result<usize> {
+        let mut request = [0; N];
+        let mut scratch = [0; ask_io::fs::PATH_MAX];
+        if !encode(&mut request, &mut scratch) {
+            return Err(io::Error::from(io::ErrorKind::InvalidFilename));
+        }
+        let mut input = crate::vec::Vec::new();
+        input.try_reserve_exact(N + path.len()).map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+        input.extend_from_slice(&request);
+        input.extend_from_slice(path);
+        crate::sys::fd::blocking(crate::sys::fd::native(self.file.as_raw_fd(), opcode, &input, output))?
+    }
+
+    pub fn open_file(&self, path: &Path, opts: &OpenOptions) -> io::Result<File> {
+        let path = beneath(path)?;
+        let creating = opts.wire_flags()?
+            & (ask_io::fs::OPEN_CREATE | ask_io::fs::OPEN_TRUNCATE | ask_io::fs::OPEN_APPEND)
+            != 0;
+        let rights = if creating { ask_io::fd::rights::WRITE } else { ask_io::fd::rights::READ };
+        File::open_native(self.provider_token, Some(self.token(rights)?), path, opts)
+    }
+
+    pub fn open_dir(&self, path: &Path, opts: &OpenOptions) -> io::Result<Self> {
+        Dir::from_file(self.open_file(path, opts)?, self.provider_token)
+    }
+
+    pub fn self_metadata(&self) -> io::Result<FileAttr> {
+        self.file.file_attr()
+    }
+
+    fn relative_metadata(&self, path: &Path, nofollow: bool) -> io::Result<FileAttr> {
+        let path = beneath(path)?;
+        let mut reply = [0; ask_io::fs::METADATA_LEN];
+        let length = self.relative_native(
+            ask_io::fs::OP_METADATA,
+            path,
+            |request: &mut [u8; ask_io::fs::FS_METADATA_PATH_REQUEST_LEN], window| {
+                ask_io::fs::encode_fs_metadata_relative_request(request, window, path, nofollow)
+                    .is_some()
+            },
+            &mut reply,
+        )?;
+        reply
+            .get(..length)
+            .and_then(ask_io::fs::decode_fs_metadata)
+            .map(FileAttr::from_metadata)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))
+    }
+
+    pub fn metadata(&self, path: &Path) -> io::Result<FileAttr> {
+        self.relative_metadata(path, false)
+    }
+
+    pub fn symlink_metadata(&self, path: &Path) -> io::Result<FileAttr> {
+        self.relative_metadata(path, true)
+    }
+
+    /// The names directly beneath this directory, in provider cookie order.
+    pub fn entry_names(&self) -> io::Result<crate::vec::Vec<OsString>> {
+        let mut names = crate::vec::Vec::new();
+        let mut cookie = ask_io::fs::DirCookie::default();
+        loop {
+            let mut reply = [0; ask_io::fs::MESSAGE_LEN];
+            let length = self.relative_native(
+                ask_io::fs::OP_READ_DIRECTORY,
+                &[],
+                |request: &mut [u8; ask_io::fs::FS_DIRECTORY_REQUEST_LEN], window| {
+                    ask_io::fs::encode_fs_directory_request(request, window, cookie, &[]).is_some()
+                },
+                &mut reply,
+            )?;
+            // The attachment form ends with an empty successful reply.
+            if length == 0 {
+                return Ok(names);
+            }
+            let (next, _, _, name) = reply
+                .get(..length)
+                .and_then(ask_io::fs::decode_fs_directory_reply)
+                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+            if next.generation == 0 || next == cookie {
+                return Err(io::Error::from(io::ErrorKind::InvalidData));
+            }
+            cookie = next;
+            let name = crate::str::from_utf8(name)
+                .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
+            names.push(OsString::from(name));
+        }
+    }
+
+    /// CHMOD carries no no-follow flag, so the final symlink is followed.
+    pub fn set_permissions_at(&self, path: &Path, perm: FilePermissions) -> io::Result<()> {
+        let path = beneath(path)?;
+        self.relative_native(
+            ask_io::fs::OP_CHMOD,
+            path,
+            |request: &mut [u8; ask_io::fs::FS_CHMOD_PATH_REQUEST_LEN], window| {
+                ask_io::fs::encode_fs_chmod_relative_request(request, window, path, perm.mode)
+                    .is_some()
+            },
+            &mut [],
+        )
+        .map(|_| ())
+    }
+
+    pub fn remove_file(&self, _path: &Path) -> io::Result<()> {
+        unsupported()
+    }
+
+    pub fn rename(&self, _from: &Path, _to_dir: &Self, _to: &Path) -> io::Result<()> {
+        unsupported()
+    }
+
+    pub fn create_dir(&self, _path: &Path) -> io::Result<()> {
+        unsupported()
+    }
+
+    pub fn remove_dir(&self, _path: &Path) -> io::Result<()> {
+        unsupported()
+    }
+}
+
+impl crate::fmt::Debug for Dir {
+    fn fmt(&self, f: &mut crate::fmt::Formatter<'_>) -> crate::fmt::Result {
+        f.debug_struct("Dir").field("fd", &self.file.as_raw_fd()).finish()
     }
 }
 
@@ -988,8 +1211,17 @@ pub fn lstat(path: &Path) -> io::Result<FileAttr> {
     stat_path(path, true)
 }
 
-pub fn set_perm(_path: &Path, _perm: FilePermissions) -> io::Result<()> {
-    unsupported()
+pub fn set_perm(path: &Path, perm: FilePermissions) -> io::Result<()> {
+    let (provider_token, relative) = resolve_fs_path(path)?;
+    metadata_unit(
+        provider_token,
+        ask_io::fs::OP_CHMOD,
+        |request: &mut [u8; ask_io::fs::FS_CHMOD_PATH_REQUEST_LEN], window| {
+            ask_io::fs::encode_fs_chmod_path_request(request, window, relative.as_bytes(), perm.mode)
+                .is_some()
+        },
+        "fs: chmod failed",
+    )
 }
 
 pub use set_perm as set_perm_nofollow;
