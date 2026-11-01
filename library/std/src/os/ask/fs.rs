@@ -158,10 +158,15 @@ pub trait DirExt {
     /// Returns the names directly beneath this directory.
     #[unstable(feature = "dirfd", issue = "120426")]
     fn entry_names(&self) -> io::Result<crate::vec::Vec<OsString>>;
-    /// Replaces the permissions of `path` beneath this directory, following a
-    /// final symlink.
+    /// Replaces the permissions of `path` beneath this directory. Without
+    /// `follow`, a final symlink is refused instead of followed.
     #[unstable(feature = "dirfd", issue = "120426")]
-    fn set_permissions_at<P: AsRef<Path>>(&self, path: P, perm: fs::Permissions) -> io::Result<()>;
+    fn set_permissions_at<P: AsRef<Path>>(
+        &self,
+        path: P,
+        perm: fs::Permissions,
+        follow: bool,
+    ) -> io::Result<()>;
 }
 
 #[unstable(feature = "dirfd", issue = "120426")]
@@ -169,7 +174,12 @@ impl DirExt for fs::Dir {
     fn entry_names(&self) -> io::Result<crate::vec::Vec<OsString>> {
         self.as_inner().entry_names()
     }
-    fn set_permissions_at<P: AsRef<Path>>(&self, path: P, perm: fs::Permissions) -> io::Result<()> {
-        self.as_inner().set_permissions_at(path.as_ref(), perm.as_inner().clone())
+    fn set_permissions_at<P: AsRef<Path>>(
+        &self,
+        path: P,
+        perm: fs::Permissions,
+        follow: bool,
+    ) -> io::Result<()> {
+        self.as_inner().set_permissions_at(path.as_ref(), perm.as_inner().clone(), follow)
     }
 }

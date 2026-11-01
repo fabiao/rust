@@ -836,14 +836,20 @@ impl Dir {
         }
     }
 
-    /// CHMOD carries no no-follow flag, so the final symlink is followed.
-    pub fn set_permissions_at(&self, path: &Path, perm: FilePermissions) -> io::Result<()> {
+    /// Without `follow`, a final symlink is refused rather than followed, so
+    /// a traversal that stat'ed a non-symlink cannot be redirected by a swap.
+    pub fn set_permissions_at(
+        &self,
+        path: &Path,
+        perm: FilePermissions,
+        follow: bool,
+    ) -> io::Result<()> {
         let path = beneath(path)?;
         self.relative_native(
             ask_io::fs::OP_CHMOD,
             path,
             |request: &mut [u8; ask_io::fs::FS_CHMOD_PATH_REQUEST_LEN], window| {
-                ask_io::fs::encode_fs_chmod_relative_request(request, window, path, perm.mode)
+                ask_io::fs::encode_fs_chmod_relative_request(request, window, path, perm.mode, !follow)
                     .is_some()
             },
             &mut [],
