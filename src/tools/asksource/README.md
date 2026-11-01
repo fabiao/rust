@@ -24,7 +24,9 @@ checks are not relaxed. Shared admission migration remains pending.
 
 ## Purpose and boundaries
 
-ASK uses source analysis to maintain its runtime-resource inventory and detect
+`asksource` supports static analysis and tuning after many implementations have
+accumulated. ASK uses that analysis to maintain its runtime-resource inventory
+and detect
 unreviewed capacity restrictions. Relevant constructs include array extents,
 const-generic arguments, inferred local storage, limits on measured collections,
 and storage introduced through constructors or expansion. Correct analysis needs
@@ -43,6 +45,31 @@ owns validated source snapshots and projection of configured compiler facts onto
 raw source. Askchef owns recipe selection and build preparation. Rust bootstrap
 owns SDK build preparation and helper installation. Native Cargo owns dependency
 resolution, unit scheduling, freshness, locks, and compilation.
+
+## Validation cadence and run scope
+
+Use `asksource` periodically to assess substantial integrated code across defined
+contexts, rather than configuring capture for every implementation. Before every
+invocation, including syntax-only and diagnostic runs, state the purpose,
+source/build scope, targets/features/compiler roles, exclusions, expected
+rebuilds and estimated elapsed-time range. Reuse valid facts and existing graph
+selectors; report actual elapsed cost, coverage and memory observations afterward.
+Follow the [run procedure](../../../../../../../docs/development-workflow.md#periodic-validation-and-declared-runs).
+For broad or overnight work, use the
+[unattended batch procedure](../../../../../../../docs/development-workflow.md#unattended-analysis-batches):
+prepare contexts and stable inputs, coordinate pauses of conflicting editing
+agents, complete the declared sequence and record per-context outcomes without
+intermediate user prompts, then release owned pauses. The diary is not a session
+suspension mechanism; unattended readiness requires the necessary host controls.
+Estimates never authorize a Cargo timeout; required current publication facts
+retain their exact-input checks.
+
+Memory monitoring/containment applies only to explicit analysis and its reader,
+compiler and bootstrap descendants. CPU use must remain unrestricted, including
+Cargo parallelism; ordinary Cargo builds and assembly need no special resource
+limits. The launcher preserves Cargo's parallelism configuration. Ordinary
+admission and syntax snapshots inherit caller resources. Explicit analysis
+entry points own containment; compiler-capture APIs still require it.
 
 ## Implemented capabilities
 
