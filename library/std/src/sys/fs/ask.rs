@@ -197,11 +197,16 @@ mod creation_mode {
     pub const DIRECTORY: u32 = 0o777;
 }
 
-/// The resident owner's umask applied to a creation mode.
-fn masked_mode(mode: u32) -> io::Result<u32> {
+/// The resident owner's process umask.
+pub(crate) fn umask() -> io::Result<u32> {
     let mut mask = 0;
     crate::sys::fd::retry(|error| unsafe { ask_fd::__askfd_get_umask(&mut mask, error) })?;
-    Ok(mode & !mask)
+    Ok(mask)
+}
+
+/// The resident owner's umask applied to a creation mode.
+fn masked_mode(mode: u32) -> io::Result<u32> {
+    Ok(mode & !umask()?)
 }
 
 /// Native timestamps are signed nanoseconds from the Unix epoch.

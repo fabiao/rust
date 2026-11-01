@@ -34,7 +34,7 @@ cfg_select! {
     target_os = "ask" => {
         mod ask;
         use ask as imp;
-        pub(crate) use ask::{absolute_view_path, fs_error, working_directory};
+        pub(crate) use ask::{absolute_view_path, fs_error, umask, working_directory};
     }
     target_os = "motor" => {
         mod motor;

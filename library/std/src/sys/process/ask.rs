@@ -152,12 +152,14 @@ impl Command {
             None => default.try_clone()?,
         };
 
-        if self.cwd.is_some() {
-            return Err(io::const_error!(
-                io::ErrorKind::Unsupported,
-                "Command current_dir is not a process property on ask"
-            ));
-        }
+        // The child inherits this process's umask and working directory;
+        // `current_dir` replaces the directory, resolved against ours.
+        let umask = crate::sys::fs::umask()?;
+        let mut directory = [0u8; ask_io::fs::PATH_MAX];
+        let directory = match self.cwd.as_ref() {
+            Some(dir) => crate::sys::fs::absolute_view_path(Path::new(dir), &mut directory)?,
+            None => crate::sys::fs::working_directory(&mut directory)?,
+        };
 
         let name = package_name(&self.program)?;
         let argv = pack_os_fields(self.args.iter().map(OsString::as_os_str))?;
@@ -175,7 +177,13 @@ impl Command {
                 reserved: 0,
             })
             .collect::<Vec<_>>();
-        let launched = activation::launch(name, &argv, &env, &actions)?;
+        let launched = activation::launch(
+            name,
+            &argv,
+            &env,
+            activation::ProcessState { umask, working_directory: directory.as_bytes() },
+            &actions,
+        )?;
         let pipes = StdioPipes {
             stdin: stdin.parent.take(),
             stdout: stdout.parent.take(),

@@ -327,10 +327,17 @@ impl Drop for Activation<'_> {
     }
 }
 
+/// The umask and normalized absolute working directory the child starts with.
+pub(super) struct ProcessState<'a> {
+    pub umask: u32,
+    pub working_directory: &'a [u8],
+}
+
 pub(super) fn launch(
     name: &[u8],
     argv: &[u8],
     env: &[u8],
+    process: ProcessState<'_>,
     actions: &[ask_io::fd::OrderedAction],
 ) -> io::Result<wire::LaunchReply> {
     let nonce = NONCE
@@ -340,15 +347,18 @@ pub(super) fn launch(
         .len()
         .checked_add(argv.len())
         .and_then(|length| length.checked_add(env.len()))
+        .and_then(|length| length.checked_add(process.working_directory.len()))
         .filter(|length| *length <= wire::DATA_LEN as usize)
         .ok_or_else(protocol)?;
     let mut channel = launcher()?;
     let window =
         channel.shared_region_mut(wire::DATA_OFFSET as usize, total).ok_or_else(protocol)?;
     let env_offset = name.len() + argv.len();
+    let directory_offset = env_offset + env.len();
     window[..name.len()].copy_from_slice(name);
     window[name.len()..env_offset].copy_from_slice(argv);
-    window[env_offset..].copy_from_slice(env);
+    window[env_offset..directory_offset].copy_from_slice(env);
+    window[directory_offset..].copy_from_slice(process.working_directory);
     let request = wire::ReserveRequest {
         nonce,
         flags: wire::launch_flag::FOREGROUND | wire::launch_flag::REQUIRE_DESCRIPTORS
@@ -356,6 +366,12 @@ pub(super) fn launch(
         name: wire::Buffer::new(0, name.len() as u32).ok_or_else(protocol)?,
         argv: wire::Buffer::new(name.len() as u32, argv.len() as u32).ok_or_else(protocol)?,
         env: wire::Buffer::new(env_offset as u32, env.len() as u32).ok_or_else(protocol)?,
+        umask: process.umask,
+        working_directory: wire::Buffer::new(
+            directory_offset as u32,
+            process.working_directory.len() as u32,
+        )
+        .ok_or_else(protocol)?,
     };
     let mut transaction = Activation {
         channel: &mut channel,
