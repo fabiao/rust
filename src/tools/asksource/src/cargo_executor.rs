@@ -282,6 +282,13 @@ struct UnitStore {
     keys: BTreeSet<String>,
 }
 
+#[derive(Eq, Ord, PartialEq, PartialOrd)]
+struct Invocation {
+    source: PathBuf,
+    output: PathBuf,
+    suffix: String,
+}
+
 struct CaptureExecutor {
     request: Value,
     request_path: PathBuf,
@@ -296,7 +303,7 @@ struct CaptureExecutor {
     selected: BTreeSet<String>,
     selected_by_base: BTreeMap<String, BTreeSet<String>>,
     lto: LtoPlan,
-    dispatch: Mutex<BTreeMap<String, String>>,
+    dispatch: Mutex<BTreeMap<Invocation, String>>,
     artifact_publications: Mutex<BTreeMap<String, Vec<(String, PathBuf)>>>,
     errors: Mutex<Vec<String>>,
     // Cargo joins compiler jobs before the completion marker is read.
@@ -545,8 +552,8 @@ impl CaptureExecutor {
     }
 }
 
-fn discriminator(source: &Path, suffix: &str) -> String {
-    format!("{}:{suffix}", source.display())
+fn discriminator(source: &Path, output: &Path, suffix: &str) -> Invocation {
+    Invocation { source: source.to_path_buf(), output: output.to_path_buf(), suffix: suffix.to_owned() }
 }
 
 fn publication_outputs(runner: &BuildRunner<'_, '_>, unit: &Unit)
@@ -632,7 +639,8 @@ impl Executor for CaptureExecutor {
             .unwrap_or_default();
         match self.dispatch.lock() {
             Ok(mut dispatch) => {
-                if dispatch.insert(discriminator(source, &suffix), key.clone()).is_some() {
+                let identity = discriminator(source, &runner.files().output_dir(unit), &suffix);
+                if dispatch.insert(identity, key.clone()).is_some() {
                     self.note_error("ambiguous Cargo compiler invocation identity".into());
                 }
             }
@@ -658,8 +666,13 @@ impl Executor for CaptureExecutor {
         let args: Vec<_> = cmd.get_args().collect();
         let suffix =
             args.iter().find_map(|arg| arg.to_str()?.strip_prefix("extra-filename=")).unwrap_or("");
+        let output = args.windows(2).find_map(|pair| {
+            (pair[0] == "--out-dir").then(|| Path::new(pair[1]))
+        }).or_else(|| args.iter().find_map(|arg| {
+            arg.to_str()?.strip_prefix("--out-dir=").map(Path::new)
+        })).ok_or_else(|| cargo::util::errors::internal("Cargo compiler invocation omits output directory"))?;
         let key = target.src_path().path().and_then(|source| {
-            self.dispatch.lock().ok()?.get(&discriminator(source, suffix)).cloned()
+            self.dispatch.lock().ok()?.get(&discriminator(source, output, suffix)).cloned()
         });
         let Some(key) = key else {
             return DefaultExecutor.exec(cmd, id, target, mode, stdout, stderr);

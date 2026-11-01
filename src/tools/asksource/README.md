@@ -179,6 +179,11 @@ Cargo reports binary outputs after compilation. Each reported binary must
 match one prepared typed declaration and its exact unit descriptor; missing or
 ambiguous declarations refuse, including when every unit stays fresh.
 
+Compiler dispatch uses a typed source-path, output-directory and optional-suffix
+key. Registration takes the directory from Cargo's layout; execution takes it
+from `--out-dir`. Build scripts with no suffix retain distinct feature and
+dependency contexts. Missing directories and duplicate keys refuse capture.
+
 The selected Cargo executable must report a source commit supported by an exact
 embedded adapter. The package currently contains adapters for its in-tree Cargo
 and pinned bootstrap Cargo, sharing one executor implementation. An unsupported
