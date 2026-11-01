@@ -336,7 +336,11 @@ impl CaptureExecutor {
         let client = policy_value["client_extern_name"].as_str().ok_or("missing startup client name")?;
         let approved: BTreeSet<PathBuf> = serde_json::from_value(policy_value["primitive_manifests"].clone())
             .map_err(|error| error.to_string())?;
-        let mut pending = vec![key.to_owned()];
+        let mut pending = if policy_value["owner_input"].is_string() {
+            vec![key.to_owned()]
+        } else {
+            Vec::new()
+        };
         let mut visited = BTreeSet::new();
         let mut clients = BTreeSet::new();
         let platform = &self.graph["units"][key]["unit"]["platform"];
