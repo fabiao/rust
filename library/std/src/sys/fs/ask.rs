@@ -369,17 +369,12 @@ pub struct File {
     descriptor: crate::sys::fd::FileDesc,
 }
 
-fn map_fs_result(result: i32) -> io::Result<()> {
-    if result < 0 { Err(unsupported_err()) } else { Ok(()) }
+fn map_fs_result(result: i32, context: &'static str) -> io::Result<()> {
+    if result == 0 { Ok(()) } else { Err(fs_error(result, context)) }
 }
 
-/// Translate one negative `askfs` reply into the closest `io::ErrorKind`.
-///
-/// The provider answers with a typed `ask_io::fs::FsError`, and collapsing all
-/// of them into `NotFound` made a quota refusal or a busy provider read as a
-/// missing path — actively misleading, and indistinguishable to a caller that
-/// wants to react to one but not the others. Unrecognized codes keep the
-/// conservative `Other`, never a specific kind the provider did not state.
+/// Translate a positive filesystem refusal into its typed error kind.
+/// Unknown codes, including negative transport failures, remain `Other`.
 pub(crate) fn fs_error(result: i32, context: &'static str) -> io::Error {
     use ask_io::fs::FsError;
 
@@ -434,9 +429,7 @@ fn metadata_call<T, const N: usize>(
     decode: impl FnOnce(&[u8]) -> Option<T>,
 ) -> io::Result<T> {
     let completion = path_exchange(provider_token, op, encode)?;
-    if completion.result < 0 {
-        return Err(fs_error(completion.result, not_found));
-    }
+    map_fs_result(completion.result, not_found)?;
     decode(completion.payload()).ok_or_else(unsupported_err)
 }
 
@@ -448,9 +441,7 @@ fn metadata_unit<const N: usize>(
     failure: &'static str,
 ) -> io::Result<()> {
     let completion = path_exchange(provider_token, op, encode)?;
-    if completion.result < 0 {
-        return Err(fs_error(completion.result, failure));
-    }
+    map_fs_result(completion.result, failure)?;
     Ok(())
 }
 
@@ -528,9 +519,7 @@ impl File {
                 .ok_or_else(unsupported_err)?;
             let completion =
                 crate::sys::fd::call(&mut channel, ask_io::fs::OP_OPEN, payload, deadline)?;
-            if completion.result != 0 {
-                return Err(fs_error(completion.result, "file open failed"));
-            }
+            map_fs_result(completion.result, "file open failed")?;
             let reply = ask_io::fs::decode_fs_open_reply(completion.payload())
                 .filter(|reply| reply.granted_rights == rights)
                 .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
@@ -822,7 +811,8 @@ impl Dir {
         let mut names = crate::vec::Vec::new();
         let mut cookie = ask_io::fs::DirCookie::default();
         loop {
-            let mut reply = [0; ask_io::fs::MESSAGE_LEN];
+            // Native replies exclude the Channel header; the owner stages paths separately.
+            let mut reply = [0; ask_abi::ipc::MAX_MSG_LEN - ask_abi::ipc::HEADER_LEN];
             let length = self.relative_native(
                 ask_io::fs::OP_READ_DIRECTORY,
                 &[],
@@ -986,9 +976,9 @@ impl Iterator for ReadDir {
             self.exhausted = true;
             return None;
         }
-        if completion.result != 0 {
+        if let Err(error) = map_fs_result(completion.result, "fs: readdir failed") {
             self.exhausted = true;
-            return Some(Err(io::const_error!(io::ErrorKind::Other, "fs: readdir failed")));
+            return Some(Err(error));
         }
         let (next, _, kind, name) =
             match ask_io::fs::decode_fs_directory_reply(completion.payload()) {
@@ -1150,9 +1140,7 @@ pub fn readlink(path: &Path) -> io::Result<PathBuf> {
         return Err(io::const_error!(io::ErrorKind::InvalidFilename, "fs: path too long"));
     }
     let completion = channel.call(ask_io::fs::OP_READLINK, &request)?;
-    if completion.result < 0 {
-        return Err(fs_error(completion.result, "fs: readlink failed"));
-    }
+    map_fs_result(completion.result, "fs: readlink failed")?;
     let window = channel
         .shared_region_mut(ask_io::fs::path_window::OFFSET, ask_io::fs::path_window::LEN)
         .ok_or_else(unsupported_err)?;
@@ -1272,9 +1260,7 @@ fn set_path_times(path: &Path, times: FileTimes, nofollow: bool) -> io::Result<(
             .is_some()
         },
     )?;
-    if completion.result < 0 {
-        return Err(fs_error(completion.result, "fs: set times failed"));
-    }
+    map_fs_result(completion.result, "fs: set times failed")?;
     Ok(())
 }
 
