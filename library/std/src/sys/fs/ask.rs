@@ -5,7 +5,7 @@ use crate::hash::Hash;
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut, SeekFrom};
 use crate::path::{Path, PathBuf};
 use crate::sys::channel::SyncChannel;
-pub use crate::sys::fs::common::{ExtraHomeDirs, ExtraMediaDirs};
+pub use crate::sys::fs::common::{ExtraHomeDirs, ExtraMediaDirs, copy};
 use crate::sys::pal::unsupported_err;
 use crate::sys::time::SystemTime;
 use crate::sys::unsupported;
@@ -462,7 +462,7 @@ fn stat_path(path: &Path, nofollow: bool) -> io::Result<FileAttr> {
                 request,
                 window,
                 relative.as_bytes(),
-                nofollow,
+                ask_io::fs::MetadataLookup::from_nofollow(nofollow),
             )
             .is_some()
         },
@@ -786,7 +786,7 @@ impl Dir {
             ask_io::fs::OP_METADATA,
             path,
             |request: &mut [u8; ask_io::fs::FS_METADATA_PATH_REQUEST_LEN], window| {
-                ask_io::fs::encode_fs_metadata_relative_request(request, window, path, nofollow)
+                ask_io::fs::encode_fs_metadata_relative_request(request, window, path, ask_io::fs::MetadataLookup::from_nofollow(nofollow))
                     .is_some()
             },
             &mut reply,
@@ -1128,23 +1128,32 @@ pub fn exists(path: &Path) -> io::Result<bool> {
 
 /// Returns the stored target bytes; an absolute target was stored provider-relative.
 pub fn readlink(path: &Path) -> io::Result<PathBuf> {
+    path_reply(path, ask_io::fs::OP_READLINK,
+        |request: &mut [u8; ask_io::fs::FS_PATH_REQUEST_LEN], window, path| {
+            ask_io::fs::encode_fs_path_request(request, window, path).is_some()
+        })
+}
+
+fn path_reply<const N: usize>(path: &Path, opcode: u32,
+    encode: impl FnOnce(&mut [u8; N], &mut [u8], &[u8]) -> bool,
+) -> io::Result<PathBuf> {
     let (provider_token, relative) = resolve_fs_path(path)?;
     let mut channel =
         SyncChannel::create_leased(provider_token, ask_io::fs::path_window::CHANNEL_PAGES)
             .map_err(|_| io::const_error!(io::ErrorKind::NotFound, "fs provider unreachable"))?;
-    let mut request = [0u8; ask_io::fs::FS_PATH_REQUEST_LEN];
+    let mut request = [0u8; N];
     let window = channel
         .shared_region_mut(ask_io::fs::path_window::OFFSET, ask_io::fs::path_window::LEN)
         .ok_or_else(unsupported_err)?;
-    if ask_io::fs::encode_fs_path_request(&mut request, window, relative.as_bytes()).is_none() {
+    if !encode(&mut request, window, relative.as_bytes()) {
         return Err(io::const_error!(io::ErrorKind::InvalidFilename, "fs: path too long"));
     }
-    let completion = channel.call(ask_io::fs::OP_READLINK, &request)?;
-    map_fs_result(completion.result, "fs: readlink failed")?;
+    let completion = channel.call(opcode, &request)?;
+    map_fs_result(completion.result, "fs: path lookup failed")?;
     let window = channel
         .shared_region_mut(ask_io::fs::path_window::OFFSET, ask_io::fs::path_window::LEN)
         .ok_or_else(unsupported_err)?;
-    let target = ask_io::fs::decode_fs_readlink_reply(completion.payload(), window)
+    let target = ask_io::fs::decode_fs_path_reply(completion.payload(), window)
         .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
     let target = crate::str::from_utf8(target)
         .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
@@ -1264,10 +1273,18 @@ fn set_path_times(path: &Path, times: FileTimes, nofollow: bool) -> io::Result<(
     Ok(())
 }
 
-pub fn canonicalize(_path: &Path) -> io::Result<PathBuf> {
-    unsupported()
-}
-
-pub fn copy(_from: &Path, _to: &Path) -> io::Result<u64> {
-    unsupported()
+pub fn canonicalize(path: &Path) -> io::Result<PathBuf> {
+    let mut absolute = [0; ask_io::fs::PATH_MAX];
+    let absolute = absolute_view_path(path, &mut absolute)?;
+    if absolute == ask_io::path::ROOT { return Ok(PathBuf::from(absolute)); }
+    let view = startup_view()?;
+    let binding = view.resolve(absolute, ask_io::view::Operation::Read).map_err(view_error)?;
+    let resolved = path_reply(Path::new(absolute), ask_io::fs::OP_METADATA,
+        |request: &mut [u8; ask_io::fs::FS_METADATA_PATH_REQUEST_LEN], window, path| {
+            ask_io::fs::encode_fs_metadata_path_request(request, window, path,
+                ask_io::fs::MetadataLookup::Canonical).is_some()
+        })?;
+    let resolved = resolved.to_str().ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+    let mut output = [0; ask_io::fs::PATH_MAX];
+    Ok(PathBuf::from(binding.decode_path(resolved, &mut output).map_err(view_error)?))
 }

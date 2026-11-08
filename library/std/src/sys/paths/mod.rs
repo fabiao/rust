@@ -16,10 +16,10 @@ cfg_select! {
         #[expect(dead_code)]
         mod unsupported;
         mod imp {
-            pub use super::ask::{chdir, getcwd};
+            pub use super::ask::{chdir, getcwd, temp_dir};
             pub use super::unsupported::{
                 JoinPathsError, SplitPaths, SplitPathsRef, current_exe, home_dir, join_paths,
-                split_paths, split_paths_ref, temp_dir,
+                split_paths, split_paths_ref,
             };
         }
     }

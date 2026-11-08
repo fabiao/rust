@@ -10,6 +10,12 @@ pub fn getcwd() -> io::Result<PathBuf> {
     Ok(PathBuf::from(path))
 }
 
+pub fn temp_dir() -> PathBuf {
+    crate::env::var_os("TMPDIR").map(PathBuf::from).unwrap_or_else(|| {
+        PathBuf::from(ask_io::path::compatibility::temporary::DIRECTORY.to_string_lossy().as_ref())
+    })
+}
+
 /// The view root holds only mount points and is always a valid directory;
 /// any other target must be a reachable directory.
 pub fn chdir(path: &Path) -> io::Result<()> {
