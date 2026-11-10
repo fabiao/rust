@@ -1,6 +1,6 @@
 //! Monotonic and wall-clock time for ask.
 //!
-//! `Instant` uses the kernel's millisecond monotonic clock (`GetMonotonicMs`).
+//! `Instant` uses the kernel's calibrated nanosecond monotonic clock.
 //! `SystemTime::now` reads the CMOS-RTC-backed wall clock (`GetWallTimeMs`,
 //! `kernel/src/arch/x86_64/rtc.rs`): not monotonic, UTC milliseconds since
 //! the Unix epoch.
@@ -26,7 +26,7 @@ const NANOS_PER_MILLI: u32 = 1_000_000;
 
 impl Instant {
     pub fn now() -> Instant {
-        Instant(Duration::from_millis(ask_sys::get_monotonic_ms()))
+        Instant(Duration::from_nanos(ask_sys::get_monotonic_ns()))
     }
 
     pub fn checked_sub_instant(&self, other: &Instant) -> Option<Duration> {
