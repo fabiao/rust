@@ -131,7 +131,7 @@ pub(super) fn run(
     let result = unsafe { ask_fd::__ask_process_entry(&input, &mut exit_code, &mut error) };
     if result != status::COMPLETE {
         ask_sys::log("process entry refused before application completion");
-        ask_sys::exit(127);
+        ask_sys::exit(ask_sys::Payload::raw(127));
     }
     exit_code as isize
 }

@@ -99,7 +99,7 @@ pub fn exit(code: i32) -> ! {
             libc::exit(code)
         },
         target_os = "motor" => moto_rt::process::exit(code),
-        target_os = "ask" => ask_sys::exit(code as u32 as u64),
+        target_os = "ask" => ask_sys::exit(ask_sys::Payload::raw(code as u32 as u64)),
         all(target_vendor = "fortanix", target_env = "sgx") => {
             crate::sys::pal::abi::exit_with_code(code as _)
         }

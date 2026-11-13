@@ -36,7 +36,7 @@ pub fn unsupported_err() -> io::Error {
 }
 
 pub fn abort_internal() -> ! {
-    ask_sys::exit(u64::MAX)
+    ask_sys::exit(ask_sys::Payload::raw(u64::MAX))
 }
 
 // SAFETY: must be called only once during runtime initialization.
@@ -60,5 +60,5 @@ pub extern "C" fn __ask_std_start() -> ! {
     // read through `GetSpawnBlob` by `sys::args` / `sys::env`. The CRT
     // argc/argv pair stays empty, matching Motor OS's `motor_start`.
     let result = unsafe { main(0, core::ptr::null(), 0) };
-    ask_sys::exit(result as u32 as u64)
+    ask_sys::exit(ask_sys::Payload::raw(result as u32 as u64))
 }

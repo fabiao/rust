@@ -357,16 +357,20 @@ impl fmt::Debug for Command {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct ExitStatus(i32);
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ExitStatus(ask_abi::termination::Outcome);
+
+impl Default for ExitStatus {
+    fn default() -> Self { Self(ask_abi::termination::Outcome::raw_exit(0)) }
+}
 
 impl ExitStatus {
     pub fn exit_ok(&self) -> Result<(), ExitStatusError> {
-        if self.0 == 0 { Ok(()) } else { Err(ExitStatusError(*self)) }
+        if self.0.is_success() { Ok(()) } else { Err(ExitStatusError(*self)) }
     }
 
     pub fn code(&self) -> Option<i32> {
-        Some(self.0)
+        self.0.raw_exit_value().and_then(|value| u32::try_from(value).ok()).map(|value| value as i32)
     }
 }
 
@@ -387,7 +391,7 @@ impl From<ExitStatusError> for ExitStatus {
 
 impl ExitStatusError {
     pub fn code(self) -> Option<NonZeroI32> {
-        NonZeroI32::new(self.0.0)
+        self.0.code().and_then(NonZeroI32::new)
     }
 }
 
@@ -466,8 +470,8 @@ impl Process {
         }
         let status = ask_io::process::decode_exit_status(completion.payload())
             .ok_or_else(pal::unsupported_err)?;
-        self.status = Some(ExitStatus(status as i32));
-        Ok(ExitStatus(status as i32))
+        self.status = Some(ExitStatus(status));
+        Ok(ExitStatus(status))
     }
 }
 

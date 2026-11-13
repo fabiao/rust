@@ -250,7 +250,7 @@ impl Thread {
             // thread's own destructors and free its TLS table directly,
             // mirroring `sys/thread/xous.rs`'s identical call.
             unsafe { crate::sys::thread_local::key::destroy_tls() };
-            ask_sys::exit(0);
+            ask_sys::exit(ask_sys::Payload::raw(0));
         }
 
         let entry = (entry_shim as *const ()).expose_provenance() as u64;
