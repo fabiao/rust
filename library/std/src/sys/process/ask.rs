@@ -425,15 +425,21 @@ impl Process {
 
     pub fn kill(&mut self) -> io::Result<()> {
         require_class2()?;
-        let mut payload = [0; ask_io::process::PROCESS_IDENTITY_LEN];
+        let mut payload = [0; ask_io::process::control::REQUEST_LEN];
+        let payload = ask_io::process::control::Request::Direct(self.identity)
+            .encode(&mut payload)
+            .ok_or(io::ErrorKind::InvalidInput)?;
         let mut guard = launcher()?;
         let completion = guard.call(
             ask_io::process::OP_CANCEL,
-            ask_io::process::encode_process_identity(&mut payload, self.identity),
+            payload,
         )?;
         drop(guard);
         if completion.result != ask_io::process::result::OK {
             return Err(map_process_result(completion.result));
+        }
+        if !completion.payload().is_empty() {
+            return Err(io::ErrorKind::InvalidData.into());
         }
         Ok(())
     }
