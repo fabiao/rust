@@ -1,4 +1,4 @@
-use ask_fd::{AliasTicket, BufferSpan, ErrorRecord, IoRequest, IoResult, OperationId, status};
+use ask_fd::{AttachmentTicket, BufferSpan, ErrorRecord, IoRequest, IoResult, OperationId, status};
 
 use crate::future::Future;
 use crate::io;
@@ -117,7 +117,7 @@ pub(crate) fn close(number: i32) {
 
 pub(crate) fn duplicate(number: i32) -> io::Result<OwnedFd> {
     let mut output = -1;
-    let mut ticket = AliasTicket::invalid();
+    let mut ticket = AttachmentTicket::invalid();
     retry(|error| unsafe {
         ask_fd::__askfd_duplicate(
             number,
@@ -138,7 +138,7 @@ pub(crate) fn duplicate(number: i32) -> io::Result<OwnedFd> {
 
 pub(crate) fn bind(binding: ask_fd::BindingRecord) -> io::Result<FileDesc> {
     let mut output = -1;
-    let mut ticket = AliasTicket::invalid();
+    let mut ticket = AttachmentTicket::invalid();
     retry(|error| unsafe {
         ask_fd::__askfd_bind(
             &binding,
@@ -512,12 +512,12 @@ pub(crate) fn lifecycle_error(code: u32) -> io::Error {
 }
 
 struct CapturedAlias {
-    ticket: AliasTicket,
+    ticket: AttachmentTicket,
 }
 
 impl CapturedAlias {
     fn acquire(number: i32) -> io::Result<Self> {
-        let mut ticket = AliasTicket::invalid();
+        let mut ticket = AttachmentTicket::invalid();
         retry(|error| unsafe { ask_fd::__askfd_acquire_alias(number, &mut ticket, error) })?;
         Ok(Self { ticket })
     }
@@ -537,7 +537,7 @@ impl Drop for CapturedAlias {
         if code == status::INVALID
             && record.domain == ask_fd::error_domain::OWNER
             && record.native_code == ask_fd::owner_error::BAD_FD
-            && unsafe { ask_fd::__askfd_release_alias(&self.ticket, &mut record) }
+            && unsafe { ask_fd::__askfd_release_attachment(&self.ticket, &mut record) }
                 == status::COMPLETE
         {
             return;
