@@ -1,4 +1,4 @@
-//! Process-local environment over the spawn-time `GetSpawnBlob` blob.
+//! Process-local environment over the runtime's spawn-time environment blob.
 //!
 //! The kernel's copy is immutable. Mutation here is PAL-local, matching
 //! libc `environ`: `set_var` is visible to later `var`/`Command` inherit
@@ -27,13 +27,9 @@ fn os_bytes(value: &OsStr) -> &[u8] {
 }
 
 fn load() -> Store {
-    let mut blob = [0u8; ask_abi::MAX_ARGV_ENV_LEN];
-    let len = match ask_sys::get_env(&mut blob) {
-        Ok(len) => len,
-        Err(_) => return Store { pairs: Vec::new() },
-    };
+    let blob = crate::sys::args::read_blob(askrust::env::vars);
     let mut pairs = Vec::new();
-    for entry in decode_nul_fields(blob.get(..len).unwrap_or(&[])) {
+    for entry in decode_nul_fields(&blob) {
         let Some(split) = entry.iter().position(|&b| b == b'=') else {
             continue;
         };

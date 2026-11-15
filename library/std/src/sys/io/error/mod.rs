@@ -8,8 +8,8 @@ cfg_select! {
         pub use motor::*;
     }
     target_os = "ask" => {
-        mod generic;
-        pub use generic::*;
+        mod ask;
+        pub use ask::*;
     }
     all(target_vendor = "fortanix", target_env = "sgx") => {
         mod sgx;

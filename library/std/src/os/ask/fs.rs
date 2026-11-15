@@ -76,7 +76,7 @@ impl MetadataExt for fs::Metadata {
         self.as_inner().native().allocated_size
     }
     fn changed_ns(&self) -> i64 {
-        self.as_inner().native().ctime_ns
+        self.as_inner().native().changed_ns
     }
 }
 
@@ -101,16 +101,16 @@ pub trait FileTypeExt {
 #[stable(feature = "rust1", since = "1.0.0")]
 impl FileTypeExt for fs::FileType {
     fn is_block_device(&self) -> bool {
-        self.as_inner().kind() == ask_io::fs::NodeKind::Block as u8
+        self.as_inner().kind() == askrust::fs::kind::BLOCK
     }
     fn is_char_device(&self) -> bool {
-        self.as_inner().kind() == ask_io::fs::NodeKind::Character as u8
+        self.as_inner().kind() == askrust::fs::kind::CHARACTER
     }
     fn is_fifo(&self) -> bool {
-        self.as_inner().kind() == ask_io::fs::NodeKind::Fifo as u8
+        self.as_inner().kind() == askrust::fs::kind::FIFO
     }
     fn is_socket(&self) -> bool {
-        self.as_inner().kind() == ask_io::fs::NodeKind::Socket as u8
+        self.as_inner().kind() == askrust::fs::kind::SOCKET
     }
 }
 

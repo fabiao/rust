@@ -27,12 +27,12 @@ macro_rules! standard_stream {
         }
     };
 }
-standard_stream!(crate::io::Stdin, ask_io::fd::number::STDIN);
-standard_stream!(crate::io::Stdout, ask_io::fd::number::STDOUT);
-standard_stream!(crate::io::Stderr, ask_io::fd::number::STDERR);
-standard_stream!(crate::io::StdinLock<'_>, ask_io::fd::number::STDIN);
-standard_stream!(crate::io::StdoutLock<'_>, ask_io::fd::number::STDOUT);
-standard_stream!(crate::io::StderrLock<'_>, ask_io::fd::number::STDERR);
+standard_stream!(crate::io::Stdin, askrust::fd::number::STDIN);
+standard_stream!(crate::io::Stdout, askrust::fd::number::STDOUT);
+standard_stream!(crate::io::Stderr, askrust::fd::number::STDERR);
+standard_stream!(crate::io::StdinLock<'_>, askrust::fd::number::STDIN);
+standard_stream!(crate::io::StdoutLock<'_>, askrust::fd::number::STDOUT);
+standard_stream!(crate::io::StderrLock<'_>, askrust::fd::number::STDERR);
 pub fn is_terminal<T: PalIsTerminal>(value: &T) -> bool {
     value.pal_is_terminal()
 }

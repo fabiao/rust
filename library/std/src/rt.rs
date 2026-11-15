@@ -143,7 +143,7 @@ pub(crate) fn cleanup() {
         #[cfg(not(target_os = "ask"))]
         crate::io::cleanup();
         #[cfg(target_os = "ask")]
-        if ask_entry::execution_class() != ask_fd::execution_class::CLASS1 {
+        if !askrust::rt::cooperative() {
             crate::io::cleanup();
         }
         // SAFETY: Only called once during runtime cleanup.

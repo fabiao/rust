@@ -1,8 +1,8 @@
-//! `std::process` PAL: signed packages through Launcher's `askio::process`.
+//! `std::process` PAL: signed packages launched through the ASK runtime.
 //!
 //! `Command::new` takes an installed package identity, not a filesystem path.
-//! Motor OS's `motor.rs` is the file-shape donor; ASK rewrites spawn around
-//! the descriptor launch transaction over the inherited Launcher authority.
+//! Motor OS's `motor.rs` is the file-shape donor; the runtime performs the
+//! descriptor launch transaction over the inherited Launcher authority.
 
 use super::CommandEnvs;
 use super::env::{CommandEnv, CommandResolvedEnvs};
@@ -10,28 +10,15 @@ use crate::ffi::{OsStr, OsString};
 use crate::num::NonZeroI32;
 use crate::path::Path;
 use crate::process::StdioPipes;
-use crate::sync::{Mutex, OnceLock};
+use crate::os::fd::FromRawFd;
 use crate::sys::FromInner;
-use crate::sys::channel::SyncChannel;
 use crate::sys::fd::FileDesc;
 use crate::sys::fs::File;
-#[path = "ask/activation.rs"]
-mod activation;
-use crate::sys::pal;
+use crate::sys::pal::{self, ask_error};
 use crate::sys::pipe::Pipe;
 use crate::{fmt, io};
 
 pub type EnvKey = OsString;
-
-static LAUNCHER: OnceLock<Mutex<SyncChannel>> = OnceLock::new();
-
-fn require_class2() -> io::Result<()> {
-    if crate::rt::ask_entry::execution_class() == ask_fd::execution_class::CLASS1 {
-        Err(io::Error::from(io::ErrorKind::WouldBlock))
-    } else {
-        Ok(())
-    }
-}
 
 pub enum Stdio {
     Inherit,
@@ -137,7 +124,6 @@ impl Command {
         default: Stdio,
         needs_stdin: bool,
     ) -> io::Result<(Process, StdioPipes)> {
-        require_class2()?;
         let stdin = match self.stdin.as_ref() {
             Some(stdin) => stdin.try_clone()?,
             None if needs_stdin => default.try_clone()?,
@@ -152,63 +138,33 @@ impl Command {
             None => default.try_clone()?,
         };
 
-        // The child inherits this process's umask and working directory;
-        // `current_dir` replaces the directory, resolved against ours.
-        let umask = crate::sys::fs::umask()?;
-        let mut directory = [0u8; ask_io::fs::PATH_MAX];
         let directory = match self.cwd.as_ref() {
-            Some(dir) => crate::sys::fs::absolute_view_path(Path::new(dir), &mut directory)?,
-            None => crate::sys::fs::working_directory(&mut directory)?,
+            Some(dir) => Some(
+                dir.to_str().ok_or_else(|| io::Error::from(io::ErrorKind::InvalidFilename))?,
+            ),
+            None => None,
         };
-
-        let name = package_name(&self.program)?;
         let argv = pack_os_fields(self.args.iter().map(OsString::as_os_str))?;
         let env_pairs: Vec<(OsString, OsString)> = self.env.capture().into_iter().collect();
         let env = pack_env_pairs(&env_pairs)?;
-        let mut stdin = plan_stdio(stdin, ask_io::fd::number::STDIN)?;
-        let mut stdout = plan_stdio(stdout, ask_io::fd::number::STDOUT)?;
-        let mut stderr = plan_stdio(stderr, ask_io::fd::number::STDERR)?;
-        let actions = [&stdin, &stdout, &stderr]
-            .into_iter()
-            .map(|plan| ask_io::fd::OrderedAction {
-                kind: ask_io::fd::action::DUP,
-                source: plan.source,
-                target: plan.target,
-                reserved: 0,
-            })
-            .collect::<Vec<_>>();
-        let launched = activation::launch(
-            name,
+        let mut stdin = plan_stdio(stdin, askrust::fd::number::STDIN)?;
+        let mut stdout = plan_stdio(stdout, askrust::fd::number::STDOUT)?;
+        let mut stderr = plan_stdio(stderr, askrust::fd::number::STDERR)?;
+        let child = askrust::process::spawn(
+            self.program.as_encoded_bytes(),
             &argv,
             &env,
-            activation::ProcessState { umask, working_directory: directory.as_bytes() },
-            &actions,
-        )?;
+            directory,
+            [stdin.source, stdout.source, stderr.source],
+        )
+        .map_err(ask_error)?;
         let pipes = StdioPipes {
             stdin: stdin.parent.take(),
             stdout: stdout.parent.take(),
             stderr: stderr.parent.take(),
         };
-        Ok((Process { identity: launched.identity(), status: None }, pipes))
+        Ok((Process { child, status: None }, pipes))
     }
-}
-
-fn package_name(program: &OsStr) -> io::Result<&[u8]> {
-    let bytes = program.as_encoded_bytes();
-    if bytes.is_empty()
-        || bytes.contains(&0)
-        || bytes.len() > ask_io::process::selector::MAX_LEN
-        || bytes.split(|byte| *byte == b'/').count() > 2
-        || bytes
-            .split(|byte| *byte == b'/')
-            .any(|part| part.is_empty() || part == b"." || part == b"..")
-    {
-        return Err(io::const_error!(
-            io::ErrorKind::NotFound,
-            "ask Command requires an installed package or package/entry selector"
-        ));
-    }
-    Ok(bytes)
 }
 
 fn pack_os_fields<'a, I>(fields: I) -> io::Result<Vec<u8>>
@@ -224,12 +180,6 @@ where
             out.push(0);
         }
         out.extend_from_slice(field.as_encoded_bytes());
-        if out.len() > ask_abi::MAX_ARGV_ENV_LEN {
-            return Err(io::const_error!(
-                io::ErrorKind::InvalidInput,
-                "argv exceeds MAX_ARGV_ENV_LEN"
-            ));
-        }
     }
     Ok(out)
 }
@@ -249,19 +199,12 @@ fn pack_env_pairs(pairs: &[(OsString, OsString)]) -> io::Result<Vec<u8>> {
         out.extend_from_slice(key.as_encoded_bytes());
         out.push(b'=');
         out.extend_from_slice(value.as_encoded_bytes());
-        if out.len() > ask_abi::MAX_ARGV_ENV_LEN {
-            return Err(io::const_error!(
-                io::ErrorKind::InvalidInput,
-                "environment exceeds MAX_ARGV_ENV_LEN"
-            ));
-        }
     }
     Ok(out)
 }
 
 struct StdioPlan {
     source: i32,
-    target: i32,
     _owned: Option<Stdio>,
     parent: Option<Pipe>,
 }
@@ -269,16 +212,20 @@ fn plan_stdio(spec: Stdio, target: i32) -> io::Result<StdioPlan> {
     let mut parent = None;
     let spec = match spec {
         Stdio::Inherit => Stdio::Fd(FileDesc::from_inner(crate::sys::fd::duplicate(target)?)),
-        Stdio::ParentStdout => {
-            Stdio::Fd(FileDesc::from_inner(crate::sys::fd::duplicate(ask_io::fd::number::STDOUT)?))
+        Stdio::ParentStdout => Stdio::Fd(FileDesc::from_inner(crate::sys::fd::duplicate(
+            askrust::fd::number::STDOUT,
+        )?)),
+        Stdio::ParentStderr => Stdio::Fd(FileDesc::from_inner(crate::sys::fd::duplicate(
+            askrust::fd::number::STDERR,
+        )?)),
+        Stdio::Null => {
+            let fd = askrust::fd::null().map_err(ask_error)?;
+            // SAFETY: the runtime returned a newly bound descriptor owned by the caller.
+            Stdio::Fd(unsafe { FileDesc::from_raw_fd(fd) })
         }
-        Stdio::ParentStderr => {
-            Stdio::Fd(FileDesc::from_inner(crate::sys::fd::duplicate(ask_io::fd::number::STDERR)?))
-        }
-        Stdio::Null => Stdio::Fd(crate::sys::fd::null()?),
         Stdio::MakePipe => {
             let (reader, writer) = crate::sys::pipe::pipe()?;
-            if target == ask_io::fd::number::STDIN {
+            if target == askrust::fd::number::STDIN {
                 parent = Some(writer);
                 Stdio::Pipe(reader)
             } else {
@@ -290,38 +237,14 @@ fn plan_stdio(spec: Stdio, target: i32) -> io::Result<StdioPlan> {
     };
     let source = match &spec {
         Stdio::Inherit => target,
-        Stdio::ParentStdout => ask_io::fd::number::STDOUT,
-        Stdio::ParentStderr => ask_io::fd::number::STDERR,
+        Stdio::ParentStdout => askrust::fd::number::STDOUT,
+        Stdio::ParentStderr => askrust::fd::number::STDERR,
         Stdio::InheritFile(file) => file.as_raw_fd(),
         Stdio::Pipe(pipe) => pipe.as_raw_fd(),
         Stdio::Fd(fd) => fd.as_raw_fd(),
         Stdio::Null | Stdio::MakePipe => return Err(pal::unsupported_err()),
     };
-    Ok(StdioPlan { source, target, _owned: Some(spec), parent })
-}
-
-fn launcher() -> io::Result<crate::sync::MutexGuard<'static, SyncChannel>> {
-    let cell = LAUNCHER.get_or_try_init(|| {
-        SyncChannel::create_leased(ask_abi::APP_LAUNCHER_TOKEN, ask_io::process::CHANNEL_PAGES)
-            .map(Mutex::new)
-            .map_err(|_| io::const_error!(io::ErrorKind::NotConnected, "launcher channel rejected"))
-    })?;
-    Ok(cell.lock().unwrap_or_else(|e| e.into_inner()))
-}
-
-fn map_process_result(result: i32) -> io::Error {
-    match result {
-        ask_io::process::result::NOT_FOUND => {
-            io::const_error!(io::ErrorKind::NotFound, "package not installed")
-        }
-        ask_io::process::result::DENIED => {
-            io::const_error!(io::ErrorKind::PermissionDenied, "launch denied")
-        }
-        ask_io::process::result::BUSY => {
-            io::const_error!(io::ErrorKind::WouldBlock, "launcher busy")
-        }
-        _ => io::const_error!(io::ErrorKind::Other, "launcher rejected the request"),
-    }
+    Ok(StdioPlan { source, _owned: Some(spec), parent })
 }
 
 impl From<Pipe> for Stdio {
@@ -358,10 +281,10 @@ impl fmt::Debug for Command {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct ExitStatus(ask_abi::termination::Outcome);
+pub struct ExitStatus(askrust::process::Outcome);
 
 impl Default for ExitStatus {
-    fn default() -> Self { Self(ask_abi::termination::Outcome::raw_exit(0)) }
+    fn default() -> Self { Self(askrust::process::Outcome::raw_exit(0)) }
 }
 
 impl ExitStatus {
@@ -376,7 +299,16 @@ impl ExitStatus {
 
 impl fmt::Display for ExitStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "exit status: {}", self.0)
+        match self.0.raw_exit_value() {
+            Some(value) => write!(f, "exit status: {value}"),
+            None => write!(
+                f,
+                "exit status: {}(label={:#x}, value={:#x})",
+                self.0.origin_name(),
+                self.0.label,
+                self.0.value
+            ),
+        }
     }
 }
 
@@ -414,70 +346,38 @@ impl From<u8> for ExitCode {
 }
 
 pub struct Process {
-    identity: ask_io::process::ProcessIdentity,
+    child: askrust::process::Child,
     status: Option<ExitStatus>,
 }
 
 impl Process {
     pub fn id(&self) -> u32 {
-        self.identity.pid as u32
+        self.child.pid as u32
     }
 
     pub fn kill(&mut self) -> io::Result<()> {
-        require_class2()?;
-        let mut payload = [0; ask_io::process::control::REQUEST_LEN];
-        let payload = ask_io::process::control::Request::Direct(self.identity)
-            .encode(&mut payload)
-            .ok_or(io::ErrorKind::InvalidInput)?;
-        let mut guard = launcher()?;
-        let completion = guard.call(
-            ask_io::process::OP_CANCEL,
-            payload,
-        )?;
-        drop(guard);
-        if completion.result != ask_io::process::result::OK {
-            return Err(map_process_result(completion.result));
-        }
-        if !completion.payload().is_empty() {
-            return Err(io::ErrorKind::InvalidData.into());
-        }
-        Ok(())
+        askrust::process::kill(self.child).map_err(ask_error)
     }
 
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
-        self.wait_flags(0)
+        self.wait_mode(false)
     }
 
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        match self.wait_flags(ask_io::process::wait_flag::NONBLOCK) {
+        match self.wait_mode(true) {
             Ok(status) => Ok(Some(status)),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
             Err(error) => Err(error),
         }
     }
 
-    fn wait_flags(&mut self, flags: u32) -> io::Result<ExitStatus> {
+    fn wait_mode(&mut self, nonblocking: bool) -> io::Result<ExitStatus> {
         if let Some(status) = self.status {
             return Ok(status);
         }
-        require_class2()?;
-        let mut payload = [0; ask_io::process::WAIT_REQUEST_LEN];
-        let mut guard = launcher()?;
-        let completion = guard.call(
-            ask_io::process::OP_WAIT,
-            ask_io::process::encode_wait_request(&mut payload, self.identity, flags),
-        )?;
-        drop(guard);
-        if completion.result == ask_io::process::result::BUSY {
-            return Err(io::const_error!(io::ErrorKind::WouldBlock, "child still running"));
-        }
-        if completion.result != ask_io::process::result::OK {
-            return Err(map_process_result(completion.result));
-        }
-        let status = ask_io::process::decode_exit_status(completion.payload())
-            .ok_or_else(pal::unsupported_err)?;
-        self.status = Some(ExitStatus(status));
-        Ok(ExitStatus(status))
+        let status = ExitStatus(askrust::process::wait(self.child, nonblocking).map_err(ask_error)?);
+        self.status = Some(status);
+        Ok(status)
     }
 }
 
@@ -521,5 +421,5 @@ pub fn read_output(
 }
 
 pub fn getpid() -> u32 {
-    ask_sys::get_pid_uncached() as u32
+    askrust::process::id()
 }

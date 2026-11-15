@@ -1,4 +1,4 @@
-//! Startup arguments from `GetSpawnBlob(SPAWN_BLOB_ARGV)`.
+//! Startup arguments from the runtime's spawn-time argument blob.
 //!
 //! The kernel copies an opaque NUL-separated blob and never parses it.
 //! Fields are separated, not terminated; a trailing empty field from an
@@ -16,13 +16,24 @@ fn os_from_bytes(bytes: &[u8]) -> OsString {
     OsString::from_inner(Buf { inner: bytes.to_vec() })
 }
 
+/// Copies a runtime blob, growing the buffer until the whole blob fits.
+pub(crate) fn read_blob(read: fn(&mut [u8]) -> askrust::Result<usize>) -> Vec<u8> {
+    let mut blob = Vec::new();
+    loop {
+        let Ok(len) = read(&mut blob) else {
+            return Vec::new();
+        };
+        if len <= blob.len() {
+            blob.truncate(len);
+            return blob;
+        }
+        blob.resize(len, 0);
+    }
+}
+
 fn load() -> Vec<OsString> {
-    let mut blob = [0u8; ask_abi::MAX_ARGV_ENV_LEN];
-    let len = match ask_sys::get_argv(&mut blob) {
-        Ok(len) => len,
-        Err(_) => return Vec::new(),
-    };
-    decode_nul_fields(blob.get(..len).unwrap_or(&[])).map(os_from_bytes).collect()
+    let blob = read_blob(askrust::env::args);
+    decode_nul_fields(&blob).map(os_from_bytes).collect()
 }
 
 pub(crate) fn decode_nul_fields(blob: &[u8]) -> impl Iterator<Item = &[u8]> {

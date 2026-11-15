@@ -5,26 +5,19 @@ use crate::io;
 use crate::path::{Path, PathBuf};
 
 pub fn getcwd() -> io::Result<PathBuf> {
-    let mut buffer = [0u8; ask_io::fs::PATH_MAX];
-    let path = crate::sys::fs::working_directory(&mut buffer)?;
-    Ok(PathBuf::from(path))
+    crate::sys::fs::read_string(askrust::fs::cwd).map(PathBuf::from)
 }
 
 pub fn temp_dir() -> PathBuf {
     crate::env::var_os("TMPDIR").map(PathBuf::from).unwrap_or_else(|| {
-        PathBuf::from(ask_io::path::compatibility::temporary::DIRECTORY.to_string_lossy().as_ref())
+        PathBuf::from(
+            crate::sys::fs::read_string(|buffer| Ok(askrust::fs::temp_dir(buffer)))
+                .unwrap_or_default(),
+        )
     })
 }
 
-/// The view root holds only mount points and is always a valid directory;
-/// any other target must be a reachable directory.
 pub fn chdir(path: &Path) -> io::Result<()> {
-    let mut buffer = [0u8; ask_io::fs::PATH_MAX];
-    let target = crate::sys::fs::absolute_view_path(path, &mut buffer)?;
-    if target != "/" && !crate::fs::metadata(target)?.is_dir() {
-        return Err(io::Error::from(io::ErrorKind::NotADirectory));
-    }
-    crate::sys::fd::retry(|error| unsafe {
-        ask_fd::__askfd_set_cwd(target.as_ptr(), target.len(), error)
-    })
+    let path = path.to_str().ok_or_else(|| io::Error::from(io::ErrorKind::InvalidFilename))?;
+    askrust::fs::set_cwd(path).map_err(crate::sys::pal::ask_error)
 }

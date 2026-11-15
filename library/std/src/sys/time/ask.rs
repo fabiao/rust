@@ -26,7 +26,7 @@ const NANOS_PER_MILLI: u32 = 1_000_000;
 
 impl Instant {
     pub fn now() -> Instant {
-        Instant(Duration::from_nanos(ask_sys::get_monotonic_ns()))
+        Instant(Duration::from_nanos(askrust::time::monotonic_ns()))
     }
 
     pub fn checked_sub_instant(&self, other: &Instant) -> Option<Duration> {
@@ -48,7 +48,7 @@ impl SystemTime {
     pub const MIN: SystemTime = SystemTime { secs: i64::MIN, nanos: 0 };
 
     pub fn now() -> SystemTime {
-        let millis = ask_sys::get_wall_time_ms();
+        let millis = askrust::time::wall_ms();
         SystemTime {
             secs: (millis / MILLIS_PER_SEC) as i64,
             nanos: (millis % MILLIS_PER_SEC) as u32 * NANOS_PER_MILLI,

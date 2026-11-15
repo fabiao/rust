@@ -1,7 +1,7 @@
 //! Standard streams capture the current resident descriptor for each operation.
 
 use crate::io;
-use crate::sys::fd::ask::{blocking, perform, request};
+use crate::sys::pal::ask_error;
 
 pub const STDIN_BUF_SIZE: usize = crate::sys::io::DEFAULT_BUF_SIZE;
 pub struct Stdin;
@@ -23,41 +23,30 @@ impl Stderr {
     }
 }
 
-fn read(number: i32, bytes: &mut [u8]) -> io::Result<usize> {
-    let result =
-        blocking(perform(number, request(ask_fd::action::READ, bytes.len()), &[], bytes))??;
-    usize::try_from(result.completed_count).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))
-}
-fn write(number: i32, bytes: &[u8]) -> io::Result<usize> {
-    let result =
-        blocking(perform(number, request(ask_fd::action::WRITE, bytes.len()), bytes, &mut []))??;
-    usize::try_from(result.completed_count).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))
-}
-fn flush(number: i32) -> io::Result<()> {
-    blocking(perform(number, request(ask_fd::action::FLUSH, 0), &[], &mut []))?.map(|_| ())
-}
+use askrust::fd::number::{STDERR, STDIN, STDOUT};
+
 impl io::Read for Stdin {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        read(ask_io::fd::number::STDIN, bytes)
+        askrust::fd::read(STDIN, bytes).map_err(ask_error)
     }
     fn read_buf(&mut self, cursor: io::BorrowedCursor<'_, u8>) -> io::Result<()> {
-        io::default_read_buf(|bytes| read(ask_io::fd::number::STDIN, bytes), cursor)
+        io::default_read_buf(|bytes| askrust::fd::read(STDIN, bytes).map_err(ask_error), cursor)
     }
 }
 impl io::Write for Stdout {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        write(ask_io::fd::number::STDOUT, bytes)
+        askrust::fd::write(STDOUT, bytes).map_err(ask_error)
     }
     fn flush(&mut self) -> io::Result<()> {
-        flush(ask_io::fd::number::STDOUT)
+        askrust::fd::flush(STDOUT).map_err(ask_error)
     }
 }
 impl io::Write for Stderr {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        write(ask_io::fd::number::STDERR, bytes)
+        askrust::fd::write(STDERR, bytes).map_err(ask_error)
     }
     fn flush(&mut self) -> io::Result<()> {
-        flush(ask_io::fd::number::STDERR)
+        askrust::fd::flush(STDERR).map_err(ask_error)
     }
 }
 pub fn panic_output() -> Option<impl io::Write> {

@@ -39,63 +39,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "askabi"
+name = "askrust"
 version = "0.1.0"
 dependencies = [
- "rustc-std-workspace-core",
-]
-
-[[package]]
-name = "askalloc"
-version = "0.1.0"
-dependencies = [
- "askabi",
- "asksys",
- "dlmalloc 0.2.14",
- "rustc-std-workspace-core",
-]
-
-[[package]]
-name = "askfd"
-version = "0.1.0"
-dependencies = [
- "askabi",
- "askio",
- "rustc-std-workspace-core",
-]
-
-[[package]]
-name = "askio"
-version = "0.1.0"
-dependencies = [
- "askabi",
- "rustc-std-workspace-core",
-]
-
-[[package]]
-name = "askipc"
-version = "0.1.0"
-dependencies = [
- "askabi",
- "askfd",
- "askio",
- "asksys",
- "rustc-std-workspace-core",
-]
-
-[[package]]
-name = "asklog"
-version = "0.1.0"
-dependencies = [
- "rustc-std-workspace-core",
-]
-
-[[package]]
-name = "asksys"
-version = "0.1.0"
-dependencies = [
- "askabi",
- "asklog",
  "rustc-std-workspace-core",
 ]
 
@@ -136,16 +82,6 @@ version = "0.0.0"
 dependencies = [
  "rand",
  "rand_xorshift 0.4.0",
-]
-
-[[package]]
-name = "dlmalloc"
-version = "0.2.14"
-dependencies = [
- "cfg-if",
- "libc",
- "rustc-std-workspace-core",
- "windows-sys",
 ]
 
 [[package]]
@@ -428,15 +364,10 @@ version = "0.0.0"
 dependencies = [
  "addr2line",
  "alloc",
- "askabi",
- "askalloc",
- "askfd",
- "askio",
- "askipc",
- "asksys",
+ "askrust",
  "cfg-if",
  "core",
- "dlmalloc 0.2.14 (registry+https://github.com/rust-lang/crates.io-index)",
+ "dlmalloc",
  "fortanix-sgx-abi",
  "hashbrown",
  "hermit-abi",

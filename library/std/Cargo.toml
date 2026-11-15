@@ -73,28 +73,11 @@ fortanix-sgx-abi = { version = "0.7.0", features = [
 [target.'cfg(target_os = "motor")'.dependencies]
 moto-rt = { version = "0.17", features = ['rustc-dep-of-std'], public = true }
 
-# In-tree only (askabi/, the canonical ask superproject crate — no separate
-# vendored copy, which used to exist and drifted silently more than once,
-# docs/rust-toolchain_history.md) — not published to crates.io, so a path
-# dependency like windows_link's rather than a version.
+# `askrust` declares the ASK runtime interface and depends only on `core`; the
+# runtime itself is linked into each executable, so ASK library and kernel
+# changes do not rebuild std. In-tree path dependency, not published.
 [target.'cfg(target_os = "ask")'.dependencies]
-ask_fd = { package = "askfd", path = "../../../../../core/libs/askfd/source", features = [
-    "rustc-dep-of-std",
-] }
-ask_abi = { package = "askabi", path = "../../../../../core/libs/askabi/source", features = [
-    "rustc-dep-of-std",
-], public = true }
-ask_ipc = { package = "askipc", path = "../../../../../core/libs/askipc/source", features = [
-    "rustc-dep-of-std",
-    "fd",
-], public = true }
-ask_io = { package = "askio", path = "../../../../../core/libs/askio/source", features = [
-    "rustc-dep-of-std",
-], public = true }
-ask_sys = { package = "asksys", path = "../../../../../core/libs/asksys/source", features = [
-    "rustc-dep-of-std",
-], public = true }
-ask_alloc = { package = "askalloc", path = "../../../../../core/libs/askalloc/source", features = [
+askrust = { path = "../../../../../core/libs/askrust/source", features = [
     "rustc-dep-of-std",
 ] }
 

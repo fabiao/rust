@@ -85,7 +85,7 @@ fn tls_table_slow() -> &'static mut [*mut u8] {
     if table.is_null() {
         alloc::handle_alloc_error(table_layout());
     }
-    if ask_sys::set_fs_base(table.expose_provenance() as u64).is_err() {
+    if unsafe { askrust::thread::set_tls_base(table.cast()) }.is_err() {
         // Safety: `table` was just allocated with `table_layout()` above and
         // is being abandoned since this thread cannot use it without a
         // working `%fs` base.

@@ -776,9 +776,22 @@ pub(crate) async fn drain_ask() -> io::Result<()> {
     } else { Vec::new() };
     let mut bytes = bytes.as_slice();
     while !bytes.is_empty() {
-        let request = crate::sys::fd::ask::request(ask_fd::action::WRITE, bytes.len());
-        let result = crate::sys::fd::ask::perform(ask_io::fd::number::STDOUT, request, bytes, &mut []).await?;
-        let count = usize::try_from(result.completed_count).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
+        let count = {
+            // SAFETY: `bytes` outlives the operation, which drops at the end of this block.
+            let mut op = unsafe { askrust::fd::write_start(askrust::fd::number::STDOUT, bytes) }
+                .map_err(crate::sys::ask_error)?;
+            crate::future::poll_fn(|cx| match op.poll() {
+                askrust::op::Poll::Pending => crate::task::Poll::Pending,
+                askrust::op::Poll::Retry => {
+                    cx.waker().wake_by_ref();
+                    crate::task::Poll::Pending
+                }
+                askrust::op::Poll::Ready(result) => crate::task::Poll::Ready(result),
+            })
+            .await
+            .map_err(crate::sys::ask_error)?
+        };
+        let count = usize::try_from(count).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
         if count == 0 { return Err(io::Error::from(io::ErrorKind::WriteZero)); }
         bytes = bytes.get(count..).ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
     }
