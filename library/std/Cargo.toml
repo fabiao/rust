@@ -86,7 +86,7 @@ ask_abi = { package = "askabi", path = "../../../../../core/libs/askabi/source",
 ], public = true }
 ask_ipc = { package = "askipc", path = "../../../../../core/libs/askipc/source", features = [
     "rustc-dep-of-std",
-    "directory",
+    "fd",
 ], public = true }
 ask_io = { package = "askio", path = "../../../../../core/libs/askio/source", features = [
     "rustc-dep-of-std",
