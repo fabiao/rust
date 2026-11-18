@@ -7,7 +7,7 @@
 //! `%fs`-relative storage, so `%fs:0` is used the same way: a self-pointer
 //! to this thread's own TLS-key table, mirroring `askposix::pthread`'s
 //! identical `ThreadControl::self_ptr`-at-`%fs:0` convention
-//! (`recipes/essentials/askposix/source/src/pthread.rs`) — two independent
+//! (`askposix`, `src/pthread.rs`) — two independent
 //! Class 2 runtimes on ask, `std` and askposix, both landed on the same
 //! "self-pointer at `%fs:0`" idiom for the same reason (no ELF TLS
 //! relocations on this target, `has_thread_local: false`).
