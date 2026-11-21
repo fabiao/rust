@@ -333,14 +333,18 @@ impl CaptureExecutor {
             matches!(kind, "bin" | "cdylib" | "dylib")));
         if !final_kind { return Ok(None); }
         let policy_value: Value = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-        let client = policy_value["client_extern_name"].as_str().ok_or("missing startup client name")?;
+        let client = &policy_value["cargo_startup_client"];
         let approved: BTreeSet<PathBuf> = serde_json::from_value(policy_value["primitive_manifests"].clone())
             .map_err(|error| error.to_string())?;
-        let mut pending = if policy_value["owner_input"].is_string() {
-            vec![key.to_owned()]
-        } else {
-            Vec::new()
-        };
+        let mut pending = Vec::new();
+        if !client.is_null() {
+            let manifest = Path::new(client["manifest"].as_str().ok_or("startup client manifest missing")?);
+            if !approved.contains(manifest) || client["library"].as_str().is_none()
+                || client["feature"].as_str().is_none() {
+                return Err("invalid Cargo startup client policy".into());
+            }
+            pending.push(key.to_owned());
+        }
         let mut visited = BTreeSet::new();
         let mut clients = BTreeSet::new();
         let platform = &self.graph["units"][key]["unit"]["platform"];
@@ -349,10 +353,10 @@ impl CaptureExecutor {
             let node = &self.graph["units"][&unit];
             let descriptor = &node["unit"];
             if descriptor["platform"] != *platform { continue; }
-            if descriptor["target"]["name"] == client && descriptor["mode"] == "build"
-                && descriptor["target"]["kind"].as_array().is_some_and(|kinds| kinds.iter().any(|kind| kind == "lib")) {
-                let manifest = PathBuf::from(descriptor["manifest"].as_str().ok_or("startup client omits manifest")?);
-                if !approved.contains(&manifest) {
+            if descriptor["target"]["name"] == client["library"] && descriptor["mode"] == "build"
+                && descriptor["target"]["kind"].as_array().is_some_and(|kinds| kinds.iter().any(|kind| kind == "lib"))
+                && descriptor["features"].as_array().is_some_and(|features| features.contains(&client["feature"])) {
+                if descriptor["manifest"] != client["manifest"] {
                     return Err("startup client does not belong to an approved native manifest".into());
                 }
                 clients.insert(unit.clone());
