@@ -11,8 +11,8 @@ use rustc_macros::extension;
 use rustc_middle::mir::{Body, ConstraintCategory};
 use rustc_middle::ty::{
     self, DefiningScopeKind, DefinitionSiteHiddenType, FallibleTypeFolder, Flags, GenericArg,
-    GenericArgsRef, OpaqueTypeKey, ProvisionalHiddenType, Region, RegionVid, Ty, TyCtxt,
-    TypeFoldable, TypeSuperFoldable, TypeVisitableExt, Unnormalized, fold_regions,
+    GenericArgs, OpaqueTypeKey, ProvisionalHiddenType, Region, RegionVid, Ty, TyCtxt, TypeFoldable,
+    TypeSuperFoldable, TypeVisitableExt, Unnormalized, fold_regions,
 };
 use rustc_mir_dataflow::points::DenseLocationMap;
 use rustc_span::Span;
@@ -252,7 +252,7 @@ fn collect_defining_uses<'tcx>(
     let mut defining_uses = vec![];
     for &(opaque_type_key, hidden_type) in opaque_types {
         let non_nll_opaque_type_key = opaque_type_key.fold_captured_lifetime_args(infcx.tcx, |r| {
-            nll_var_to_universal_region(&rcx, r.as_var()).unwrap_or(r)
+            nll_var_to_universal_region(rcx, r.as_var()).unwrap_or(r)
         });
         if let Err(err) = opaque_type_has_defining_use_args(
             infcx,
@@ -439,8 +439,8 @@ impl<'a, 'tcx> ToArgRegionsFolder<'a, 'tcx> {
     fn fold_closure_args(
         &mut self,
         def_id: DefId,
-        args: GenericArgsRef<'tcx>,
-    ) -> Result<GenericArgsRef<'tcx>, RegionVid> {
+        args: GenericArgs<'tcx>,
+    ) -> Result<GenericArgs<'tcx>, RegionVid> {
         let generics = self.cx().generics_of(def_id);
         self.cx().mk_args_from_iter(args.iter().enumerate().map(|(index, arg)| {
             if index < generics.parent_count {

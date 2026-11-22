@@ -223,7 +223,7 @@ fn predicate_references_self<'tcx>(
     match predicate.kind().skip_binder() {
         ty::ClauseKind::Trait(ref data) => {
             // In the case of a trait predicate, we can skip the "self" type.
-            data.trait_ref.args[1..]
+            data.trait_ref.args.as_slice()[1..]
                 .iter()
                 .any(|&arg| {
                     contains_illegal_self_type_reference(
@@ -251,7 +251,7 @@ fn predicate_references_self<'tcx>(
             //
             // This is ALT2 in issue #56288, see that for discussion of the
             // possible alternatives.
-            data.projection_term.args[1..]
+            data.projection_term.args.as_slice()[1..]
                 .iter()
                 .any(|&arg| {
                     contains_illegal_self_type_reference(
@@ -276,6 +276,8 @@ fn predicate_references_self<'tcx>(
 
         // FIXME(generic_const_exprs): this can mention `Self`
         ty::ClauseKind::ConstEvaluatable(..) => None,
+
+        ty::ClauseKind::CompressedTrait(..) => unreachable!(),
     }
 }
 
@@ -339,6 +341,7 @@ fn generics_require_sized_self(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
         | ty::ClauseKind::ConstEvaluatable(_)
         | ty::ClauseKind::UnstableFeature(_)
         | ty::ClauseKind::HostEffect(..) => false,
+        ty::ClauseKind::CompressedTrait(_) => unreachable!(),
     })
 }
 
@@ -361,7 +364,10 @@ pub fn dyn_compatibility_violations_for_assoc_item(
     let span = || item.ident(tcx).span;
 
     match item.kind {
-        ty::AssocKind::Const { name } => {
+        ty::AssocKind::Const { data: ty::AssocConstData::Anonymous } => {
+            panic!("anonymous associated consts shouldn't end up here")
+        }
+        ty::AssocKind::Const { data: ty::AssocConstData::Named(name) } => {
             // We will permit type associated consts if they are explicitly mentioned in the
             // trait object type. We can't check this here, as here we only check if it is
             // guaranteed to not be possible.
@@ -813,7 +819,7 @@ fn receiver_is_dispatchable<'tcx>(
 
         normalize_param_env_or_error(
             tcx,
-            ty::ParamEnv::new(tcx, clauses),
+            clauses,
             ObligationCause::dummy_with_span(tcx.def_span(method.def_id)),
         )
     };
@@ -1027,27 +1033,30 @@ fn contains_illegal_impl_trait_in_trait<'tcx>(
     fn_def_id: DefId,
     ty: ty::Binder<'tcx, Ty<'tcx>>,
 ) -> Option<MethodViolation> {
+    if !ty.has_aliases() {
+        // RPITIT is a projection, short-circuit if none exist.
+        return None;
+    }
+
     let ty = tcx.liberate_late_bound_regions(fn_def_id, ty);
 
     if tcx.asyncness(fn_def_id).is_async() {
         // Rendering the error as a separate `async-specific` message is better.
         Some(MethodViolation::AsyncFn)
     } else {
-        ty.visit_with(&mut IllegalRpititVisitor { tcx, allowed: None }).break_value()
+        ty.visit_with(&mut IllegalRpititVisitor { tcx }).break_value()
     }
 }
 
 struct IllegalRpititVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
-    allowed: Option<ty::AliasTy<'tcx>>,
 }
 
 impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for IllegalRpititVisitor<'tcx> {
     type Result = ControlFlow<MethodViolation>;
 
     fn visit_ty(&mut self, ty: Ty<'tcx>) -> Self::Result {
-        if let ty::Alias(_, proj @ ty::AliasTy { kind: ty::Projection { def_id }, .. }) = *ty.kind()
-            && Some(proj) != self.allowed
+        if let ty::Alias(_, ty::AliasTy { kind: ty::Projection { def_id }, .. }) = *ty.kind()
             && self.tcx.is_impl_trait_in_trait(def_id)
         {
             ControlFlow::Break(MethodViolation::ReferencesImplTraitInTrait(

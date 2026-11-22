@@ -674,11 +674,21 @@ pub const CONFIG_CHANGE_HISTORY: &[ChangeInfo] = &[
     ChangeInfo {
         change_id: 162423,
         severity: ChangeSeverity::Warning,
-        summary: "You should now use `x install rust-src` instead of `x install src` to install the standard library source component. If you want to install it as part of a custom `build.tools` set, include `rust-src` in `build.tools.",
+        summary: "You should now use `x install rust-src` instead of `x install src` to install the standard library source component. If you want to install it as part of a custom `build.tools` set, include `rust-src` in `build.tools.`",
+    },
+    ChangeInfo {
+        change_id: 165034,
+        severity: ChangeSeverity::Info,
+        summary: "You can now specify rustc_perf as an external repository, using `build.rustc-perf-path = '/home/meower/my-rustc-perf'`",
     },
     ChangeInfo {
         change_id: 163731,
         severity: ChangeSeverity::Info,
         summary: "A new option `llvm.tpde` has been added to control whether the TPDE pass plugin should be built as an experimental alternative LLVM backend.",
+    },
+    ChangeInfo {
+        change_id: 165707,
+        severity: ChangeSeverity::Info,
+        summary: "`low-priority` is now enabled by default aside from `bootstrap.dist.toml`, which is optimal for the overwhelming majority of situations.",
     },
 ];

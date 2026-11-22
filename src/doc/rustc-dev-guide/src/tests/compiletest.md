@@ -477,6 +477,10 @@ causing separate files to be generated for 32bit and 64bit systems.
 > (including transitively via `rust.debug` or `rust.debug-assertions`),
 > they will not be run!
 
+Similarly,
+to generate separate files for each panic strategy ("panic-abort" and "panic-unwind"),
+add `// EMIT_MIR_FOR_EACH_PANIC_STRATEGY` to the test.
+
 [`tests/mir-opt`]: https://github.com/rust-lang/rust/tree/HEAD/tests/mir-opt
 [`ignore-std-debug-assertions` directive]: ./directives.md#controlling-when-tests-are-run
 
@@ -803,6 +807,64 @@ pub fn identity(ts: TokenStream) -> TokenStream {
 > the `aux-build` header, and use `#![crate_type="proc_macro"]`, and `//@
 > force-host` and `//@ no-prefer-dynamic` headers in the proc-macro.
 
+### Auxiliary lint
+
+By using an `aux-lint` directive in a `ui-fulldeps` test, you can build a 'lint library' file which will be loaded into rustc's lints when running your test.
+
+```rs
+// tests/ui-fulldeps/lint_test.rs
+
+//@ aux-lint: my_lint.rs
+
+fn main() {
+  trigger_lint(); //~ ERROR this triggered the lint
+}
+```
+
+```rs
+// tests/ui-fulldeps/auxiliary/my_lint.rs
+
+#![feature(rustc_private)]
+
+extern crate rustc_driver;
+extern crate rustc_errors;
+extern crate rustc_hir;
+extern crate rustc_lint;
+extern crate rustc_macros;
+extern crate rustc_session;
+
+use rustc_lint::{LateContext, LateLintPass, LintContext};
+use rustc_macros::Diagnostic;
+use rustc_session::{declare_lint_pass, declare_tool_lint};
+
+declare_tool_lint! {
+    pub example::EXAMPLE_LINT,
+    Deny,
+    "some example lint"
+}
+declare_lint_pass!(ExampleLint => [EXAMPLE_LINT]);
+
+#[derive(Diagnostic)]
+#[diag("this triggered the lint")]
+pub(crate) struct Example;
+
+impl LateLintPass<'_> for ExampleLint {
+    // lint implementation
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn register_lints(
+    sess: &rustc_session::Session,
+    lint_store: &mut rustc_lint::LintStore,
+) {
+    lint_store.register_lints(&[HELLO_LINT]);
+    lint_store.register_late_pass(|_| Box::new(HelloLint));
+}
+```
+
+> **Note**: The `register_lints` signature must match _exactly_,
+> as it will be dynamically loaded by the test runner.
+
 ## Revisions
 
 Revisions allow a single test file to be used for multiple tests.
@@ -822,7 +884,7 @@ after `//` for UI error annotations, like so:
 
 ```rust,ignore
 // A flag to pass in only for cfg `foo`:
-//@[foo]compile-flags: -Z verbose-internals
+//@[foo] compile-flags: -Z verbose-internals
 
 #[cfg(foo)]
 fn test_foo() {

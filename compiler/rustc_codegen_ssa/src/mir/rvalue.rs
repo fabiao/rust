@@ -430,7 +430,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 // Notably, Scalar ⇌ ScalarPair cases go here to avoid padding
                 // and endianness issues, as do SimdVector ones to avoid worrying
                 // about things like f32x8 ⇌ ptrx4 that would need multiple steps.
-                let align = Ord::max(operand.layout.align.abi, cast.align.abi);
+                let align = Ord::max(operand.layout.align, cast.align);
                 let size = Ord::max(operand.layout.size, cast.size);
                 let temp = PlaceValue::alloca(bx, size, align);
                 bx.lifetime_start(temp.llval, size);
@@ -965,11 +965,10 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                     // so offsetting a pointer to ZST is a noop.
                     lhs
                 } else {
-                    let llty = bx.cx().backend_type(pointee_layout);
                     if !rhs_ty.is_signed() {
-                        bx.inbounds_nuw_gep(llty, lhs, &[rhs])
+                        bx.inbounds_nuw_gep(pointee_layout.size, lhs, rhs)
                     } else {
-                        bx.inbounds_gep(llty, lhs, &[rhs])
+                        bx.inbounds_gep(pointee_layout.size, lhs, rhs)
                     }
                 }
             }

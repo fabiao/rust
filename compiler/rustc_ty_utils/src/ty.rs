@@ -74,6 +74,9 @@ fn sizedness_constraint_for_ty<'tcx>(
         ty::Placeholder(..) | ty::Bound(..) | ty::Infer(..) => {
             bug!("unexpected type `{ty:?}` in `sizedness_constraint_for_ty`")
         }
+
+        // FIXME(scrabsha)
+        ty::View(..) => unimplemented!(),
     }
 }
 
@@ -196,10 +199,8 @@ fn param_env(tcx: TyCtxt<'_>, def_id: DefId) -> ty::ParamEnv<'_> {
 
     let local_did = def_id.as_local().unwrap_or(CRATE_DEF_ID);
 
-    let unnormalized_env = ty::ParamEnv::new(tcx, clauses);
-
     let cause = traits::ObligationCause::misc(tcx.def_span(def_id), local_did);
-    traits::normalize_param_env_or_error(tcx, unnormalized_env, cause)
+    traits::normalize_param_env_or_error(tcx, clauses, cause)
 }
 
 /// Walk through a function type, gathering all RPITITs and installing a
@@ -393,6 +394,9 @@ fn impl_self_is_guaranteed_unsized<'tcx>(tcx: TyCtxt<'tcx>, impl_def_id: DefId) 
         | ty::Placeholder(_)
         | ty::Infer(_)
         | ty::Error(_) => false,
+
+        // FIXME(scrabsha)
+        ty::View(..) => unimplemented!(),
     }
 }
 

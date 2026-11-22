@@ -284,7 +284,7 @@ pub enum TyKind<I: Interner> {
     /// the type of the coroutine, we convert them to higher ranked
     /// lifetimes bound by the witness itself.
     ///
-    /// This contains the `DefId` and the `GenericArgsRef` of the coroutine.
+    /// This contains the `DefId` and the `GenericArg` of the coroutine.
     /// The actual witness types are computed on MIR by the `mir_coroutine_witnesses` query.
     ///
     /// Looking at the following example, the witness for this coroutine
@@ -306,6 +306,20 @@ pub enum TyKind<I: Interner> {
 
     /// A tuple type. For example, `(i32, bool)`.
     Tuple(I::Tys),
+
+    /// A view over an [`Adt`].
+    ///
+    /// Takes an ADT and restricts the fields that can be accessed. The layout
+    /// is the same as the initial ADT. View types are `!MetaSized`.
+    ///
+    /// The fields that can be accessed are encoded as a tuple of `FieldRepresentingType`.
+    /// For instance, `view_type!(MyStruct.{ field1, field2 })` is represented as
+    /// `View(MyStruct, [], (field_of!(MyStruct.field1), field_of!(FieldInfo.field2)))`.
+    ///
+    /// Refer to the [View types experiment][1] project goal for more infos.
+    ///
+    /// [1]: https://goals.rust-lang.org/2026/view-types-experiment.html
+    View(I::AdtDef, I::GenericArgs, I::Ty),
 
     /// A projection, opaque type, free type alias, or inherent associated type.
     ///
@@ -361,24 +375,48 @@ pub enum TyKind<I: Interner> {
 impl<I: Interner> Eq for TyKind<I> {}
 
 impl<I: Interner> TyKind<I> {
-    pub fn fn_sig(self, interner: I) -> ty::Binder<I, ty::FnSig<I>> {
-        self.unnormalized_fn_sig(interner).skip_normalization()
-    }
-
     pub fn unnormalized_fn_sig(self, interner: I) -> Unnormalized<I, ty::Binder<I, ty::FnSig<I>>> {
         match self {
             ty::FnPtr(sig_tys, hdr) => Unnormalized::new_wip(sig_tys.with(hdr)),
             ty::FnDef(def_id, args) => {
                 interner.fn_sig(def_id).instantiate(interner, args.no_bound_vars().unwrap())
             }
-            ty::Error(_) => {
-                // ignore errors (#54954)
-                Unnormalized::dummy(ty::Binder::dummy(ty::FnSig::dummy()))
-            }
+            // ignore errors (#54954)
+            ty::Error(_) => Unnormalized::dummy(ty::Binder::dummy(ty::FnSig::dummy())),
             ty::Closure(..) => panic!(
                 "to get the signature of a closure, use `args.as_closure().sig()` not `fn_sig()`",
             ),
             _ => panic!("Ty::fn_sig() called on non-fn type: {:?}", self),
+        }
+    }
+
+    pub fn fn_sig(self, interner: I) -> ty::Binder<I, ty::FnSig<I>> {
+        self.unnormalized_fn_sig(interner).skip_normalization()
+    }
+
+    pub fn fn_sig_abi(self, interner: I) -> ExternAbi {
+        match self {
+            ty::FnPtr(_, hdr) => hdr.abi(),
+            ty::FnDef(def_id, _) => interner.fn_sig(def_id).skip_binder().abi(),
+            // ignore errors (#54954)
+            ty::Error(_) => FnSig::<I>::dummy().abi(),
+            ty::Closure(..) => panic!(
+                "to get the ABI of a closure, use `args.as_closure().sig().abi()` not `fn_sig_abi()`",
+            ),
+            _ => panic!("`fn_sig_abi` called on non-fn type: {:?}", self),
+        }
+    }
+
+    pub fn fn_sig_safety(self, interner: I) -> I::Safety {
+        match self {
+            ty::FnPtr(_, hdr) => hdr.safety(),
+            ty::FnDef(def_id, _) => interner.fn_sig(def_id).skip_binder().safety(),
+            // ignore errors (#54954)
+            ty::Error(_) => FnSig::<I>::dummy().safety(),
+            ty::Closure(..) => panic!(
+                "to get the safety of a closure, use `args.as_closure().sig().safety()` not `fn_sig_safety()`",
+            ),
+            _ => panic!("`fn_sig_safety` called on non-fn type: {:?}", self),
         }
     }
 
@@ -421,6 +459,9 @@ impl<I: Interner> TyKind<I> {
             | ty::Param(_)
             | ty::Bound(_, _)
             | ty::Placeholder(_) => false,
+
+            // FIXME(scrabsha)
+            ty::View(..) => unimplemented!(),
         }
     }
 }
@@ -488,6 +529,9 @@ impl<I: Interner> fmt::Debug for TyKind<I> {
             Placeholder(p) => write!(f, "{p:?}"),
             Infer(t) => write!(f, "{:?}", t),
             TyKind::Error(_) => write!(f, "{{type error}}"),
+
+            // FIXME(scrabsha)
+            ty::View(..) => unimplemented!(),
         }
     }
 }
@@ -606,10 +650,16 @@ impl<I: Interner> AliasTy<I> {
     /// For example, if this is a projection of `<T as StreamingIterator>::Item<'a>`,
     /// then this function would return a `T: StreamingIterator` trait reference and
     /// `['a]` as the own args.
-    pub fn trait_ref_and_own_args(self, interner: I) -> (ty::TraitRef<I>, I::GenericArgsSlice) {
+    pub fn trait_ref_and_own_args<'a>(
+        &'a self,
+        interner: I,
+    ) -> (ty::TraitRef<I>, I::GenericArgsSlice<'a>)
+    where
+        I: 'a,
+    {
         let AliasTyKind::Projection { def_id } = self.kind else { panic!("expected a projection") };
 
-        interner.trait_ref_and_own_args_for_alias(def_id.into(), self.args)
+        interner.trait_ref_and_own_args_for_alias(def_id.into(), &self.args)
     }
 
     /// Extracts the underlying trait reference from this projection.
@@ -1166,7 +1216,7 @@ impl<I: Interner> FnSig<I> {
     }
 
     pub fn is_fn_trait_compatible(self) -> bool {
-        !self.c_variadic() && self.safety().is_safe() && self.abi() == ExternAbi::Rust
+        !self.c_variadic() && self.safety().is_safe() && self.abi().is_fn_trait_compatible()
     }
 
     /// Set the safety flag.

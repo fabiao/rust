@@ -12,8 +12,8 @@ use rustc_span::{DUMMY_SP, Span, Symbol, bug};
 use rustc_type_ir::lang_items::{SolverAdtLangItem, SolverProjectionLangItem, SolverTraitLangItem};
 use rustc_type_ir::solve::CanonicalInputData;
 use rustc_type_ir::{
-    BoundVar, CollectAndApply, DebruijnIndex, Interner, RegionVid, TypeFoldable, Unnormalized,
-    VisitorResult, WithCachedTypeInfo, search_graph, try_visit,
+    BoundVar, CollectAndApply, DebruijnIndex, IncludeSizedImplicitBounds, Interner, RegionVid,
+    TypeFoldable, Unnormalized, VisitorResult, WithCachedTypeInfo, search_graph, try_visit,
 };
 
 use crate::dep_graph::{DepKind, DepNodeIndex};
@@ -61,9 +61,12 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
     type InherentAssocTermId = DefId;
     type Span = Span;
 
-    type GenericArgs = ty::GenericArgsRef<'tcx>;
+    type GenericArgs = ty::GenericArgs<'tcx>;
 
-    type GenericArgsSlice = &'tcx [ty::GenericArg<'tcx>];
+    type GenericArgsSlice<'a>
+        = &'a [ty::GenericArg<'tcx>]
+    where
+        Self: 'a;
     type GenericArg = ty::GenericArg<'tcx>;
     type Term = ty::Term<'tcx>;
     type BoundVarKinds = &'tcx List<ty::BoundVariableKind<'tcx>>;
@@ -244,26 +247,26 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
         self.adt_def(adt_def_id)
     }
 
-    fn trait_ref_and_own_args_for_alias(
+    fn trait_ref_and_own_args_for_alias<'a>(
         self,
         def_id: DefId,
-        args: ty::GenericArgsRef<'tcx>,
-    ) -> (ty::TraitRef<'tcx>, &'tcx [ty::GenericArg<'tcx>]) {
+        args: &'a ty::GenericArgs<'tcx>,
+    ) -> (ty::TraitRef<'tcx>, &'a [ty::GenericArg<'tcx>]) {
         debug_assert_matches!(self.def_kind(def_id), DefKind::AssocTy | DefKind::AssocConst);
         let trait_def_id = self.parent(def_id);
         debug_assert_matches!(self.def_kind(trait_def_id), DefKind::Trait);
-        let trait_ref = ty::TraitRef::from_assoc(self, trait_def_id, args);
-        (trait_ref, &args[trait_ref.args.len()..])
+        let trait_ref = ty::TraitRef::from_assoc(self, trait_def_id, *args);
+        (trait_ref, &args.as_slice()[trait_ref.args.len()..])
     }
 
-    fn mk_args(self, args: &[Self::GenericArg]) -> ty::GenericArgsRef<'tcx> {
+    fn mk_args(self, args: &[Self::GenericArg]) -> ty::GenericArgs<'tcx> {
         self.mk_args(args)
     }
 
     fn mk_args_from_iter<I, T>(self, args: I) -> T::Output
     where
         I: Iterator<Item = T>,
-        T: CollectAndApply<Self::GenericArg, ty::GenericArgsRef<'tcx>>,
+        T: CollectAndApply<Self::GenericArg, ty::GenericArgs<'tcx>>,
     {
         self.mk_args_from_iter(args)
     }
@@ -271,19 +274,19 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
     fn check_alias_term_args_compatible(
         self,
         kind: ty::AliasTermKind<'tcx>,
-        args: ty::GenericArgsRef<'tcx>,
+        args: ty::GenericArgs<'tcx>,
     ) -> bool {
         self.check_alias_term_args_compatible(kind, args)
     }
 
-    fn debug_assert_args_compatible(self, def_id: DefId, args: ty::GenericArgsRef<'tcx>) {
+    fn debug_assert_args_compatible(self, def_id: DefId, args: ty::GenericArgs<'tcx>) {
         self.debug_assert_args_compatible(def_id, args);
     }
 
     fn debug_assert_alias_term_args_compatible(
         self,
         kind: ty::AliasTermKind<'tcx>,
-        args: ty::GenericArgsRef<'tcx>,
+        args: ty::GenericArgs<'tcx>,
     ) {
         self.debug_assert_alias_term_args_compatible(kind, args);
     }
@@ -302,7 +305,9 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
             self.debug_assert_args_compatible(
                 def_id,
                 self.mk_args_from_iter(
-                    [self.types.trait_object_dummy_self.into()].into_iter().chain(args.iter()),
+                    [self.types.trait_object_dummy_self.into()]
+                        .into_iter()
+                        .chain(args.as_slice().iter().copied()),
                 ),
             );
         }
@@ -520,6 +525,14 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
 
     fn is_default_trait(self, def_id: DefId) -> bool {
         self.is_default_trait(def_id)
+    }
+
+    fn is_implicit_trait(
+        self,
+        def_id: Self::TraitId,
+        including_sized: IncludeSizedImplicitBounds,
+    ) -> bool {
+        self.is_implicit_trait(def_id, including_sized)
     }
 
     fn is_sizedness_trait(self, def_id: DefId) -> bool {
@@ -823,11 +836,14 @@ bidirectional_lang_item_map! {
     Clone,
     Copy,
     Coroutine,
+    Debug,
     Destruct,
     DiscriminantKind,
     Drop,
+    Eq,
     Field,
     Fn,
+    FnAddrTrait,
     FnMut,
     FnOnce,
     FnPtrTrait,
@@ -836,9 +852,12 @@ bidirectional_lang_item_map! {
     Future,
     Iterator,
     MetaSized,
+    Move,
     PointeeSized,
     PointeeTrait,
+    Send,
     Sized,
+    Sync,
     TransmuteTrait,
     TrivialClone,
     TryAsDyn,

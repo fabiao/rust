@@ -78,7 +78,7 @@ declare_clippy_lint! {
     /// module-item-order-groupings = [
     ///     [ "modules", [ "extern_crate", "mod", "foreign_mod" ], ],
     ///     [ "use", [ "use", ], ],
-    ///     [ "everything_else", [ "macro", "global_asm", "static", "const", "ty_alias", "enum", "struct", "union", "trait", "trait_alias", "impl", "fn", ], ],
+    ///     [ "everything_else", [ "macro", "global_asm", "static", "const", "ty_alias", "enum", "struct", "union", "trait", "trait_alias", "impl", "fn", "test_binder_constraints" ], ],
     /// ]
     /// ```
     ///
@@ -695,7 +695,7 @@ fn get_trait_item_order(cx: &LateContext<'_>, trait_impl: &rustc_hir::Impl<'_>) 
             cx.tcx
                 .associated_items(def_id)
                 .in_definition_order()
-                .map(rustc_middle::ty::AssocItem::name)
+                .filter_map(rustc_middle::ty::AssocItem::opt_name)
                 .collect()
         })
 }

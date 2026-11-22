@@ -155,6 +155,7 @@ where
             ty::ClauseKind::ConstEvaluatable(ct) => ct.visit_with(self),
             ty::ClauseKind::WellFormed(term) => term.visit_with(self),
             ty::ClauseKind::UnstableFeature(_) => V::Result::output(),
+            ty::ClauseKind::CompressedTrait(_) => unreachable!(),
         }
     }
 
@@ -183,6 +184,7 @@ where
         let ty_kind = *ty.kind();
         match ty_kind {
             ty::Adt(ty::AdtDef(Interned(&ty::AdtDefData { did: def_id, .. }, _)), ..)
+            | ty::View(ty::AdtDef(Interned(&ty::AdtDefData { did: def_id, .. }, _)), ..)
             | ty::Foreign(def_id)
             | ty::FnDef(def_id, ..)
             | ty::Closure(def_id, ..)

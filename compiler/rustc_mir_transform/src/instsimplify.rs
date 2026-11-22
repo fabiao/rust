@@ -7,8 +7,8 @@ use rustc_index::IndexVec;
 use rustc_middle::mir::visit::MutVisitor;
 use rustc_middle::mir::*;
 use rustc_middle::ty::layout::{IntegerExt, ValidityRequirement};
-use rustc_middle::ty::{self, GenericArgsRef, Ty, TyCtxt, layout};
-use rustc_span::{Symbol, bug, sym};
+use rustc_middle::ty::{self, GenericArgs, Intrinsic, Ty, TyCtxt, layout};
+use rustc_span::{bug, sym};
 
 use crate::PassPolicy;
 use crate::simplify::simplify_duplicate_switch_targets;
@@ -58,7 +58,7 @@ impl<'tcx> crate::MirPass<'tcx> for InstSimplify {
             ctx.simplify_primitive_clone(terminator, &mut block.statements);
             ctx.simplify_size_or_align_of_val(terminator, &mut block.statements);
             ctx.simplify_raw_eq(terminator, &mut block.statements);
-            ctx.simplify_intrinsic_assert(terminator);
+            ctx.simplify_intrinsic_assert(terminator, &mut block.statements);
             ctx.simplify_nounwind_call(terminator);
             simplify_duplicate_switch_targets(terminator);
         }
@@ -281,9 +281,9 @@ impl<'tcx> InstSimplifyContext<'_, 'tcx> {
             && args.len() == 1
             && let Some((fn_def_id, generics)) = func.const_fn_def()
         {
-            let lang_item = if self.tcx.is_intrinsic(fn_def_id, sym::size_of_val) {
+            let lang_item = if self.tcx.is_rustc_intrinsic(fn_def_id, sym::size_of_val) {
                 LangItem::SizeOf
-            } else if self.tcx.is_intrinsic(fn_def_id, sym::align_of_val) {
+            } else if self.tcx.is_rustc_intrinsic(fn_def_id, sym::align_of_val) {
                 LangItem::AlignOf
             } else {
                 return;
@@ -303,7 +303,7 @@ impl<'tcx> InstSimplifyContext<'_, 'tcx> {
             let const_op = Operand::unevaluated_constant(
                 self.tcx,
                 const_def_id,
-                &[ty.into()],
+                self.tcx.mk_args(&[ty.into()]),
                 source_info.span,
             );
             statements.push(Statement::new(
@@ -333,7 +333,7 @@ impl<'tcx> InstSimplifyContext<'_, 'tcx> {
         } = &terminator.kind
             && args.len() == 2
             && let Some((fn_def_id, generics)) = func.const_fn_def()
-            && tcx.is_intrinsic(fn_def_id, sym::raw_eq)
+            && tcx.is_rustc_intrinsic(fn_def_id, sym::raw_eq)
             && let generic_ty = generics.type_at(0)
             && let Ok(layout) = tcx.layout_of(self.typing_env.as_query_input(generic_ty))
             && let Ok(integer) = Integer::from_size(layout.size)
@@ -385,7 +385,7 @@ impl<'tcx> InstSimplifyContext<'_, 'tcx> {
 
         let body_ty = self.tcx.type_of(def_id).skip_binder();
         let body_abi = match body_ty.kind() {
-            ty::FnDef(..) => body_ty.fn_sig(self.tcx).abi(),
+            ty::FnDef(..) => body_ty.fn_sig_abi(self.tcx),
             ty::Closure(..) => ExternAbi::RustCall,
             ty::Coroutine(..) => ExternAbi::Rust,
             _ => bug!("unexpected body ty: {body_ty:?}"),
@@ -396,9 +396,17 @@ impl<'tcx> InstSimplifyContext<'_, 'tcx> {
         }
     }
 
-    fn simplify_intrinsic_assert(&self, terminator: &mut Terminator<'tcx>) {
-        let TerminatorKind::Call { ref func, target: ref mut target @ Some(target_block), .. } =
-            terminator.kind
+    fn simplify_intrinsic_assert(
+        &self,
+        terminator: &mut Terminator<'tcx>,
+        statements: &mut Vec<Statement<'tcx>>,
+    ) {
+        let TerminatorKind::Call {
+            ref func,
+            destination,
+            target: ref mut target @ Some(target_block),
+            ..
+        } = terminator.kind
         else {
             return;
         };
@@ -407,7 +415,7 @@ impl<'tcx> InstSimplifyContext<'_, 'tcx> {
             return;
         };
         // The intrinsics we are interested in have one generic parameter
-        let [arg, ..] = args[..] else { return };
+        let [arg, ..] = *args.as_slice() else { return };
 
         let known_is_valid =
             intrinsic_assert_panics(self.tcx, self.typing_env, arg, intrinsic_name);
@@ -419,7 +427,21 @@ impl<'tcx> InstSimplifyContext<'_, 'tcx> {
                 *target = None;
             }
             Some(false) => {
-                // If we know the assert does not panic, turn the call into a Goto
+                // If we know the assert does not panic, turn the call into a Goto. We still need to
+                // initialize its unit result.
+                statements.push(Statement::new(
+                    terminator.source_info,
+                    StatementKind::Assign(Box::new((
+                        destination,
+                        Rvalue::Use(
+                            Operand::zero_sized_constant(
+                                self.tcx.types.unit,
+                                terminator.source_info.span,
+                            ),
+                            WithRetag::Yes,
+                        ),
+                    ))),
+                ));
                 terminator.kind = TerminatorKind::goto(target_block);
             }
         }
@@ -430,9 +452,10 @@ fn intrinsic_assert_panics<'tcx>(
     tcx: TyCtxt<'tcx>,
     typing_env: ty::TypingEnv<'tcx>,
     arg: ty::GenericArg<'tcx>,
-    intrinsic_name: Symbol,
+    intrinsic_name: Intrinsic,
 ) -> Option<bool> {
-    let requirement = ValidityRequirement::from_intrinsic(intrinsic_name)?;
+    let Intrinsic::Rustc(intrinsic_name) = intrinsic_name else { return None };
+    let requirement = ValidityRequirement::from_rustc_intrinsic(intrinsic_name)?;
     let ty = arg.expect_ty();
     Some(!tcx.check_validity_requirement((requirement, typing_env.as_query_input(ty))).ok()?)
 }
@@ -440,7 +463,7 @@ fn intrinsic_assert_panics<'tcx>(
 fn resolve_rust_intrinsic<'tcx>(
     tcx: TyCtxt<'tcx>,
     func_ty: Ty<'tcx>,
-) -> Option<(Symbol, GenericArgsRef<'tcx>)> {
+) -> Option<(Intrinsic, GenericArgs<'tcx>)> {
     let ty::FnDef(def_id, args) = *func_ty.kind() else { return None };
     let intrinsic = tcx.intrinsic(def_id)?;
     Some((intrinsic.name, args.no_bound_vars().unwrap()))

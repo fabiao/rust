@@ -1,7 +1,7 @@
 use std::collections::hash_map::Entry::*;
 
 use object::pe;
-use rustc_abi::{CanonAbi, X86Call};
+use rustc_abi::{CanonAbi, ExternAbi};
 use rustc_ast::expand::allocator::{AllocatorKind, NO_ALLOC_SHIM_IS_UNSTABLE, global_fn_name};
 use rustc_crate_store::CrateDepKind;
 use rustc_data_structures::fx::FxHashSet;
@@ -15,7 +15,7 @@ use rustc_middle::middle::exported_symbols::{
 };
 use rustc_middle::query::LocalCrate;
 use rustc_middle::ty::{
-    self, GenericArgKind, GenericArgsRef, Instance, ShimKind, SymbolName, Ty, TyCtxt,
+    self, GenericArgKind, GenericArgs, Instance, ShimKind, SymbolName, Ty, TyCtxt,
 };
 use rustc_middle::util::Providers;
 use rustc_span::{Span, bug};
@@ -359,16 +359,15 @@ fn exported_generic_symbols_provider_local<'tcx>(
             is_local
         };
 
-        let is_instantiable_downstream =
-            |did: Option<DefId>, generic_args: GenericArgsRef<'tcx>| {
-                generic_args
-                    .types()
-                    .chain(did.into_iter().map(move |did| tcx.type_of(did).skip_binder()))
-                    .all(move |arg| {
-                        arg.walk()
-                            .all(|ty| ty.as_type().is_none_or(|ty| !is_local_to_current_crate(ty)))
-                    })
-            };
+        let is_instantiable_downstream = |did: Option<DefId>, generic_args: GenericArgs<'tcx>| {
+            generic_args
+                .types()
+                .chain(did.into_iter().map(move |did| tcx.type_of(did).skip_binder()))
+                .all(move |arg| {
+                    arg.walk()
+                        .all(|ty| ty.as_type().is_none_or(|ty| !is_local_to_current_crate(ty)))
+                })
+        };
 
         let is_offload_instance = |mono_item: &MonoItem<'tcx>| {
             if let MonoItem::Fn(instance) = mono_item {
@@ -413,7 +412,7 @@ fn exported_generic_symbols_provider_local<'tcx>(
                     let should_export = if item_is_offload {
                         has_generics
                     } else {
-                        has_generics && is_instantiable_downstream(Some(def), &args)
+                        has_generics && is_instantiable_downstream(Some(def), args)
                     };
 
                     if should_export {
@@ -442,8 +441,8 @@ fn exported_generic_symbols_provider_local<'tcx>(
 
                     // Drop glue did is always going to be non-local outside of libcore, thus we don't need to check it's locality (which includes invoking `type_of` query).
                     let should_export = match ty.kind() {
-                        ty::Adt(_, args) => is_instantiable_downstream(None, args),
-                        ty::Closure(_, args) => is_instantiable_downstream(None, args),
+                        ty::Adt(_, args) => is_instantiable_downstream(None, *args),
+                        ty::Closure(_, args) => is_instantiable_downstream(None, *args),
                         _ => true,
                     };
 
@@ -505,7 +504,7 @@ fn exported_generic_symbols_provider_local<'tcx>(
 fn upstream_monomorphizations_provider(
     tcx: TyCtxt<'_>,
     (): (),
-) -> DefIdMap<UnordMap<GenericArgsRef<'_>, CrateNum>> {
+) -> DefIdMap<UnordMap<GenericArgs<'_>, CrateNum>> {
     let cnums = tcx.crates(());
 
     let mut instances: DefIdMap<UnordMap<_, _>> = Default::default();
@@ -570,14 +569,14 @@ fn upstream_monomorphizations_provider(
 fn upstream_monomorphizations_for_provider(
     tcx: TyCtxt<'_>,
     def_id: DefId,
-) -> Option<&UnordMap<GenericArgsRef<'_>, CrateNum>> {
+) -> Option<&UnordMap<GenericArgs<'_>, CrateNum>> {
     assert!(!def_id.is_local());
     tcx.upstream_monomorphizations(()).get(&def_id)
 }
 
 fn upstream_drop_glue_for_provider<'tcx>(
     tcx: TyCtxt<'tcx>,
-    args: GenericArgsRef<'tcx>,
+    args: GenericArgs<'tcx>,
 ) -> Option<CrateNum> {
     let def_id = tcx.lang_items().drop_glue_fn()?;
     tcx.upstream_monomorphizations_for(def_id)?.get(&args).cloned()
@@ -585,7 +584,7 @@ fn upstream_drop_glue_for_provider<'tcx>(
 
 fn upstream_async_drop_glue_for_provider<'tcx>(
     tcx: TyCtxt<'tcx>,
-    args: GenericArgsRef<'tcx>,
+    args: GenericArgs<'tcx>,
 ) -> Option<CrateNum> {
     let def_id = tcx.lang_items().async_drop_in_place_fn()?;
     tcx.upstream_monomorphizations_for(def_id)?.get(&args).cloned()
@@ -759,9 +758,74 @@ fn calling_convention_for_symbol<'tcx>(
         .unwrap_or((CanonAbi::Rust, &[]))
 }
 
+/// Whether symbol decoration might require computing the full FnAbi.
+fn needs_calling_convention_decoration<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    symbol: ExportedSymbol<'tcx>,
+) -> bool {
+    let target = &tcx.sess.target;
+
+    if !matches!(target.arch, Arch::X86 | Arch::X86_64) {
+        return false;
+    }
+
+    let def_id = match symbol {
+        ExportedSymbol::NonGeneric(def_id) | ExportedSymbol::Generic(def_id, _) => def_id,
+        _ => return false,
+    };
+
+    if !matches!(tcx.def_kind(def_id), DefKind::Fn | DefKind::AssocFn) {
+        return false;
+    }
+
+    let sig = tcx.fn_sig(def_id).skip_binder();
+
+    match target.arch {
+        Arch::X86 => match sig.abi() {
+            ExternAbi::Vectorcall { .. } => true,
+            ExternAbi::Fastcall { .. } | ExternAbi::Stdcall { .. } => target.is_like_windows,
+            ExternAbi::System { .. } => target.is_like_windows && !sig.c_variadic(),
+            _ => false,
+        },
+        Arch::X86_64 => matches!(sig.abi(), ExternAbi::Vectorcall { .. }),
+        _ => false,
+    }
+}
+
+/// Names used to preserve an exported symbol during LTO.
+///
+/// The restriction pass matches LLVM IR names, which retain the `\x01`
+/// marker for explicitly decorated symbols. ThinLTO GUIDs instead use
+/// the identifier without that marker, so preserve both spellings.
+pub(crate) fn symbol_names_for_lto<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    symbol: ExportedSymbol<'tcx>,
+    instantiating_crate: CrateNum,
+) -> Vec<String> {
+    let name = symbol_name_for_instance_in_crate(tcx, symbol, instantiating_crate);
+    // ThinLTO GUIDs omit the LLVM marker for explicitly named symbols.
+    if let Some(stripped) = name.strip_prefix('\x01') {
+        return vec![name.clone(), stripped.to_owned()];
+    }
+
+    if !needs_calling_convention_decoration(tcx, symbol) {
+        return vec![name];
+    }
+
+    let (callconv, args) = calling_convention_for_symbol(tcx, symbol);
+
+    if let Some(decorated) =
+        crate::common::windows_calling_convention_name(&tcx.sess.target, callconv, &name, args)
+    {
+        vec![format!("\x01{decorated}"), decorated]
+    } else {
+        vec![name]
+    }
+}
 /// This is the symbol name of the given instance as seen by the linker.
 ///
-/// On 32-bit Windows symbols are decorated according to their calling conventions.
+/// On Windows, symbols are decorated according to their calling conventions.
+/// Vectorcall symbols are also decorated on non-Windows targets.
 pub(crate) fn linking_symbol_name_for_instance_in_crate<'tcx>(
     tcx: TyCtxt<'tcx>,
     symbol: ExportedSymbol<'tcx>,
@@ -778,8 +842,19 @@ pub(crate) fn linking_symbol_name_for_instance_in_crate<'tcx>(
 
     let target = &tcx.sess.target;
     if !target.is_like_windows {
+        if !needs_calling_convention_decoration(tcx, symbol) {
+            return undecorated;
+        }
+
+        let (callconv, args) = calling_convention_for_symbol(tcx, symbol);
+        if let Some(name) =
+            crate::common::windows_calling_convention_name(target, callconv, &undecorated, args)
+        {
+            return name;
+        }
+
         // Mach-O has a global "_" suffix and `object` crate will handle it.
-        // ELF does not have any symbol decorations.
+        // Other calling conventions do not need decoration here.
         return undecorated;
     }
 
@@ -792,27 +867,26 @@ pub(crate) fn linking_symbol_name_for_instance_in_crate<'tcx>(
         _ => return undecorated,
     };
 
+    // LLVM treats names beginning with '\x01' as already mangled and strips that prefix.
+    // Names beginning with '?' are left undecorated by LLVM; the prefix is kept.
+    if let Some(name) = undecorated.strip_prefix('\x01') {
+        return name.to_string();
+    }
+    if undecorated.starts_with('?') {
+        return undecorated;
+    }
     let (callconv, args) = calling_convention_for_symbol(tcx, symbol);
 
-    // Decorate symbols with prefixes, suffixes and total number of bytes of arguments.
-    // Reference: https://docs.microsoft.com/en-us/cpp/build/reference/decorated-names?view=msvc-170
-    let (prefix, suffix) = match callconv {
-        CanonAbi::X86(X86Call::Fastcall) => ("@", "@"),
-        CanonAbi::X86(X86Call::Stdcall) => ("_", "@"),
-        CanonAbi::X86(X86Call::Vectorcall) => ("", "@@"),
-        _ => {
-            if let Some(prefix) = prefix {
-                undecorated.insert(0, prefix);
-            }
-            return undecorated;
-        }
-    };
+    if let Some(name) =
+        crate::common::windows_calling_convention_name(target, callconv, &undecorated, args)
+    {
+        return name;
+    }
 
-    let args_in_bytes: u64 = args
-        .iter()
-        .map(|abi| abi.layout.size.bytes().next_multiple_of(target.pointer_width as u64 / 8))
-        .sum();
-    format!("{prefix}{undecorated}{suffix}{args_in_bytes}")
+    if let Some(prefix) = prefix {
+        undecorated.insert(0, prefix);
+    }
+    undecorated
 }
 
 pub(crate) fn exporting_symbol_name_for_instance_in_crate<'tcx>(

@@ -319,10 +319,12 @@ pub trait BuilderMethods<'a, 'tcx>:
     fn range_metadata(&mut self, load: Self::Value, range: WrappingRange);
     fn nonnull_metadata(&mut self, load: Self::Value);
 
-    fn store(&mut self, val: Self::Value, ptr: Self::Value, align: Align) -> Self::Value;
-    fn store_to_place(&mut self, val: Self::Value, place: PlaceValue<Self::Value>) -> Self::Value {
+    fn store(&mut self, val: Self::Value, ptr: Self::Value, align: Align) {
+        self.store_with_flags(val, ptr, align, MemFlags::empty())
+    }
+    fn store_to_place(&mut self, val: Self::Value, place: PlaceValue<Self::Value>) {
         assert_eq!(place.llextra, None);
-        self.store(val, place.llval, place.align)
+        self.store(val, place.llval, place.align);
     }
     fn store_with_flags(
         &mut self,
@@ -330,13 +332,13 @@ pub trait BuilderMethods<'a, 'tcx>:
         ptr: Self::Value,
         align: Align,
         flags: MemFlags,
-    ) -> Self::Value;
+    );
     fn store_to_place_with_flags(
         &mut self,
         val: Self::Value,
         place: PlaceValue<Self::Value>,
         flags: MemFlags,
-    ) -> Self::Value {
+    ) {
         assert_eq!(place.llextra, None);
         self.store_with_flags(val, place.llval, place.align, flags)
     }
@@ -349,26 +351,23 @@ pub trait BuilderMethods<'a, 'tcx>:
         size: Size,
     );
 
-    fn gep(&mut self, ty: Self::Type, ptr: Self::Value, indices: &[Self::Value]) -> Self::Value;
-    fn inbounds_gep(
-        &mut self,
-        ty: Self::Type,
-        ptr: Self::Value,
-        indices: &[Self::Value],
-    ) -> Self::Value;
+    fn gep(&mut self, stride: Size, ptr: Self::Value, index: Self::Value) -> Self::Value;
+    fn inbounds_gep(&mut self, stride: Size, ptr: Self::Value, index: Self::Value) -> Self::Value {
+        self.gep(stride, ptr, index)
+    }
     fn inbounds_nuw_gep(
         &mut self,
-        ty: Self::Type,
+        stride: Size,
         ptr: Self::Value,
-        indices: &[Self::Value],
+        index: Self::Value,
     ) -> Self::Value {
-        self.inbounds_gep(ty, ptr, indices)
+        self.inbounds_gep(stride, ptr, index)
     }
     fn ptradd(&mut self, ptr: Self::Value, offset: Self::Value) -> Self::Value {
-        self.gep(self.cx().type_i8(), ptr, &[offset])
+        self.gep(Size::from_bytes(1), ptr, offset)
     }
     fn inbounds_ptradd(&mut self, ptr: Self::Value, offset: Self::Value) -> Self::Value {
-        self.inbounds_gep(self.cx().type_i8(), ptr, &[offset])
+        self.inbounds_gep(Size::from_bytes(1), ptr, offset)
     }
 
     fn trunc(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value;

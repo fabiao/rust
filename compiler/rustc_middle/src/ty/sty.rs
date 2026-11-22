@@ -7,7 +7,7 @@ use std::debug_assert_matches;
 use std::ops::{ControlFlow, Range};
 
 use hir::def::{CtorKind, DefKind};
-use rustc_abi::{FIRST_VARIANT, FieldIdx, NumScalableVectors, ScalableElt, VariantIdx};
+use rustc_abi::{ExternAbi, FIRST_VARIANT, FieldIdx, NumScalableVectors, ScalableElt, VariantIdx};
 use rustc_attr_ir::lang_items::LangItem;
 use rustc_errors::{ErrorGuaranteed, MultiSpan};
 use rustc_hir as hir;
@@ -18,7 +18,8 @@ use rustc_type_ir::TyKind::*;
 use rustc_type_ir::solve::SizedTraitKind;
 use rustc_type_ir::walk::TypeWalker;
 use rustc_type_ir::{
-    self as ir, BoundVar, CollectAndApply, MayBeErased, TypeVisitableExt, elaborate,
+    self as ir, BoundVar, CallerBoundsIterator, CollectAndApply, MayBeErased, TypeVisitableExt,
+    elaborate,
 };
 use tracing::instrument;
 use ty::util::IntTypeExt;
@@ -28,8 +29,8 @@ use crate::infer::canonical::Canonical;
 use crate::traits::ObligationCause;
 use crate::ty::InferTy::*;
 use crate::ty::{
-    self, AdtDef, Const, Discr, GenericArg, GenericArgs, GenericArgsRef, List, ParamEnv, Region,
-    Ty, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitor, UintTy, ValTree,
+    self, AdtDef, Const, Discr, GenericArg, GenericArgs, List, ParamEnv, Region, Ty, TyCtxt,
+    TypeSuperVisitable, TypeVisitable, TypeVisitor, UintTy, ValTree,
 };
 
 // Re-export and re-parameterize some `I = TyCtxt<'tcx>` types here
@@ -177,9 +178,9 @@ impl<'tcx> ty::CoroutineArgs<TyCtxt<'tcx>> {
 
 #[derive(Debug, Copy, Clone, StableHash, TypeFoldable, TypeVisitable)]
 pub enum UpvarArgs<'tcx> {
-    Closure(GenericArgsRef<'tcx>),
-    Coroutine(GenericArgsRef<'tcx>),
-    CoroutineClosure(GenericArgsRef<'tcx>),
+    Closure(GenericArgs<'tcx>),
+    Coroutine(GenericArgs<'tcx>),
+    CoroutineClosure(GenericArgs<'tcx>),
 }
 
 impl<'tcx> UpvarArgs<'tcx> {
@@ -224,12 +225,12 @@ impl<'tcx> UpvarArgs<'tcx> {
 pub struct InlineConstArgs<'tcx> {
     /// Generic parameters from the enclosing item,
     /// concatenated with the inferred type of the constant.
-    pub args: GenericArgsRef<'tcx>,
+    pub args: GenericArgs<'tcx>,
 }
 
 /// Struct returned by `split()`.
-pub struct InlineConstArgsParts<'tcx, T> {
-    pub parent_args: &'tcx [GenericArg<'tcx>],
+pub struct InlineConstArgsParts<'tcx, 'a, T> {
+    pub parent_args: &'a [GenericArg<'tcx>],
     pub ty: T,
 }
 
@@ -237,7 +238,7 @@ impl<'tcx> InlineConstArgs<'tcx> {
     /// Construct `InlineConstArgs` from `InlineConstArgsParts`.
     pub fn new(
         tcx: TyCtxt<'tcx>,
-        parts: InlineConstArgsParts<'tcx, Ty<'tcx>>,
+        parts: InlineConstArgsParts<'tcx, '_, Ty<'tcx>>,
     ) -> InlineConstArgs<'tcx> {
         InlineConstArgs {
             args: tcx.mk_args_from_iter(
@@ -248,15 +249,15 @@ impl<'tcx> InlineConstArgs<'tcx> {
 
     /// Divides the inline const args into their respective components.
     /// The ordering assumed here must match that used by `InlineConstArgs::new` above.
-    fn split(self) -> InlineConstArgsParts<'tcx, GenericArg<'tcx>> {
-        match self.args[..] {
-            [ref parent_args @ .., ty] => InlineConstArgsParts { parent_args, ty },
+    fn split(&self) -> InlineConstArgsParts<'tcx, '_, GenericArg<'tcx>> {
+        match self.args.as_slice() {
+            [parent_args @ .., ty] => InlineConstArgsParts { parent_args, ty: *ty },
             _ => bug!("inline const args missing synthetics"),
         }
     }
 
     /// Returns the generic parameters of the inline const's parent.
-    pub fn parent_args(self) -> &'tcx [GenericArg<'tcx>] {
+    pub fn parent_args(&self) -> &[GenericArg<'tcx>] {
         self.split().parent_args
     }
 
@@ -327,7 +328,7 @@ impl ParamConst {
 
     #[instrument(level = "debug")]
     pub fn find_const_ty_from_env<'tcx>(self, env: ParamEnv<'tcx>) -> Ty<'tcx> {
-        let mut candidates = env.caller_bounds().filter_map(|clause| {
+        let mut candidates = env.caller_bounds().non_trait_clauses().iter().filter_map(|clause| {
             // `ConstArgHasType` are never desugared to be higher ranked.
             match clause.kind().skip_binder() {
                 ty::ClauseKind::ConstArgHasType(param_ct, ty) => {
@@ -361,16 +362,9 @@ impl ParamConst {
 
 /// Constructors for `Ty`
 impl<'tcx> Ty<'tcx> {
-    /// Avoid using this in favour of more specific `new_*` methods, where possible.
-    /// The more specific methods will often optimize their creation.
-    #[inline]
-    fn new(tcx: TyCtxt<'tcx>, st: TyKind<'tcx>) -> Ty<'tcx> {
-        tcx.mk_ty_from_kind(st)
-    }
-
     #[inline]
     pub fn new_infer(tcx: TyCtxt<'tcx>, infer: ty::InferTy) -> Ty<'tcx> {
-        Ty::new(tcx, TyKind::Infer(infer))
+        tcx.interners.intern_infer(infer)
     }
 
     #[inline]
@@ -380,7 +374,7 @@ impl<'tcx> Ty<'tcx> {
             .infer_ty_vars
             .get(v.as_usize())
             .copied()
-            .unwrap_or_else(|| Ty::new(tcx, Infer(TyVar(v))))
+            .unwrap_or_else(|| tcx.interners.intern_infer(TyVar(v)))
     }
 
     #[inline]
@@ -425,7 +419,7 @@ impl<'tcx> Ty<'tcx> {
 
     #[inline]
     pub fn new_param(tcx: TyCtxt<'tcx>, index: u32, name: Symbol) -> Ty<'tcx> {
-        Ty::new(tcx, Param(ParamTy { index, name }))
+        tcx.interners.intern_param(ParamTy { index, name })
     }
 
     #[inline]
@@ -441,7 +435,7 @@ impl<'tcx> Ty<'tcx> {
         {
             ty
         } else {
-            Ty::new(tcx, Bound(ty::BoundVarIndexKind::Bound(index), bound_ty))
+            tcx.interners.intern_bound(ty::BoundVarIndexKind::Bound(index), bound_ty)
         }
     }
 
@@ -451,12 +445,9 @@ impl<'tcx> Ty<'tcx> {
         if let Some(ty) = tcx.types.bound_canonical_anons.get(var.as_usize()).copied() {
             ty
         } else {
-            Ty::new(
-                tcx,
-                Bound(
-                    ty::BoundVarIndexKind::Canonical,
-                    ty::BoundTy { var, kind: ty::BoundTyKind::Anon },
-                ),
+            tcx.interners.intern_bound(
+                ty::BoundVarIndexKind::Canonical,
+                ty::BoundTy { var, kind: ty::BoundTyKind::Anon },
             )
         }
     }
@@ -470,7 +461,7 @@ impl<'tcx> Ty<'tcx> {
         {
             ty
         } else {
-            Ty::new(tcx, Placeholder(placeholder))
+            tcx.interners.intern_placeholder(placeholder)
         }
     }
 
@@ -480,12 +471,12 @@ impl<'tcx> Ty<'tcx> {
         is_rigid: ty::IsRigid,
         alias_ty: ty::AliasTy<'tcx>,
     ) -> Ty<'tcx> {
-        Ty::new(tcx, Alias(is_rigid, alias_ty))
+        tcx.interners.intern_alias(is_rigid, alias_ty)
     }
 
     #[inline]
     pub fn new_pat(tcx: TyCtxt<'tcx>, base: Ty<'tcx>, pat: ty::Pattern<'tcx>) -> Ty<'tcx> {
-        Ty::new(tcx, Pat(base, pat))
+        tcx.interners.intern_pat(base, pat)
     }
 
     #[inline]
@@ -523,14 +514,14 @@ impl<'tcx> Ty<'tcx> {
         tcx: TyCtxt<'tcx>,
         is_rigid: ty::IsRigid,
         def_id: DefId,
-        args: GenericArgsRef<'tcx>,
+        args: GenericArgs<'tcx>,
     ) -> Ty<'tcx> {
         Ty::new_alias(tcx, is_rigid, AliasTy::new_from_args(tcx, ty::Opaque { def_id }, args))
     }
 
     /// Constructs a `TyKind::Error` type with current `ErrorGuaranteed`
     pub fn new_error(tcx: TyCtxt<'tcx>, guar: ErrorGuaranteed) -> Ty<'tcx> {
-        Ty::new(tcx, Error(guar))
+        tcx.interners.intern_error(guar)
     }
 
     /// Constructs a `TyKind::Error` type and registers a `span_delayed_bug` to ensure it gets used.
@@ -548,7 +539,7 @@ impl<'tcx> Ty<'tcx> {
         msg: impl Into<Cow<'static, str>>,
     ) -> Ty<'tcx> {
         let reported = tcx.dcx().span_delayed_bug(span, msg);
-        Ty::new(tcx, Error(reported))
+        tcx.interners.intern_error(reported)
     }
 
     #[inline]
@@ -595,7 +586,7 @@ impl<'tcx> Ty<'tcx> {
         ty: Ty<'tcx>,
         mutbl: ty::Mutability,
     ) -> Ty<'tcx> {
-        Ty::new(tcx, Ref(r, ty, mutbl))
+        tcx.interners.intern_ref(r, ty, mutbl)
     }
 
     #[inline]
@@ -620,7 +611,7 @@ impl<'tcx> Ty<'tcx> {
 
     #[inline]
     pub fn new_ptr(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, mutbl: ty::Mutability) -> Ty<'tcx> {
-        Ty::new(tcx, ty::RawPtr(ty, mutbl))
+        tcx.interners.intern_raw_ptr(ty, mutbl)
     }
 
     #[inline]
@@ -634,54 +625,20 @@ impl<'tcx> Ty<'tcx> {
     }
 
     #[inline]
-    pub fn new_adt(tcx: TyCtxt<'tcx>, def: AdtDef<'tcx>, args: GenericArgsRef<'tcx>) -> Ty<'tcx> {
+    pub fn new_adt(tcx: TyCtxt<'tcx>, def: AdtDef<'tcx>, args: GenericArgs<'tcx>) -> Ty<'tcx> {
         tcx.debug_assert_args_compatible(def.did(), args);
-        if cfg!(debug_assertions) {
-            match tcx.def_kind(def.did()) {
-                DefKind::Struct | DefKind::Union | DefKind::Enum => {}
-                DefKind::Mod
-                | DefKind::Variant
-                | DefKind::Trait
-                | DefKind::TyAlias
-                | DefKind::ForeignTy
-                | DefKind::TraitAlias
-                | DefKind::AssocTy
-                | DefKind::TyParam
-                | DefKind::Fn
-                | DefKind::Const
-                | DefKind::ConstParam
-                | DefKind::Static { .. }
-                | DefKind::Ctor(..)
-                | DefKind::AssocFn
-                | DefKind::AssocConst
-                | DefKind::Macro(..)
-                | DefKind::ExternCrate
-                | DefKind::Use
-                | DefKind::ForeignMod
-                | DefKind::AnonConst
-                | DefKind::OpaqueTy
-                | DefKind::Field
-                | DefKind::LifetimeParam
-                | DefKind::GlobalAsm
-                | DefKind::Impl { .. }
-                | DefKind::Closure
-                | DefKind::SyntheticCoroutineBody
-                | DefKind::TestBinderConstraints => {
-                    bug!("not an adt: {def:?} ({:?})", tcx.def_kind(def.did()))
-                }
-            }
-        }
-        Ty::new(tcx, Adt(def, args))
+        tcx.debug_assert_adt_def_kind_compatible(def);
+        tcx.interners.intern_adt(def, args)
     }
 
     #[inline]
     pub fn new_foreign(tcx: TyCtxt<'tcx>, def_id: DefId) -> Ty<'tcx> {
-        Ty::new(tcx, Foreign(def_id))
+        tcx.interners.intern_foreign(def_id)
     }
 
     #[inline]
     pub fn new_array(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, n: u64) -> Ty<'tcx> {
-        Ty::new(tcx, Array(ty, ty::Const::from_target_usize(tcx, n)))
+        tcx.interners.intern_array(ty, ty::Const::from_target_usize(tcx, n))
     }
 
     #[inline]
@@ -690,17 +647,21 @@ impl<'tcx> Ty<'tcx> {
         ty: Ty<'tcx>,
         ct: ty::Const<'tcx>,
     ) -> Ty<'tcx> {
-        Ty::new(tcx, Array(ty, ct))
+        tcx.interners.intern_array(ty, ct)
     }
 
     #[inline]
     pub fn new_slice(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Ty<'tcx> {
-        Ty::new(tcx, Slice(ty))
+        tcx.interners.intern_slice(ty)
     }
 
     #[inline]
     pub fn new_tup(tcx: TyCtxt<'tcx>, ts: &[Ty<'tcx>]) -> Ty<'tcx> {
-        if ts.is_empty() { tcx.types.unit } else { Ty::new(tcx, Tuple(tcx.mk_type_list(ts))) }
+        if ts.is_empty() {
+            tcx.types.unit
+        } else {
+            tcx.interners.intern_tuple(tcx.mk_type_list(ts))
+        }
     }
 
     pub fn new_tup_from_iter<I, T>(tcx: TyCtxt<'tcx>, iter: I) -> T::Output
@@ -723,18 +684,18 @@ impl<'tcx> Ty<'tcx> {
             DefKind::AssocFn | DefKind::Fn | DefKind::Ctor(_, CtorKind::Fn)
         );
         let args = args.map_bound(|args| tcx.check_and_mk_args(def_id, args));
-        Ty::new(tcx, FnDef(def_id, args))
+        tcx.interners.intern_fn_def(def_id, args)
     }
 
     #[inline]
     pub fn new_fn_ptr(tcx: TyCtxt<'tcx>, fty: PolyFnSig<'tcx>) -> Ty<'tcx> {
         let (sig_tys, hdr) = fty.split();
-        Ty::new(tcx, FnPtr(sig_tys, hdr))
+        tcx.interners.intern_fn_ptr(sig_tys, hdr)
     }
 
     #[inline]
     pub fn new_unsafe_binder(tcx: TyCtxt<'tcx>, b: Binder<'tcx, Ty<'tcx>>) -> Ty<'tcx> {
-        Ty::new(tcx, UnsafeBinder(b.into()))
+        tcx.interners.intern_unsafe_binder(b.into())
     }
 
     #[inline]
@@ -770,7 +731,7 @@ impl<'tcx> Ty<'tcx> {
                 but it has {projection_count}"
             );
         }
-        Ty::new(tcx, Dynamic(obj, reg))
+        tcx.interners.intern_dynamic(obj, reg)
     }
 
     #[inline]
@@ -778,7 +739,7 @@ impl<'tcx> Ty<'tcx> {
         tcx: TyCtxt<'tcx>,
         is_rigid: ty::IsRigid,
         item_def_id: DefId,
-        args: ty::GenericArgsRef<'tcx>,
+        args: ty::GenericArgs<'tcx>,
     ) -> Ty<'tcx> {
         Ty::new_alias(
             tcx,
@@ -805,48 +766,48 @@ impl<'tcx> Ty<'tcx> {
     pub fn new_closure(
         tcx: TyCtxt<'tcx>,
         def_id: DefId,
-        closure_args: GenericArgsRef<'tcx>,
+        closure_args: GenericArgs<'tcx>,
     ) -> Ty<'tcx> {
         tcx.debug_assert_args_compatible(def_id, closure_args);
-        Ty::new(tcx, Closure(def_id, closure_args))
+        tcx.interners.intern_closure(def_id, closure_args)
     }
 
     #[inline]
     pub fn new_coroutine_closure(
         tcx: TyCtxt<'tcx>,
         def_id: DefId,
-        closure_args: GenericArgsRef<'tcx>,
+        closure_args: GenericArgs<'tcx>,
     ) -> Ty<'tcx> {
         tcx.debug_assert_args_compatible(def_id, closure_args);
-        Ty::new(tcx, CoroutineClosure(def_id, closure_args))
+        tcx.interners.intern_coroutine_closure(def_id, closure_args)
     }
 
     #[inline]
     pub fn new_coroutine(
         tcx: TyCtxt<'tcx>,
         def_id: DefId,
-        coroutine_args: GenericArgsRef<'tcx>,
+        coroutine_args: GenericArgs<'tcx>,
     ) -> Ty<'tcx> {
         tcx.debug_assert_args_compatible(def_id, coroutine_args);
-        Ty::new(tcx, Coroutine(def_id, coroutine_args))
+        tcx.interners.intern_coroutine(def_id, coroutine_args)
     }
 
     #[inline]
     pub fn new_coroutine_witness(
         tcx: TyCtxt<'tcx>,
         def_id: DefId,
-        args: GenericArgsRef<'tcx>,
+        args: GenericArgs<'tcx>,
     ) -> Ty<'tcx> {
         if cfg!(debug_assertions) {
             tcx.debug_assert_args_compatible(tcx.typeck_root_def_id(def_id), args);
         }
-        Ty::new(tcx, CoroutineWitness(def_id, args))
+        tcx.interners.intern_coroutine_witness(def_id, args)
     }
 
     pub fn new_coroutine_witness_for_coroutine(
         tcx: TyCtxt<'tcx>,
         def_id: DefId,
-        coroutine_args: GenericArgsRef<'tcx>,
+        coroutine_args: GenericArgs<'tcx>,
     ) -> Ty<'tcx> {
         tcx.debug_assert_args_compatible(def_id, coroutine_args);
         // HACK: Coroutine witness types are lifetime erased, so they
@@ -866,6 +827,25 @@ impl<'tcx> Ty<'tcx> {
                 }
             });
         Ty::new_coroutine_witness(tcx, def_id, args)
+    }
+
+    pub fn new_view(
+        tcx: TyCtxt<'tcx>,
+        def: AdtDef<'tcx>,
+        args: GenericArgs<'tcx>,
+        fields: &[FieldIdx],
+    ) -> Ty<'tcx> {
+        tcx.debug_assert_args_compatible(def.did(), args);
+        tcx.debug_assert_adt_def_kind_compatible(def);
+
+        let base = Ty::new_adt(tcx, def, args);
+
+        let fields = fields
+            .iter()
+            .map(|field| Ty::new_field_representing_type(tcx, base, FIRST_VARIANT, *field));
+        let fields = Ty::new_tup_from_iter(tcx, fields);
+
+        tcx.interners.intern_view(def, args, fields)
     }
 
     // misc
@@ -989,7 +969,7 @@ impl<'tcx> rustc_type_ir::inherent::Ty<TyCtxt<'tcx>> for Ty<'tcx> {
     fn new_adt(
         interner: TyCtxt<'tcx>,
         adt_def: ty::AdtDef<'tcx>,
-        args: ty::GenericArgsRef<'tcx>,
+        args: ty::GenericArgs<'tcx>,
     ) -> Self {
         Ty::new_adt(interner, adt_def, args)
     }
@@ -1006,30 +986,26 @@ impl<'tcx> rustc_type_ir::inherent::Ty<TyCtxt<'tcx>> for Ty<'tcx> {
         Ty::new_dynamic(interner, preds, region)
     }
 
-    fn new_coroutine(
-        interner: TyCtxt<'tcx>,
-        def_id: DefId,
-        args: ty::GenericArgsRef<'tcx>,
-    ) -> Self {
+    fn new_coroutine(interner: TyCtxt<'tcx>, def_id: DefId, args: ty::GenericArgs<'tcx>) -> Self {
         Ty::new_coroutine(interner, def_id, args)
     }
 
     fn new_coroutine_closure(
         interner: TyCtxt<'tcx>,
         def_id: DefId,
-        args: ty::GenericArgsRef<'tcx>,
+        args: ty::GenericArgs<'tcx>,
     ) -> Self {
         Ty::new_coroutine_closure(interner, def_id, args)
     }
 
-    fn new_closure(interner: TyCtxt<'tcx>, def_id: DefId, args: ty::GenericArgsRef<'tcx>) -> Self {
+    fn new_closure(interner: TyCtxt<'tcx>, def_id: DefId, args: ty::GenericArgs<'tcx>) -> Self {
         Ty::new_closure(interner, def_id, args)
     }
 
     fn new_coroutine_witness(
         interner: TyCtxt<'tcx>,
         def_id: DefId,
-        args: ty::GenericArgsRef<'tcx>,
+        args: ty::GenericArgs<'tcx>,
     ) -> Self {
         Ty::new_coroutine_witness(interner, def_id, args)
     }
@@ -1037,7 +1013,7 @@ impl<'tcx> rustc_type_ir::inherent::Ty<TyCtxt<'tcx>> for Ty<'tcx> {
     fn new_coroutine_witness_for_coroutine(
         interner: TyCtxt<'tcx>,
         def_id: DefId,
-        coroutine_args: ty::GenericArgsRef<'tcx>,
+        coroutine_args: ty::GenericArgs<'tcx>,
     ) -> Self {
         Ty::new_coroutine_witness_for_coroutine(interner, def_id, coroutine_args)
     }
@@ -1097,7 +1073,7 @@ impl<'tcx> rustc_type_ir::inherent::Ty<TyCtxt<'tcx>> for Ty<'tcx> {
     fn new_fn_def(
         interner: TyCtxt<'tcx>,
         def_id: DefId,
-        args: ty::Binder<'tcx, ty::GenericArgsRef<'tcx>>,
+        args: ty::Binder<'tcx, ty::GenericArgs<'tcx>>,
     ) -> Self {
         Ty::new_fn_def(interner, def_id, args)
     }
@@ -1307,7 +1283,7 @@ impl<'tcx> Ty<'tcx> {
             ScalableElt::Container => (
                 NumScalableVectors::from_field_count(def.non_enum_variant().fields.len())?,
                 def.non_enum_variant().fields[FieldIdx::ZERO]
-                    .ty(tcx, args)
+                    .ty(tcx, *args)
                     .skip_norm_wip()
                     .ty_adt_def()?,
             ),
@@ -1317,7 +1293,7 @@ impl<'tcx> Ty<'tcx> {
         };
         let variant = vec_def.non_enum_variant();
         assert_eq!(variant.fields.len(), 1);
-        let field_ty = variant.fields[FieldIdx::ZERO].ty(tcx, args);
+        let field_ty = variant.fields[FieldIdx::ZERO].ty(tcx, *args);
         Some((element_count, field_ty.skip_norm_wip(), num_vectors))
     }
 
@@ -1328,7 +1304,7 @@ impl<'tcx> Ty<'tcx> {
         assert!(def.repr().simd(), "`simd_size_and_type` called on non-SIMD type");
         let variant = def.non_enum_variant();
         assert_eq!(variant.fields.len(), 1);
-        let field_ty = variant.fields[FieldIdx::ZERO].ty(tcx, args);
+        let field_ty = variant.fields[FieldIdx::ZERO].ty(tcx, *args);
         let Array(f0_elem_ty, f0_len) = field_ty.skip_norm_wip().kind() else {
             bug!("Simd type has non-array field type {field_ty:?}")
         };
@@ -1624,6 +1600,20 @@ impl<'tcx> Ty<'tcx> {
         self.kind().fn_sig(tcx)
     }
 
+    /// `ty.fn_sig_abi(tcx)` is much faster than `ty.fn_sig(tcx).abi()` because the latter requires
+    /// instantiating the signature.
+    #[tracing::instrument(level = "trace", skip(tcx))]
+    pub fn fn_sig_abi(self, tcx: TyCtxt<'tcx>) -> ExternAbi {
+        self.kind().fn_sig_abi(tcx)
+    }
+
+    /// `ty.fn_sig_safety(tcx)` is much faster than `ty.fn_sig(tcx).safety()` because the latter
+    /// requires instantiating the signature.
+    #[tracing::instrument(level = "trace", skip(tcx))]
+    pub fn fn_sig_safety(self, tcx: TyCtxt<'tcx>) -> hir::Safety {
+        self.kind().fn_sig_safety(tcx)
+    }
+
     #[tracing::instrument(level = "trace", skip(tcx))]
     pub fn unnormalized_fn_sig(self, tcx: TyCtxt<'tcx>) -> ty::Unnormalized<'tcx, PolyFnSig<'tcx>> {
         self.kind().unnormalized_fn_sig(tcx)
@@ -1764,6 +1754,9 @@ impl<'tcx> Ty<'tcx> {
             | ty::Infer(FreshTy(_) | ty::FreshIntTy(_) | ty::FreshFloatTy(_)) => {
                 bug!("`discriminant_ty` applied to unexpected type: {:?}", self)
             }
+
+            // FIXME(scrabsha)
+            ty::View(..) => unimplemented!(),
         }
     }
 
@@ -1796,6 +1789,8 @@ impl<'tcx> Ty<'tcx> {
             | ty::Error(_) => Ok(tcx.types.unit),
             // Extern types have metadata = ().
             ty::Foreign(..) => Ok(tcx.types.unit),
+            // FIXME(scrabsha): i expect views to behave like foreign types here?
+            ty::View(..) => Ok(tcx.types.unit),
             // If returned by `struct_tail_raw` this is a unit struct
             // without any fields, or not a struct, and therefore is Sized.
             ty::Adt(..) => Ok(tcx.types.unit),
@@ -2002,7 +1997,9 @@ impl<'tcx> Ty<'tcx> {
                 ty.instantiate(tcx, args).skip_norm_wip().has_trivial_sizedness(tcx, sizedness)
             }),
 
-            ty::Alias(..) | ty::Param(_) | ty::Placeholder(..) | ty::Bound(..) => false,
+            ty::Alias(..) | ty::Param(_) | ty::Placeholder(..) | ty::Bound(..) | ty::View(..) => {
+                false
+            }
 
             ty::Infer(ty::TyVar(_)) => false,
 
@@ -2068,6 +2065,9 @@ impl<'tcx> Ty<'tcx> {
             ty::Param(..) | ty::Placeholder(..) | ty::Bound(..) | ty::Infer(..) | ty::Error(..) => {
                 false
             }
+
+            // FIXME(scrabsha)
+            ty::View(..) => unimplemented!(),
         }
     }
 
@@ -2113,6 +2113,7 @@ impl<'tcx> Ty<'tcx> {
             | ty::Coroutine(..)
             | ty::CoroutineWitness(..)
             | ty::Alias(..)
+            | ty::View(..)
             | ty::Error(_) => false,
         }
     }

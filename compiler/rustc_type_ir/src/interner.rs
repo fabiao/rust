@@ -113,7 +113,9 @@ pub trait Interner:
     type Span: Span<Self>;
 
     type GenericArgs: GenericArgs<Self>;
-    type GenericArgsSlice: Copy + Debug + Hash + Eq + SliceLike<Item = Self::GenericArg>;
+    type GenericArgsSlice<'a>: Copy + Debug + Hash + Eq + SliceLike<Item = Self::GenericArg>
+    where
+        Self: 'a;
     type GenericArg: GenericArg<Self>;
     type Term: Term<Self>;
 
@@ -300,11 +302,11 @@ pub trait Interner:
     type AdtDef: AdtDef<Self>;
     fn adt_def(self, adt_def_id: Self::AdtId) -> Self::AdtDef;
 
-    fn trait_ref_and_own_args_for_alias(
+    fn trait_ref_and_own_args_for_alias<'a>(
         self,
         def_id: Self::TraitAssocTermId,
-        args: Self::GenericArgs,
-    ) -> (ty::TraitRef<Self>, Self::GenericArgsSlice);
+        args: &'a Self::GenericArgs,
+    ) -> (ty::TraitRef<Self>, Self::GenericArgsSlice<'a>);
 
     fn mk_args(self, args: &[Self::GenericArg]) -> Self::GenericArgs;
 
@@ -458,6 +460,12 @@ pub trait Interner:
     fn is_trait_lang_item(self, def_id: Self::TraitId, lang_item: SolverTraitLangItem) -> bool;
 
     fn is_default_trait(self, def_id: Self::TraitId) -> bool;
+
+    fn is_implicit_trait(
+        self,
+        def_id: Self::TraitId,
+        including_sized: IncludeSizedImplicitBounds,
+    ) -> bool;
 
     fn is_sizedness_trait(self, def_id: Self::TraitId) -> bool;
 
@@ -783,4 +791,9 @@ impl<I: Interner> search_graph::Cx for I {
     fn assert_evaluation_is_concurrent(&self) {
         self.assert_evaluation_is_concurrent()
     }
+}
+
+pub enum IncludeSizedImplicitBounds {
+    Yes,
+    No,
 }

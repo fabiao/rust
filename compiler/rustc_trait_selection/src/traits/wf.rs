@@ -11,8 +11,8 @@ use rustc_infer::traits::{
     ObligationCauseCode, PredicateObligation, PredicateObligations, WellFormedLoc,
 };
 use rustc_middle::ty::{
-    self, DelayedSet, GenericArgsRef, PredicateProxy, Term, TermKind, Ty, TyCtxt,
-    TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor,
+    self, DelayedSet, GenericArgs, PredicateProxy, Term, TermKind, Ty, TyCtxt, TypeSuperVisitable,
+    TypeVisitable, TypeVisitableExt, TypeVisitor,
 };
 use rustc_session::diagnostics::feature_err;
 use rustc_span::def_id::{DefId, LocalDefId};
@@ -209,6 +209,7 @@ pub fn clause_obligations<'tcx>(
             wf.add_wf_preds_for_term(ct.into());
         }
         ty::ClauseKind::UnstableFeature(_) => {}
+        ty::ClauseKind::CompressedTrait(_) => unreachable!(),
     }
 
     wf.normalize(infcx)
@@ -281,7 +282,7 @@ enum Elaborate {
 ///
 /// Note that bounds that can be expressed as associated item bounds are **not**
 /// super predicates. This means that form 2 and 3 from above are only relevant if
-/// the [`GenericArgsRef`] of the projection type are not its identity arguments.
+/// the [`GenericArgs`] of the projection type are not its identity arguments.
 fn extend_cause_with_original_assoc_item_obligation<'tcx>(
     tcx: TyCtxt<'tcx>,
     item: Option<&hir::Item<'tcx>>,
@@ -539,7 +540,7 @@ impl<'a, 'tcx> WfPredicates<'a, 'tcx> {
         data.args.visit_with(self);
     }
 
-    fn add_wf_preds_for_projection_args(&mut self, args: GenericArgsRef<'tcx>) {
+    fn add_wf_preds_for_projection_args(&mut self, args: GenericArgs<'tcx>) {
         let tcx = self.tcx();
         let cause = self.cause(ObligationCauseCode::WellFormed(WellFormedLoc::None));
         let param_env = self.param_env;
@@ -617,7 +618,7 @@ impl<'a, 'tcx> WfPredicates<'a, 'tcx> {
     fn nominal_obligations(
         &mut self,
         def_id: DefId,
-        args: GenericArgsRef<'tcx>,
+        args: GenericArgs<'tcx>,
         mut push_obligation: impl FnMut(&mut Self, PredicateObligation<'tcx>),
     ) {
         // PERF: `Sized`'s predicates include `MetaSized`, but both are compiler implemented marker
@@ -812,7 +813,7 @@ impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
                 self.require_sized(subty, ObligationCauseCode::SliceOrArrayElem);
                 // Note that the len being WF is implicitly checked while visiting.
                 // Here we just check that it's of type usize.
-                let cause = self.cause(ObligationCauseCode::ArrayLen(t));
+                let cause = self.cause(ObligationCauseCode::ArrayLen(t, self.span));
                 self.out.push(traits::Obligation::with_depth(
                     tcx,
                     cause,
@@ -1122,6 +1123,15 @@ impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
                     ))),
                 ));
             }
+
+            ty::View(def, args, _fields) => {
+                // FIXME(scrabsha): what should we require from fields?
+
+                // WfNominalType
+                self.nominal_obligations(def.did(), args, |this, obligation| {
+                    this.out.push(obligation)
+                });
+            }
         }
 
         t.super_visit_with(self)
@@ -1344,6 +1354,7 @@ pub fn object_region_bounds<'tcx>(
                 | ty::ClauseKind::WellFormed(_)
                 | ty::ClauseKind::UnstableFeature(_)
                 | ty::ClauseKind::ConstEvaluatable(_) => None,
+                ty::ClauseKind::CompressedTrait(_) => unreachable!(),
             }
         })
         .collect()

@@ -18,7 +18,7 @@ use rustc_middle::ty::{
     TypeFolder, TypeSuperFoldable, TypeVisitable, TypeVisitableExt, TypeVisitor, TypingMode,
     Unnormalized, Upcast,
 };
-use rustc_span::{BytePos, DUMMY_SP, Span, bug, span_bug};
+use rustc_span::{BytePos, DUMMY_SP, Span, bug, kw, span_bug};
 use rustc_trait_selection::error_reporting::InferCtxtErrorExt;
 use rustc_trait_selection::infer::InferCtxtExt;
 use rustc_trait_selection::regions::InferCtxtRegionExt;
@@ -238,7 +238,6 @@ fn compare_method_clause_entailment<'tcx>(
 
     let hybrid_clauses = hybrid_clauses.into_iter().map(Unnormalized::skip_norm_wip);
     let normalize_cause = traits::ObligationCause::misc(impl_m_span, impl_m_def_id);
-    let param_env = ty::ParamEnv::new(tcx, hybrid_clauses);
     // NOTE(-Zhigher-ranked-assumptions): The `hybrid_preds`
     // should be well-formed. However, using them may result in
     // region errors as we currently don't track placeholder
@@ -253,7 +252,8 @@ fn compare_method_clause_entailment<'tcx>(
     // should be due to missing implied bounds.
     //
     // cc trait-system-refactor-initiative/issues/166.
-    let param_env = traits::normalize_param_env_or_error(tcx, param_env, normalize_cause);
+    let param_env =
+        traits::normalize_param_env_or_error(tcx, hybrid_clauses.collect(), normalize_cause);
     debug!(?param_env);
 
     let infcx = &tcx.infer_ctxt().build(TypingMode::non_body_analysis());
@@ -494,10 +494,9 @@ pub(super) fn collect_return_position_impl_trait_in_trait_tys<'tcx>(
         .into_iter()
         .chain(tcx.clauses_of(trait_m.def_id).instantiate_own(tcx, trait_to_impl_args))
         .map(|(clause, _)| clause.skip_norm_wip());
-    let param_env = ty::ParamEnv::new(tcx, hybrid_clauses);
     let param_env = traits::normalize_param_env_or_error(
         tcx,
-        param_env,
+        hybrid_clauses.collect(),
         ObligationCause::misc(tcx.def_span(impl_m_def_id), impl_m_def_id),
     );
 
@@ -625,12 +624,16 @@ pub(super) fn collect_return_position_impl_trait_in_trait_tys<'tcx>(
                 "method `{}` has an incompatible return type for trait",
                 trait_m.name()
             );
+            diag.span_context(tcx.def_span(impl_m.container_id(tcx)).shrink_to_lo());
             infcx.err_ctxt().note_type_err(
                 &mut diag,
                 &cause,
-                tcx.hir_get_if_local(impl_m.def_id)
-                    .and_then(|node| node.fn_decl())
-                    .map(|decl| (decl.output.span(), Cow::from("return type in trait"), false)),
+                tcx.hir_get_if_local(trait_m.def_id).and_then(|node| node.fn_decl()).map(|decl| {
+                    let mut span: MultiSpan = decl.output.span().into();
+                    span.push_span_context(tcx.def_span(trait_m.container_id(tcx)).shrink_to_lo());
+                    span.push_span_context(tcx.def_span(trait_m.def_id).shrink_to_lo());
+                    (span, Cow::from("return type in trait"), false)
+                }),
                 Some(param_env.and(infer::ValuePairs::Terms(ExpectedFound {
                     expected: trait_return_ty.into(),
                     found: impl_return_ty.into(),
@@ -795,7 +798,7 @@ pub(super) fn collect_return_position_impl_trait_in_trait_tys<'tcx>(
 
 struct ImplTraitInTraitCollector<'a, 'tcx, E> {
     ocx: &'a ObligationCtxt<'a, 'tcx, E>,
-    types: FxIndexMap<DefId, (Ty<'tcx>, ty::GenericArgsRef<'tcx>)>,
+    types: FxIndexMap<DefId, (Ty<'tcx>, ty::GenericArgs<'tcx>)>,
     span: Span,
     param_env: ty::ParamEnv<'tcx>,
     impl_m_id: LocalDefId,
@@ -1014,6 +1017,7 @@ fn report_trait_method_mismatch<'tcx>(
         "method `{}` has an incompatible type for trait",
         trait_m.name()
     );
+    diag.span_context(tcx.def_span(impl_m.container_id(tcx)).shrink_to_lo());
     match &terr {
         TypeError::ArgumentMutability(0) | TypeError::ArgumentSorts(_, 0)
             if trait_m.is_method() =>
@@ -1079,10 +1083,53 @@ fn report_trait_method_mismatch<'tcx>(
     }
 
     cause.span = impl_err_span;
+
+    let mut labels = vec![];
+    let mut context = vec![];
+    if let TypeError::ArgumentSorts(_, i) = &terr
+        && let Some(ty) =
+            tcx.fn_sig(trait_m.def_id).skip_binder().inputs_and_output().skip_binder().get(*i)
+        && let ty::Param(param) = ty.kind()
+        // The expected type corresponds to a type parameter, which migh thave a default type or
+        // have been explicitly set in the `impl` with a different type.
+        && let generics = tcx.generics_of(trait_m.def_id)
+        && let param = generics.type_param(*param, tcx)
+        && let GenericParamDefKind::Type { has_default: true, .. } = param.kind
+    {
+        context.push(tcx.def_span(trait_m.container_id(tcx)).shrink_to_lo());
+
+        let param_name = param.name;
+        let msg = if let Some(ty) = trait_sig.inputs_and_output.get(*i)
+            && infcx.can_eq(param_env, *ty, tcx.type_of(param.def_id).skip_binder())
+        {
+            format!("expected to match the default of type parameter `{param_name}`")
+        } else if let Some(ty) = trait_sig.inputs_and_output.get(*i)
+            && let ty::Param(p) = tcx.type_of(param.def_id).skip_binder().kind()
+            && p.name == kw::SelfUpper
+            && infcx.can_eq(param_env, *ty, impl_trait_ref.self_ty())
+        {
+            format!("expected to match the `Self` default of type parameter `{param_name}`")
+        } else {
+            format!("expected to match type parameter `{param_name}`")
+        };
+        labels.push((tcx.def_span(param.def_id), msg));
+    }
+
     infcx.err_ctxt().note_type_err(
         &mut diag,
         &cause,
-        trait_err_span.map(|sp| (sp, Cow::from("type in trait"), false)),
+        trait_err_span.map(|sp| {
+            let mut span: MultiSpan = sp.into();
+            span.push_span_context(tcx.def_span(trait_m.container_id(tcx)).shrink_to_lo());
+            span.push_span_context(tcx.def_span(trait_m.def_id).shrink_to_lo());
+            for (sp, label) in labels {
+                span.push_span_label(sp, label);
+            }
+            for sp in context {
+                span.push_span_context(sp);
+            }
+            (span, Cow::from("type in trait"), false)
+        }),
         Some(param_env.and(infer::ValuePairs::PolySigs(ExpectedFound {
             expected: ty::Binder::dummy(trait_sig),
             found: ty::Binder::dummy(impl_sig),
@@ -2190,7 +2237,8 @@ fn compare_const_generic_param_types<'tcx>(
                 infcx.err_ctxt().note_type_err(
                     &mut diag,
                     &cause,
-                    param_trait_ty_span.map(|span| (span, Cow::from("type in trait"), false)),
+                    param_trait_ty_span
+                        .map(|span| (span.into(), Cow::from("type in trait"), false)),
                     Some(param_env.and(infer::ValuePairs::Terms(ExpectedFound {
                         expected: trait_ty.into(),
                         found: impl_ty.into(),
@@ -2323,10 +2371,9 @@ fn compare_const_clause_entailment<'tcx>(
     );
     let hybrid_clauses = hybrid_clauses.into_iter().map(Unnormalized::skip_norm_wip);
 
-    let param_env = ty::ParamEnv::new(tcx, hybrid_clauses);
     let param_env = traits::normalize_param_env_or_error(
         tcx,
-        param_env,
+        hybrid_clauses.collect(),
         ObligationCause::misc(impl_ct_span, impl_ct_def_id),
     );
 
@@ -2365,6 +2412,8 @@ fn compare_const_clause_entailment<'tcx>(
             "implemented const `{}` has an incompatible type for trait",
             trait_ct.name()
         );
+        diag.span_context(tcx.def_span(impl_ct.container_id(tcx)).shrink_to_lo());
+        diag.span_context(tcx.def_span(impl_ct.def_id).shrink_to_lo());
 
         let trait_c_span = trait_ct.def_id.as_local().map(|trait_ct_def_id| {
             // Add a label to the Span containing just the type of the const
@@ -2375,7 +2424,12 @@ fn compare_const_clause_entailment<'tcx>(
         infcx.err_ctxt().note_type_err(
             &mut diag,
             &cause,
-            trait_c_span.map(|span| (span, Cow::from("type in trait"), false)),
+            trait_c_span.map(|span| {
+                let mut span: MultiSpan = span.into();
+                span.push_span_context(tcx.def_span(trait_ct.container_id(tcx)).shrink_to_lo());
+                span.push_span_context(tcx.def_span(trait_ct.def_id).shrink_to_lo());
+                (span, Cow::from("type in trait"), false)
+            }),
             Some(param_env.and(infer::ValuePairs::Terms(ExpectedFound {
                 expected: trait_ty.into(),
                 found: impl_ty.into(),
@@ -2474,8 +2528,8 @@ fn compare_type_clause_entailment<'tcx>(
     }
 
     let hybrid_clauses = hybrid_clauses.into_iter().map(Unnormalized::skip_norm_wip);
-    let param_env = ty::ParamEnv::new(tcx, hybrid_clauses);
-    let param_env = traits::normalize_param_env_or_error(tcx, param_env, normalize_cause);
+    let param_env =
+        traits::normalize_param_env_or_error(tcx, hybrid_clauses.collect(), normalize_cause);
     debug!(?param_env);
 
     let infcx = tcx.infer_ctxt().build(TypingMode::non_body_analysis());
@@ -2719,9 +2773,8 @@ fn param_env_with_gat_bounds<'tcx>(
     impl_ty: ty::AssocItem,
     impl_trait_ref: ty::TraitRef<'tcx>,
 ) -> ty::ParamEnv<'tcx> {
-    let param_env = tcx.param_env(impl_ty.def_id);
+    let mut param_env = tcx.param_env(impl_ty.def_id).into_builder(tcx);
     let container_id = impl_ty.container_id(tcx);
-    let mut clauses = param_env.caller_bounds().collect::<Vec<_>>();
 
     // for RPITITs, we should install predicates that allow us to project all
     // of the RPITITs associated with the same body. This is because checking
@@ -2818,7 +2871,7 @@ fn param_env_with_gat_bounds<'tcx>(
                 //
                 // impl<T> X for T where T: X { type Y = <T as X>::Y; }
             }
-            _ => clauses.push(
+            _ => param_env.add_clause(
                 ty::Binder::bind_with_vars(
                     ty::ProjectionClause {
                         projection_term: ty::AliasTerm::new(
@@ -2835,7 +2888,7 @@ fn param_env_with_gat_bounds<'tcx>(
         };
     }
 
-    ty::ParamEnv::new(tcx, clauses)
+    param_env.build()
 }
 
 /// Manually check here that `async fn foo()` wasn't matched against `fn foo()`,

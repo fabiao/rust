@@ -23,8 +23,8 @@ use rustc_middle::ty::adjustment::{
     PointerCoercion,
 };
 use rustc_middle::ty::{
-    self, AssocContainer, GenericArgs, GenericArgsRef, GenericParamDefKind, Ty, TyCtxt,
-    TypeFoldable, TypeVisitableExt, Unnormalized, UserArgs,
+    self, AssocContainer, GenericArgs, GenericParamDefKind, Ty, TyCtxt, TypeFoldable,
+    TypeVisitableExt, Unnormalized, UserArgs,
 };
 use rustc_span::{DUMMY_SP, Span, bug, span_bug};
 use rustc_trait_selection::traits;
@@ -301,7 +301,7 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
         &mut self,
         self_ty: Ty<'tcx>,
         pick: &probe::Pick<'tcx>,
-    ) -> GenericArgsRef<'tcx> {
+    ) -> GenericArgs<'tcx> {
         match pick.kind {
             probe::InherentImplPick => {
                 let impl_def_id = pick.item.container_id(self.tcx);
@@ -333,27 +333,32 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
                     return ty::GenericArgs::extend_with_error(self.tcx, trait_def_id, &[]);
                 }
 
-                self.extract_existential_trait_ref(self_ty, |this, object_ty, principal| {
-                    // The object data has no entry for the Self
-                    // Type. For the purposes of this method call, we
-                    // instantiate the object type itself. This
-                    // wouldn't be a sound instantiation in all cases,
-                    // since each instance of the object type is a
-                    // different existential and hence could match
-                    // distinct types (e.g., if `Self` appeared as an
-                    // argument type), but those cases have already
-                    // been ruled out when we deemed the trait to be
-                    // "dyn-compatible".
-                    let original_poly_trait_ref = principal.with_self_ty(this.tcx, object_ty);
-                    let upcast_poly_trait_ref = this.upcast(original_poly_trait_ref, trait_def_id);
-                    let upcast_trait_ref =
-                        this.instantiate_binder_with_fresh_vars(upcast_poly_trait_ref);
-                    debug!(
-                        "original_poly_trait_ref={:?} upcast_trait_ref={:?} target_trait={:?}",
-                        original_poly_trait_ref, upcast_trait_ref, trait_def_id
-                    );
-                    upcast_trait_ref.args
-                })
+                self.extract_existential_trait_ref(
+                    self_ty,
+                    trait_def_id,
+                    |this, object_ty, principal| {
+                        // The object data has no entry for the Self
+                        // Type. For the purposes of this method call, we
+                        // instantiate the object type itself. This
+                        // wouldn't be a sound instantiation in all cases,
+                        // since each instance of the object type is a
+                        // different existential and hence could match
+                        // distinct types (e.g., if `Self` appeared as an
+                        // argument type), but those cases have already
+                        // been ruled out when we deemed the trait to be
+                        // "dyn-compatible".
+                        let original_poly_trait_ref = principal.with_self_ty(this.tcx, object_ty);
+                        let upcast_poly_trait_ref =
+                            this.upcast(original_poly_trait_ref, trait_def_id);
+                        let upcast_trait_ref =
+                            this.instantiate_binder_with_fresh_vars(upcast_poly_trait_ref);
+                        debug!(
+                            "original_poly_trait_ref={:?} upcast_trait_ref={:?} target_trait={:?}",
+                            original_poly_trait_ref, upcast_trait_ref, trait_def_id
+                        );
+                        upcast_trait_ref.args
+                    },
+                )
             }
 
             probe::TraitPick { .. } => {
@@ -375,9 +380,18 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
         }
     }
 
-    fn extract_existential_trait_ref<R, F>(&mut self, self_ty: Ty<'tcx>, mut closure: F) -> R
+    fn extract_existential_trait_ref<F>(
+        &mut self,
+        self_ty: Ty<'tcx>,
+        trait_def_id: DefId,
+        mut closure: F,
+    ) -> GenericArgs<'tcx>
     where
-        F: FnMut(&mut ConfirmContext<'a, 'tcx>, Ty<'tcx>, ty::PolyExistentialTraitRef<'tcx>) -> R,
+        F: FnMut(
+            &mut ConfirmContext<'a, 'tcx>,
+            Ty<'tcx>,
+            ty::PolyExistentialTraitRef<'tcx>,
+        ) -> GenericArgs<'tcx>,
     {
         // If we specified that this is an object method, then the
         // self-type ought to be something that can be dereferenced to
@@ -407,11 +421,11 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
                 _ => None,
             })
             .unwrap_or_else(|| {
-                span_bug!(
+                self.dcx().span_delayed_bug(
                     self.span,
-                    "self-type `{}` for ObjectPick never dereferenced to an object",
-                    self_ty
-                )
+                    format!("self-type `{self_ty}` for ObjectPick never dereferenced to an object"),
+                );
+                ty::GenericArgs::extend_with_error(self.tcx, trait_def_id, &[])
             })
     }
 
@@ -419,8 +433,8 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
         &mut self,
         pick: &probe::Pick<'tcx>,
         seg: &hir::PathSegment<'tcx>,
-        parent_args: GenericArgsRef<'tcx>,
-    ) -> GenericArgsRef<'tcx> {
+        parent_args: GenericArgs<'tcx>,
+    ) -> GenericArgs<'tcx> {
         // Determine the values for the generic parameters of the method.
         // If they were not explicitly supplied, just construct fresh
         // variables.
@@ -519,7 +533,7 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
         let args = lower_generic_args(
             self.fcx,
             pick.item.def_id,
-            parent_args,
+            parent_args.as_slice(),
             false,
             None,
             &arg_count_correct,
@@ -614,7 +628,7 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
     fn instantiate_method_sig(
         &mut self,
         pick: &probe::Pick<'tcx>,
-        all_args: GenericArgsRef<'tcx>,
+        all_args: GenericArgs<'tcx>,
     ) -> (ty::FnSig<'tcx>, ty::InstantiatedClauses<'tcx>) {
         debug!("instantiate_method_sig(pick={:?}, all_args={:?})", pick, all_args);
 
@@ -638,7 +652,7 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
     fn add_obligations(
         &mut self,
         sig: ty::FnSig<'tcx>,
-        all_args: GenericArgsRef<'tcx>,
+        all_args: GenericArgs<'tcx>,
         method_clauses: ty::InstantiatedClauses<'tcx>,
         def_id: DefId,
     ) {

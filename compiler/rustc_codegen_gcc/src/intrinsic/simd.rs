@@ -11,12 +11,12 @@ use rustc_codegen_ssa::diagnostics::ExpectedPointerMutability;
 use rustc_codegen_ssa::diagnostics::InvalidMonomorphization;
 use rustc_codegen_ssa::mir::operand::OperandRef;
 use rustc_codegen_ssa::mir::place::PlaceRef;
-use rustc_codegen_ssa::traits::{BaseTypeCodegenMethods, BuilderMethods, LayoutTypeCodegenMethods};
+use rustc_codegen_ssa::traits::{BaseTypeCodegenMethods, BuilderMethods};
 #[cfg(feature = "master")]
 use rustc_hir as hir;
 use rustc_middle::mir::BinOp;
 use rustc_middle::ty::layout::{HasTyCtxt, HasTypingEnv as _, LayoutOf};
-use rustc_middle::ty::{self, Ty};
+use rustc_middle::ty::{self, Intrinsic, Ty};
 use rustc_span::{ErrorGuaranteed, Span, Symbol, span_bug, sym};
 
 use crate::builder::Builder;
@@ -671,7 +671,6 @@ pub fn generic_simd_intrinsic<'a, 'gcc, 'tcx>(
             );
         }
 
-        let pointee_type = bx.backend_type(layout);
         let pointers = args[0].immediate();
         let offsets = args[1].immediate();
         let elem_type = llret_ty.dyncast_vector().expect("vector return type").get_element_type();
@@ -680,7 +679,7 @@ pub fn generic_simd_intrinsic<'a, 'gcc, 'tcx>(
                 let index = bx.context.new_rvalue_from_long(bx.usize_type, i as _);
                 let pointer = bx.extract_element(pointers, index);
                 let offset = bx.extract_element(offsets, index);
-                let pointer = bx.gep(pointee_type, pointer, &[offset]);
+                let pointer = bx.gep(layout.size, pointer, offset);
                 // GCC has no pointer vectors, so the lanes are `usize`.
                 bx.ptrtoint(pointer, elem_type)
             })
@@ -865,7 +864,11 @@ pub fn generic_simd_intrinsic<'a, 'gcc, 'tcx>(
             }};
         }
         let ty::Float(ref f) = *in_elem.kind() else {
-            return_error!(InvalidMonomorphization::BasicFloatType { span, name, ty: in_ty });
+            return_error!(InvalidMonomorphization::BasicFloatType {
+                span,
+                name: Intrinsic::Rustc(name),
+                ty: in_ty
+            });
         };
         let elem_ty = bx.cx.type_float_from_ty(*f);
         let (elem_ty_str, elem_ty, cast_type) = match f.bit_width() {

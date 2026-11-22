@@ -833,7 +833,7 @@ fn ty_is_known_nonnull<'tcx>(
             }
 
             def.variants().iter().filter_map(|variant| transparent_newtype_field(tcx, variant)).any(
-                |field| ty_is_known_nonnull(tcx, typing_env, field.ty(tcx, args).skip_norm_wip()),
+                |field| ty_is_known_nonnull(tcx, typing_env, field.ty(tcx, *args).skip_norm_wip()),
             )
         }
         ty::Pat(base, pat) => {
@@ -955,10 +955,10 @@ pub(crate) fn repr_nullable_ptr<'tcx>(
         ty::Adt(ty_def, args) => {
             let field_ty = match &ty_def.variants().raw[..] {
                 [var_one, var_two] => match (&var_one.fields.raw[..], &var_two.fields.raw[..]) {
-                    ([], [field]) | ([field], []) => field.ty(tcx, args).skip_norm_wip(),
+                    ([], [field]) | ([field], []) => field.ty(tcx, *args).skip_norm_wip(),
                     ([field1], [field2]) => {
-                        let ty1 = field1.ty(tcx, args).skip_norm_wip();
-                        let ty2 = field2.ty(tcx, args).skip_norm_wip();
+                        let ty1 = field1.ty(tcx, *args).skip_norm_wip();
+                        let ty2 = field2.ty(tcx, *args).skip_norm_wip();
 
                         if is_niche_optimization_candidate(tcx, typing_env, ty1) {
                             ty2
@@ -982,7 +982,7 @@ pub(crate) fn repr_nullable_ptr<'tcx>(
             // being applied (and we've got a problem somewhere).
             let compute_size_skeleton =
                 |t| SizeSkeleton::compute(t, tcx, typing_env, DUMMY_SP).ok();
-            if !compute_size_skeleton(ty)?.same_size(compute_size_skeleton(field_ty)?) {
+            if !compute_size_skeleton(ty)?.same_size(&compute_size_skeleton(field_ty)?) {
                 bug!("improper_ctypes: Option nonnull optimization not applied?");
             }
 

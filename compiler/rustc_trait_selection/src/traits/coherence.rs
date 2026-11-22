@@ -41,7 +41,7 @@ use crate::traits::{
 /// bounds / where-clauses).
 #[derive(Clone, Debug, TypeFoldable, TypeVisitable)]
 pub struct ImplHeader<'tcx> {
-    pub impl_args: ty::GenericArgsRef<'tcx>,
+    pub impl_args: ty::GenericArgs<'tcx>,
     pub self_ty: Ty<'tcx>,
     pub trait_ref: Option<ty::TraitRef<'tcx>>,
     pub predicates: Vec<ty::Predicate<'tcx>>,
@@ -447,7 +447,6 @@ fn impl_intersection_has_negative_obligation(
             .into_iter()
             .map(|(c, s)| (c.skip_norm_wip(), s)),
     )
-    .elaborate_sized()
     .any(|(clause, _)| try_prove_negated_where_clause(infcx, clause, param_env))
 }
 

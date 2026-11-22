@@ -29,7 +29,7 @@ pub use self::select::{EvaluationCache, EvaluationResult, OverflowError, Selecti
 use crate::mir::ConstraintCategory;
 pub use crate::traits::solve::BuiltinImplSource;
 use crate::ty::abstract_const::NotConstEvaluatable;
-use crate::ty::{self, AdtKind, GenericArgsRef, Ty};
+use crate::ty::{self, AdtKind, GenericArgs, Ty};
 
 /// The reason why we incurred this obligation; used for error reporting.
 ///
@@ -188,7 +188,7 @@ pub enum ObligationCauseCode<'tcx> {
     SliceOrArrayElem,
 
     /// An array `[T; N]` can only be indexed (and is only well-formed if) `N` has type usize.
-    ArrayLen(Ty<'tcx>),
+    ArrayLen(Ty<'tcx>, Span),
 
     /// A tuple is WF only if its middle elements are `Sized`.
     TupleElem,
@@ -365,6 +365,8 @@ pub enum ObligationCauseCode<'tcx> {
 
     /// Opaque return type of this function
     OpaqueReturnType(Option<(Ty<'tcx>, HirId)>),
+
+    ReturnType,
 
     /// Block implicit return
     BlockTailExpression(HirId, hir::MatchSource),
@@ -758,7 +760,7 @@ impl<'tcx, N> ImplSource<'tcx, N> {
 #[derive(TypeFoldable, TypeVisitable)]
 pub struct ImplSourceUserDefinedData<'tcx, N> {
     pub impl_def_id: DefId,
-    pub args: GenericArgsRef<'tcx>,
+    pub args: GenericArgs<'tcx>,
     pub nested: ThinVec<N>,
 }
 

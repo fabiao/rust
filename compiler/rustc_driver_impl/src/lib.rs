@@ -59,7 +59,7 @@ use rustc_session::output::invalid_output_for_target;
 use rustc_session::{EarlyDiagCtxt, Session, config};
 use rustc_span::def_id::LOCAL_CRATE;
 use rustc_span::{DUMMY_SP, FileName};
-use rustc_structures::CrateType;
+use rustc_structures::{CrateType, LintName};
 use rustc_target::json::ToJson;
 use rustc_target::spec::{Target, TargetTuple};
 use tracing::trace;
@@ -335,7 +335,16 @@ pub fn compiler_entrypoint(at_args: &[String], callbacks: &mut (dyn Callbacks + 
                 }
             }
 
-            let linker = Linker::codegen_and_build_linker(tcx, codegen_backend);
+            let metadata = passes::finish_and_emit_metadata(tcx);
+
+            // Don't do code generation if there were any errors. Likewise if
+            // there were any delayed bugs, because codegen will likely cause
+            // more ICEs, obscuring the original problem.
+            if let Some(guar) = tcx.sess.dcx().has_errors_or_delayed_bugs() {
+                guar.raise_fatal();
+            }
+
+            let linker = Linker::codegen_and_build_linker(tcx, codegen_backend, metadata);
 
             if let Some(metrics_dir) = &sess.opts.unstable_opts.metrics_dir {
                 dump_feature_usage_metrics(tcx, metrics_dir);
@@ -518,9 +527,11 @@ fn show_md_content_with_pager(content: &str, color: ColorConfig) {
     }
 
     // The pager failed. Try to print pretty output to stdout.
-    if let Some((bufwtr, mdbuf)) = &mut pretty_data
+    if matches!(color, ColorConfig::Auto | ColorConfig::Always)
+        && let Some((bufwtr, mdbuf)) = &mut pretty_data
         && bufwtr.write_all(&mdbuf).is_ok()
     {
+        // Colored output was successfully printed to stdout.
         return;
     }
 
@@ -990,11 +1001,9 @@ Available lint options:
         lints
     }
 
-    fn sort_lint_groups(
-        lints: Vec<(&'static str, Vec<LintId>, bool)>,
-    ) -> Vec<(&'static str, Vec<LintId>)> {
+    fn sort_lint_groups(lints: Vec<(LintName, Vec<LintId>, bool)>) -> Vec<(LintName, Vec<LintId>)> {
         let mut lints: Vec<_> = lints.into_iter().map(|(x, y, _)| (x, y)).collect();
-        lints.sort_by_key(|l| l.0);
+        lints.sort_by(|left, right| Ord::cmp(&left.0, &right.0));
         lints
     }
 
@@ -1041,7 +1050,7 @@ Available lint options:
         loaded_groups
             .iter()
             .chain(&builtin_groups)
-            .map(|&(s, _)| s.chars().count())
+            .map(|(s, _)| s.name.as_str().chars().count())
             .max()
             .unwrap_or(0),
     );
@@ -1054,7 +1063,7 @@ Available lint options:
 
     safe_println!("Lint groups provided by rustc:\n");
 
-    let print_lint_groups = |lints: Vec<(&'static str, Vec<LintId>)>, all_warnings| {
+    let print_lint_groups = |lints: Vec<(LintName, Vec<LintId>)>, all_warnings| {
         safe_println!("    {}  sub-lints", padded("name"));
         safe_println!("    {}  ---------", padded("----"));
 
@@ -1063,7 +1072,7 @@ Available lint options:
         }
 
         for (name, to) in lints {
-            let name = name.to_lowercase().replace('_', "-");
+            let name = name.to_string().to_lowercase().replace('_', "-");
             let desc = to
                 .into_iter()
                 .map(|x| x.to_string().replace('_', "-"))
@@ -1467,7 +1476,7 @@ pub fn install_ice_hook(bug_report_url: &'static str, extra_info: fn(DiagCtxtHan
     // (e.g. `RUST_BACKTRACE=1`)
     if env::var_os("RUST_BACKTRACE").is_none() {
         // HACK: this check is extremely dumb, but we don't really need it to be smarter since this should only happen in the test suite anyway.
-        let ui_testing = std::env::args().any(|arg| arg == "-Zui-testing");
+        let ui_testing = env::args_os().any(|arg| arg == "-Zui-testing");
         if env!("CFG_RELEASE_CHANNEL") == "dev" && !ui_testing {
             panic::set_backtrace_style(panic::BacktraceStyle::Short);
         } else {

@@ -4,7 +4,7 @@ use rustc_index::interval::IntervalSet;
 use rustc_middle::mir::visit::{TyContext, Visitor};
 use rustc_middle::mir::{Body, Local, Location, SourceInfo};
 use rustc_middle::ty::relate::Relate;
-use rustc_middle::ty::{GenericArgsRef, Region, RegionVid, Ty, TyCtxt, TypeVisitable};
+use rustc_middle::ty::{GenericArgs, Region, RegionVid, Ty, TyCtxt, TypeVisitable};
 use rustc_mir_dataflow::move_paths::MoveData;
 use rustc_mir_dataflow::points::{DenseLocationMap, PointIndex};
 use rustc_span::span_bug;
@@ -47,7 +47,7 @@ pub(super) fn generate<'tcx>(
 
     let free_regions = regions_that_outlive_free_regions(
         typeck.infcx.num_region_vars(),
-        &typeck.universal_regions,
+        typeck.universal_regions,
         &typeck.constraints.outlives_constraints,
     );
 
@@ -121,7 +121,7 @@ pub(super) fn generate<'tcx>(
     record_regular_live_regions(
         typeck.tcx(),
         &mut typeck.constraints.liveness_constraints,
-        &typeck.universal_regions,
+        typeck.universal_regions,
         &mut typeck.polonius_context,
         typeck.body,
     );
@@ -220,7 +220,7 @@ struct LiveVariablesVisitor<'a, 'tcx> {
 impl<'a, 'tcx> Visitor<'tcx> for LiveVariablesVisitor<'a, 'tcx> {
     /// We sometimes have `args` within an rvalue, or within a
     /// call. Make them live at the location where they appear.
-    fn visit_args(&mut self, args: &GenericArgsRef<'tcx>, location: Location) {
+    fn visit_args(&mut self, args: &GenericArgs<'tcx>, location: Location) {
         self.record_regions_live_at(*args, location);
         self.super_args(args);
     }

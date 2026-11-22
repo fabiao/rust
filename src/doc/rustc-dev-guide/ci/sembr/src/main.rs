@@ -20,6 +20,9 @@ struct Cli {
     /// Applies to lines that are to be split
     #[arg(long, default_value_t = 100)]
     line_length_limit: usize,
+    /// Hide compliant files... they are less important to display
+    #[arg(long, default_value_t = false)]
+    hide_compliant_files: bool,
 }
 
 static REGEX_IGNORE_END: LazyLock<Regex> =
@@ -47,7 +50,7 @@ fn main() -> Result<()> {
         if extension != "md" {
             continue;
         }
-        let old = fs::read_to_string(&path)?;
+        let mut old = fs::read_to_string(&path)?;
         let mut new = comply(&old);
         if cli.reflow_harder {
             new = reformat(&new, cli.line_length_limit)
@@ -55,14 +58,22 @@ fn main() -> Result<()> {
         if new == old {
             compliant.push(path.clone());
         } else if cli.overwrite {
-            fs::write(&path, reformat(&new, cli.line_length_limit))?;
+            while new != old {
+                old = new.clone();
+                new = reformat(&new, cli.line_length_limit);
+            }
+            fs::write(&path, new)?;
             made_compliant.push(path.clone());
         } else {
             not_compliant.push(path.clone());
         }
     }
     if !compliant.is_empty() {
-        display("compliant", &compliant);
+        if cli.hide_compliant_files {
+            println!("{} files are compliant", compliant.len())
+        } else {
+            display("compliant", &compliant);
+        }
     }
     if !made_compliant.is_empty() {
         display("made compliant", &made_compliant);
@@ -121,12 +132,10 @@ fn comply(content: &str) -> String {
             line.find(|ch: char| !ch.is_whitespace()).unwrap()
         };
         let mut newly_split_lines = line.split_inclusive(&*REGEX_SPLIT);
-        let first = newly_split_lines.next().unwrap().trim_end().to_owned();
-        let mut remaining: Vec<_> = newly_split_lines
-            .map(|portion| format!("{:indent$}{}", "", portion.trim_end()))
-            .collect();
         let mut new_lines = Vec::new();
-        new_lines.push(first);
+        new_lines.push(newly_split_lines.next().unwrap().trim_end().to_owned());
+        let mut remaining: Vec<_> =
+            newly_split_lines.map(|portion| format!("{:indent$}{}", "", portion.trim())).collect();
         new_lines.append(&mut remaining);
         new_content.splice(new_n..=new_n, new_lines.clone());
         new_n += new_lines.len() - 1;
@@ -244,13 +253,14 @@ some code. block
 ```
 sentence with *italics* should not be ignored. truly.
 git log main.. compiler
- foo.   bar.  baz
 o? whatever
 r? @reviewer
  r? @reviewer
 ~? diagnostic
 
 the queries that we do, as well as the **query DAG**. The
+
+trim double space.  or many spaces.   in this next sentence
 ";
     let expected = "
 # some. heading
@@ -276,9 +286,6 @@ some code. block
 sentence with *italics* should not be ignored.
 truly.
 git log main.. compiler
- foo.
-   bar.
-  baz
 o?
 whatever
 r? @reviewer
@@ -287,6 +294,10 @@ r? @reviewer
 
 the queries that we do, as well as the **query DAG**.
 The
+
+trim double space.
+or many spaces.
+in this next sentence
 ";
     assert_eq!(expected, comply(original));
 }

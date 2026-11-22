@@ -339,7 +339,7 @@ impl<'mir, 'tcx> Checker<'mir, 'tcx> {
     fn revalidate_conditional_constness(
         &mut self,
         callee: DefId,
-        callee_args: ty::GenericArgsRef<'tcx>,
+        callee_args: ty::GenericArgs<'tcx>,
         call_span: Span,
     ) -> Option<ConstConditionsHold> {
         let tcx = self.tcx;
@@ -831,7 +831,7 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                     return;
                 }
 
-                // Intrinsics are language primitives, not regular calls, so treat them separately.
+                // Non-backend intrinsics are language primitives, not regular calls, so treat them separately.
                 if let Some(intrinsic) = tcx.intrinsic(callee) {
                     if !tcx.is_const_fn(callee) {
                         // Non-const intrinsic.

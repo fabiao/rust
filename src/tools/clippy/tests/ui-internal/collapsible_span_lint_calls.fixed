@@ -1,6 +1,7 @@
 #![deny(clippy::collapsible_span_lint_calls)]
 #![allow(clippy::missing_clippy_version_attribute)]
 #![feature(rustc_private)]
+#![feature(default_field_values)]
 
 extern crate clippy_utils;
 extern crate rustc_ast;
@@ -17,7 +18,7 @@ declare_tool_lint! {
     pub clippy::TEST_LINT,
     Warn,
     "",
-    report_in_external_macro: true
+    @report_in_external_macro = true
 }
 
 declare_lint_pass!(Pass => [TEST_LINT]);

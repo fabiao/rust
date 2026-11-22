@@ -68,7 +68,7 @@ declare_tool_lint! {
     pub clippy::COLLAPSIBLE_SPAN_LINT_CALLS,
     Warn,
     "found collapsible `span_lint_and_then` calls",
-    report_in_external_macro: true
+    @report_in_external_macro = true
 }
 
 declare_lint_pass!(CollapsibleCalls => [COLLAPSIBLE_SPAN_LINT_CALLS]);
@@ -83,7 +83,7 @@ impl<'tcx> LateLintPass<'tcx> for CollapsibleCalls {
             && internal_paths::SPAN_LINT_AND_THEN.matches_path(cx, func)
             && let ExprKind::Closure(&Closure { body, .. }) = call_f.kind
             && let body = cx.tcx.hir_body(body)
-            && let only_expr = peel_blocks_with_stmt(&body.value)
+            && let only_expr = peel_blocks_with_stmt(body.value)
             && let ExprKind::MethodCall(ps, recv, span_call_args, _) = &only_expr.kind
             && let ExprKind::Path(..) = recv.kind
         {

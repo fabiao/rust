@@ -18,7 +18,7 @@ use rustc_middle::ty::print::{
 use rustc_middle::ty::util::Discr;
 use rustc_middle::ty::{
     AdtDef, AdtKind, AssocItem, Binder, ClosureKind, CoroutineArgsExt, EarlyBinder,
-    ExistentialTraitRef, FnSig, GenericArgsRef, Instance, InstanceKind, IntrinsicDef, List,
+    ExistentialTraitRef, FnSig, GenericArgs, Instance, InstanceKind, Intrinsic, IntrinsicDef, List,
     PolyFnSig, ScalarInt, TraitDef, TraitRef, Ty, TyCtxt, TyKind, TypeVisitableExt, UintTy,
     ValTree, VariantDef, VtblEntry,
 };
@@ -310,9 +310,9 @@ impl<'tcx, B: Bridge> CompilerCtxt<'tcx, B> {
         };
         attrs_iter
             .filter_map(|attribute| {
-                if let Attribute::Tool(u) = attribute {
+                if let Attribute::Tool { item, .. } = attribute {
                     let attr_str = rustc_hir_pretty::attribute_to_string(self, attribute);
-                    Some((attr_str, u.span))
+                    Some((attr_str, item.span))
                 } else {
                     None
                 }
@@ -377,11 +377,7 @@ impl<'tcx, B: Bridge> CompilerCtxt<'tcx, B> {
     }
 
     /// Retrieve the function signature for the given generic arguments.
-    pub fn fn_sig(
-        &self,
-        def_id: DefId,
-        args_ref: GenericArgsRef<'tcx>,
-    ) -> Binder<'tcx, FnSig<'tcx>> {
+    pub fn fn_sig(&self, def_id: DefId, args_ref: GenericArgs<'tcx>) -> Binder<'tcx, FnSig<'tcx>> {
         let sig = self.tcx.fn_sig(def_id).instantiate(self.tcx, args_ref).skip_norm_wip();
         sig
     }
@@ -404,11 +400,15 @@ impl<'tcx, B: Bridge> CompilerCtxt<'tcx, B> {
 
     /// Retrieve the plain function name of an intrinsic.
     pub fn intrinsic_name(&self, def_id: DefId) -> String {
-        self.tcx.intrinsic(def_id).unwrap().name.to_string()
+        match self.tcx.intrinsic(def_id).unwrap().name {
+            Intrinsic::Rustc(s) => s,
+            Intrinsic::Backend { llvm } => llvm,
+        }
+        .to_string()
     }
 
     /// Retrieve the closure signature for the given generic arguments.
-    pub fn closure_sig(&self, args_ref: GenericArgsRef<'tcx>) -> Binder<'tcx, FnSig<'tcx>> {
+    pub fn closure_sig(&self, args_ref: GenericArgs<'tcx>) -> Binder<'tcx, FnSig<'tcx>> {
         args_ref.as_closure().sig()
     }
 
@@ -430,7 +430,7 @@ impl<'tcx, B: Bridge> CompilerCtxt<'tcx, B> {
     pub fn coroutine_discr_for_variant(
         &self,
         coroutine: DefId,
-        args: GenericArgsRef<'tcx>,
+        args: GenericArgs<'tcx>,
         variant: rustc_abi::VariantIdx,
     ) -> Discr<'tcx> {
         args.as_coroutine().discriminant_for_variant(coroutine, self.tcx, variant)
@@ -559,7 +559,7 @@ impl<'tcx, B: Bridge> CompilerCtxt<'tcx, B> {
     }
 
     /// Returns the type of given definition instantiated with the given arguments.
-    pub fn def_ty_with_args(&self, item: DefId, args_ref: GenericArgsRef<'tcx>) -> Ty<'tcx> {
+    pub fn def_ty_with_args(&self, item: DefId, args_ref: GenericArgs<'tcx>) -> Ty<'tcx> {
         let def_ty = self.tcx.type_of(item);
         self.tcx.instantiate_and_normalize_erasing_regions(args_ref, self.typing_env(), def_ty)
     }
@@ -601,7 +601,7 @@ impl<'tcx, B: Bridge> CompilerCtxt<'tcx, B> {
     }
 
     /// Get the instantiation types.
-    pub fn instance_args(&self, instance: ty::Instance<'tcx>) -> GenericArgsRef<'tcx> {
+    pub fn instance_args(&self, instance: ty::Instance<'tcx>) -> GenericArgs<'tcx> {
         instance.args
     }
 
@@ -664,7 +664,7 @@ impl<'tcx, B: Bridge> CompilerCtxt<'tcx, B> {
     pub fn resolve_instance(
         &self,
         def_id: DefId,
-        args_ref: GenericArgsRef<'tcx>,
+        args_ref: GenericArgs<'tcx>,
     ) -> Option<Instance<'tcx>> {
         match Instance::try_resolve(self.tcx, self.typing_env(), def_id, args_ref) {
             Ok(Some(instance)) => Some(instance),
@@ -682,7 +682,7 @@ impl<'tcx, B: Bridge> CompilerCtxt<'tcx, B> {
     pub fn resolve_for_fn_ptr(
         &self,
         def_id: DefId,
-        args_ref: GenericArgsRef<'tcx>,
+        args_ref: GenericArgs<'tcx>,
     ) -> Option<Instance<'tcx>> {
         Instance::resolve_for_fn_ptr(self.tcx, self.typing_env(), def_id, args_ref)
     }
@@ -691,7 +691,7 @@ impl<'tcx, B: Bridge> CompilerCtxt<'tcx, B> {
     pub fn resolve_closure(
         &self,
         def_id: DefId,
-        args_ref: GenericArgsRef<'tcx>,
+        args_ref: GenericArgs<'tcx>,
         closure_kind: ClosureKind,
     ) -> Option<Instance<'tcx>> {
         Some(Instance::resolve_closure(self.tcx, def_id, args_ref, closure_kind))

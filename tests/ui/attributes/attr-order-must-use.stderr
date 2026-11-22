@@ -1,4 +1,4 @@
-error: unused attribute
+error: duplicate `must_use` attributes
   --> $DIR/attr-order-must-use.rs:6:1
    |
 LL | #[must_use = "BBB"]
@@ -25,7 +25,7 @@ LL |     must_use();
    |
    = note: AAA
    = note: `#[deny(unused_must_use)]` implied by `#[deny(unused)]`
-help: use `let _ = ...` to ignore the resulting value
+help: if you wish to disregard this recommendation, use `let _ = ...` to ignore the value
    |
 LL |     let _ = must_use();
    |     +++++++

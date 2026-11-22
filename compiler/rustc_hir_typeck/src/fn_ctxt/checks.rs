@@ -209,7 +209,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // Lowering info if a splatted function is being called.
         fn_id: SplatLoweringInfo<'tcx>,
         // The generics of the function being called. Only used for splatting
-        callee_generic_args: Option<ty::GenericArgsRef<'tcx>>,
+        callee_generic_args: Option<ty::GenericArgs<'tcx>>,
     ) {
         let tcx = self.tcx;
 
@@ -508,8 +508,6 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 // We use implementations of VaArgSafe as the source of truth. On some embedded
                 // targets, c_double is f32 and c_int/c_uing are i16/u16, and these types implement
                 // VaArgSafe there. On all other targets, these types do not implement VaArgSafe.
-                //
-                // cfg(bootstrap): change the if let to an unwrap.
                 let arg_ty = self.structurally_resolve_type(arg.span, arg_ty);
                 if let Some(trait_def_id) = tcx.lang_items().va_arg_safe()
                     && self
@@ -597,7 +595,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // Lowering info if a splatted function is being called.
         fn_id: SplatLoweringInfo<'tcx>,
         // The generics of the function being called. Only used for splatting
-        callee_generic_args: Option<ty::GenericArgsRef<'tcx>>,
+        callee_generic_args: Option<ty::GenericArgs<'tcx>>,
     ) -> TupledArgCheckOutcome<'tcx> {
         let (first_tupled_arg_index, is_self_splatted) = tuple_arguments.tupled_arg_index();
         let Some(first_tupled_arg_index) = first_tupled_arg_index else {
@@ -3481,7 +3479,7 @@ impl<'a, 'tcx> ArgsCtxt<'a, 'tcx> {
                 callee_ty.peel_refs(),
                 self.call_ctxt.callee_expr.unwrap().hir_id,
                 TraitsInScope,
-                |mut ctxt| ctxt.probe_for_similar_candidate(),
+                |mut ctxt| ctxt.probe_for_similar_candidate(&[]),
             )
             && assoc.is_method()
         {
@@ -3725,9 +3723,9 @@ fn only_keep_structural_changes<'tcx>(
             formal_ty: Ty<'tcx>,
             _expected_ty: Ty<'tcx>,
             _def_id: DefId,
-            formal_args: ty::GenericArgsRef<'tcx>,
-            expected_args: ty::GenericArgsRef<'tcx>,
-            mk: impl FnOnce(ty::GenericArgsRef<'tcx>) -> Ty<'tcx>,
+            formal_args: ty::GenericArgs<'tcx>,
+            expected_args: ty::GenericArgs<'tcx>,
+            mk: impl FnOnce(ty::GenericArgs<'tcx>) -> Ty<'tcx>,
         ) -> RelateResult<'tcx, Ty<'tcx>> {
             let new_args = relate::relate_args_invariantly(self, formal_args, expected_args)?;
 

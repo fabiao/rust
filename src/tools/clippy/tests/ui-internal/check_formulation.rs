@@ -1,6 +1,7 @@
 #![deny(clippy::almost_standard_lint_formulation)]
 #![allow(clippy::lint_without_lint_pass)]
 #![feature(rustc_private)]
+#![feature(default_field_values)]
 
 #[macro_use]
 extern crate rustc_middle;
@@ -15,7 +16,7 @@ declare_tool_lint! {
     pub clippy::VALID,
     Warn,
     "One",
-    report_in_external_macro: true
+    @report_in_external_macro = true
 }
 
 declare_tool_lint! {
@@ -26,7 +27,7 @@ declare_tool_lint! {
     pub clippy::INVALID1,
     Warn,
     "One",
-    report_in_external_macro: true
+    @report_in_external_macro = true
 }
 
 declare_tool_lint! {
@@ -37,7 +38,7 @@ declare_tool_lint! {
     pub clippy::INVALID2,
     Warn,
     "One",
-    report_in_external_macro: true
+    @report_in_external_macro = true
 }
 
 declare_tool_lint! {
@@ -48,7 +49,7 @@ declare_tool_lint! {
     pub clippy::ALLOWED_INVALID,
     Warn,
     "One",
-    report_in_external_macro: true
+    @report_in_external_macro = true
 }
 
 declare_lint_pass!(Pass => [VALID, INVALID1, INVALID2]);

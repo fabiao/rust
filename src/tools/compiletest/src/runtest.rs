@@ -16,16 +16,17 @@ use tracing::*;
 use crate::common::{
     CompareMode, Config, Debugger, ForcePassMode, PassFailMode, RunResult, TestMode, TestPaths,
     TestSuite, UI_EXTENSIONS, UI_FIXED, UI_RUN_STDERR, UI_RUN_STDOUT, UI_STDERR, UI_STDOUT, UI_SVG,
-    UI_WINDOWS_SVG, expected_output_path, incremental_dir, output_base_dir, output_base_name,
+    expected_output_path, incremental_dir, output_base_dir, output_base_name,
 };
 use crate::directives::{AuxCrate, TestProps};
+use crate::edition::Edition;
 use crate::errors::{Error, ErrorKind, load_errors};
 use crate::executor::TestVariant;
 use crate::output_capture::ConsoleOut;
 use crate::read2::{Truncated, read2_abbreviated};
 use crate::runtest::compute_diff::{DiffLine, diff_by_lines, make_diff, write_diff};
 use crate::util::{ArgFileCommand, Utf8PathBufExt, add_dylib_path, static_regex};
-use crate::{json, stamp_file_path};
+use crate::{discovery, json};
 
 // Helper modules that implement test running logic for each test suite.
 // tidy-alphabetical-start
@@ -101,7 +102,7 @@ fn get_lib_name(name: &str, aux_type: AuxType, wasm_proc_macros: bool) -> Option
         AuxType::Lib => Some(format!("lib{name}.rlib")),
         // FIXME maybe use `rustc --print file-names` instead?
         AuxType::ProcMacro if wasm_proc_macros => Some(format!("{name}.wasm")),
-        AuxType::Dylib | AuxType::ProcMacro => Some(dylib_name(name)),
+        AuxType::Dylib | AuxType::ProcMacro | AuxType::Lint => Some(dylib_name(name)),
     }
 }
 
@@ -224,6 +225,14 @@ struct TestCx<'test> {
     variant: &'test TestVariant,
 }
 
+impl TestCx<'_> {
+    fn edition(self) -> Edition {
+        // We're always explicitly defaulting to rustc's default to suppress the
+        // warning that rustc emits when no edition gets specified.
+        self.props.edition.or(self.config.edition).unwrap_or(Edition::RUSTC_DEFAULT)
+    }
+}
+
 enum ReadFrom {
     Path,
     Stdin(String),
@@ -253,11 +262,12 @@ enum Emit {
     LinkArgsAsm,
 }
 
-/// Indicates whether we are using `rustc` or `rustdoc` to compile an input file.
+/// Indicates whether we are using `rustc`, `rustdoc` or `compiletest-lint-driver`` to compile an input file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CompilerKind {
     Rustc,
     Rustdoc,
+    LintDriver,
 }
 
 /// Unstable compiler flags that compiletest passes to UI tests on its own, i.e. without specific
@@ -456,6 +466,7 @@ impl<'test> TestCx<'test> {
             .arg(&aux_dir)
             .arg("-A")
             .arg("internal_features")
+            .arg(self.edition().to_flag())
             .args(&self.props.compile_flags)
             .envs(self.props.rustc_env.clone());
         self.maybe_add_external_args(&mut rustc, &self.config.target_rustcflags);
@@ -570,6 +581,7 @@ impl<'test> TestCx<'test> {
             .arg("internal_features");
         self.set_revision_flags(&mut rustc);
         self.maybe_add_external_args(&mut rustc, &self.config.target_rustcflags);
+        rustc.arg(self.edition().to_flag());
         rustc.args(&self.props.compile_flags);
 
         self.compose_and_run_compiler(rustc, Some(src))
@@ -982,6 +994,7 @@ impl<'test> TestCx<'test> {
             emit,
             allow_unused,
             LinkToAux::Yes,
+            self.edition(),
             passes,
         );
 
@@ -1065,6 +1078,7 @@ impl<'test> TestCx<'test> {
             // FIXME(#160895): While the new solver is enabled by default on nightly,
             // we don't want to use it in our tests for now.
             .arg("-Znext-solver=coherence")
+            .arg(self.edition().to_flag())
             .args(&self.props.compile_flags)
             .args(&self.props.doc_flags);
 
@@ -1105,6 +1119,7 @@ impl<'test> TestCx<'test> {
             rustdoc_merge
                 .arg("-o")
                 .arg(out_dir.as_ref())
+                .arg(self.edition().to_flag())
                 .args(&self.props.compile_flags)
                 .args(&self.props.doc_flags)
                 .arg("--read-doc-meta-dir")
@@ -1269,6 +1284,7 @@ impl<'test> TestCx<'test> {
         !self.props.aux.builds.is_empty()
             || !self.props.aux.crates.is_empty()
             || !self.props.aux.proc_macros.is_empty()
+            || !self.props.aux.lints.is_empty()
     }
 
     fn aux_output_dir(&self) -> Utf8PathBuf {
@@ -1302,12 +1318,40 @@ impl<'test> TestCx<'test> {
             self.build_auxiliary(rel_ab, &aux_dir, Some(AuxType::Bin));
         }
 
+        for lint in &self.props.aux.lints {
+            self.build_auxiliary(lint, &aux_dir, Some(AuxType::Lint));
+        }
+
         let path_to_crate_name = |path: &str| -> String {
             path.rsplit_once('/')
                 .map_or(path, |(_, tail)| tail)
                 .trim_end_matches(".rs")
                 .replace('-', "_")
         };
+
+        let lint_lib_paths = self
+            .props
+            .aux
+            .lints
+            .iter()
+            .filter_map(|p| {
+                if let Some(lib_name) = get_lib_name(
+                    &path_to_crate_name(p),
+                    AuxType::Lint,
+                    self.config.wasm_proc_macros,
+                ) {
+                    Some(aux_dir.join(lib_name).to_string())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        if !lint_lib_paths.is_empty() {
+            rustc.env(
+                "COMPILETEST_LINT_DRIVER_PATHS",
+                std::env::join_paths(lint_lib_paths).unwrap(),
+            );
+        }
 
         let add_extern = |rustc: &mut Command,
                           extern_modifiers: Option<&str>,
@@ -1383,6 +1427,9 @@ impl<'test> TestCx<'test> {
     /// directory.
     fn build_minicore(&self) -> Utf8PathBuf {
         let output_file_path = self.output_base_dir().join("libminicore.rlib");
+
+        // We want to inherit *all* `TestProps` from the test that added minicore *except*
+        // for the edition which we want to keep fixed to the latest stable one.
         let mut rustc = self.make_compile_args(
             CompilerKind::Rustc,
             &self.config.minicore_path,
@@ -1390,6 +1437,7 @@ impl<'test> TestCx<'test> {
             Emit::None,
             AllowUnused::Yes,
             LinkToAux::No,
+            Edition::LATEST_STABLE,
             vec![],
         );
 
@@ -1444,6 +1492,8 @@ impl<'test> TestCx<'test> {
             } else {
                 aux_props.force_host = true;
             }
+        } else if aux_type == Some(AuxType::Lint) {
+            aux_props.force_host = true;
         }
         let mut aux_dir = aux_dir.to_path_buf();
         if aux_type == Some(AuxType::Bin) {
@@ -1471,6 +1521,7 @@ impl<'test> TestCx<'test> {
             Emit::None,
             AllowUnused::No,
             LinkToAux::No,
+            aux_cx.edition(),
             Vec::new(),
         );
         aux_cx.build_all_auxiliary(&aux_dir, &mut aux_rustc);
@@ -1484,6 +1535,8 @@ impl<'test> TestCx<'test> {
             (AuxType::Bin, Some("bin"))
         } else if aux_type == Some(AuxType::ProcMacro) {
             (AuxType::ProcMacro, Some("proc-macro"))
+        } else if aux_type == Some(AuxType::Lint) {
+            (AuxType::Lint, Some("dylib"))
         } else if aux_type.is_some() {
             panic!("aux_type {aux_type:?} not expected");
         } else if aux_props.no_prefer_dynamic {
@@ -1586,9 +1639,16 @@ impl<'test> TestCx<'test> {
 
         command.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::piped());
 
+        let lint_driver_path =
+            self.config.rustc_lint_driver_lib_path.as_ref().map(Utf8PathBuf::as_path);
         // Need to be sure to put both the lib_path and the aux path in the dylib
         // search path for the child.
-        add_dylib_path(&mut command, iter::once(lib_path).chain(aux_path));
+        add_dylib_path(
+            &mut command,
+            iter::once(lib_path)
+                .chain(aux_path)
+                .chain(lint_driver_path.filter(|_| !self.props.aux.lints.is_empty())),
+        );
 
         let mut child = disable_error_reporting(|| command.spawn())
             .unwrap_or_else(|e| panic!("failed to exec `{command:?}`: {e:?}"));
@@ -1619,6 +1679,9 @@ impl<'test> TestCx<'test> {
     /// Choose a compiler kind (rustc or rustdoc) for compiling test files,
     /// based on the test suite being tested.
     fn compiler_kind_for_non_aux(&self) -> CompilerKind {
+        if !self.props.aux.lints.is_empty() {
+            return CompilerKind::LintDriver;
+        }
         match self.config.suite {
             TestSuite::RustdocJs | TestSuite::RustdocJson | TestSuite::RustdocUi => {
                 CompilerKind::Rustdoc
@@ -1657,6 +1720,7 @@ impl<'test> TestCx<'test> {
         emit: Emit,
         allow_unused: AllowUnused,
         link_to_aux: LinkToAux,
+        edition: Edition,
         passes: Vec<String>, // Vec of passes under mir-opt test to be dumped
     ) -> Command {
         // FIXME(Zalathar): We should have a cleaner distinction between
@@ -1666,6 +1730,9 @@ impl<'test> TestCx<'test> {
             CompilerKind::Rustdoc => {
                 Command::new(&self.config.rustdoc_path.clone().expect("no rustdoc built yet"))
             }
+            CompilerKind::LintDriver => Command::new(
+                self.config.rustc_lint_driver_path.as_ref().expect("no rustc lint driver provided"),
+            ),
         };
         compiler.arg(input_file);
 
@@ -1717,8 +1784,14 @@ impl<'test> TestCx<'test> {
         if !self.props.compile_flags.iter().any(|flag| flag.starts_with("--sysroot"))
             && !self.config.host_rustcflags.iter().any(|flag| flag == "--sysroot")
         {
-            // In stage 0, make sure we use `stage0-sysroot` instead of the bootstrap sysroot.
-            compiler.arg("--sysroot").arg(&self.config.sysroot_base);
+            if compiler_kind == CompilerKind::LintDriver {
+                compiler
+                    .arg("--sysroot")
+                    .arg(self.config.rustc_lint_driver_sysroot.as_ref().unwrap());
+            } else {
+                // In stage 0, make sure we use `stage0-sysroot` instead of the bootstrap sysroot.
+                compiler.arg("--sysroot").arg(&self.config.sysroot_base);
+            }
         }
 
         // If the provided codegen backend is not LLVM, we need to pass it.
@@ -1797,6 +1870,26 @@ impl<'test> TestCx<'test> {
             debug!("dir_opt: {:?}", dir_opt);
             rustc.arg(dir_opt);
         };
+
+        if !self.config.parallel_frontend_enabled() {
+            // If the parallel frontend thread count was not specified, we override
+            // it to 1, because the tested toolchain might have a different default
+            // value for the frontend thread count, but we want to run tests in
+            // compiletest with the sequential frontend for now, until we prepare the testing
+            // infrastructure of all test suites to support potentially non-deterministic order of
+            // diagnostics.
+
+            // We can't set this option if the test already specifies the frontend thread count
+            // though.
+            if !self
+                .props
+                .compile_flags
+                .iter()
+                .any(|flag| flag.contains("-Zthreads") || flag.contains("--jobs-frontend"))
+            {
+                compiler.arg("-Zthreads=1");
+            }
+        }
 
         match self.config.mode {
             TestMode::Incremental => {
@@ -1952,7 +2045,7 @@ impl<'test> TestCx<'test> {
                     // `rustdoc` uses `-o` for the output directory.
                     compiler.arg("-o").arg(path);
                 }
-                CompilerKind::Rustc => {
+                CompilerKind::Rustc | CompilerKind::LintDriver => {
                     compiler.arg("--out-dir").arg(path);
                 }
             },
@@ -2041,6 +2134,7 @@ impl<'test> TestCx<'test> {
             compiler.arg("-Cforce-unwind-tables=yes");
         }
 
+        compiler.arg(edition.to_flag());
         compiler.args(&self.props.compile_flags);
 
         compiler
@@ -2267,6 +2361,7 @@ impl<'test> TestCx<'test> {
             Emit::LlvmIr,
             AllowUnused::No,
             LinkToAux::Yes,
+            self.edition(),
             Vec::new(),
         );
 
@@ -2443,13 +2538,7 @@ impl<'test> TestCx<'test> {
         let (stderr_kind, stdout_kind) = match output_kind {
             TestOutput::Compile => (
                 if self.force_color_svg() {
-                    if self.config.target.contains("windows") {
-                        // We single out Windows here because some of the CLI coloring is
-                        // specifically changed for Windows.
-                        UI_WINDOWS_SVG
-                    } else {
-                        UI_SVG
-                    }
+                    UI_SVG
                 } else if self.props.stderr_per_bitwidth {
                     &stderr_bits
                 } else {
@@ -3085,7 +3174,8 @@ impl<'test> TestCx<'test> {
     }
 
     fn create_stamp(&self) {
-        let stamp_file_path = stamp_file_path(&self.config, self.testpaths, self.variant);
+        let stamp_file_path =
+            discovery::stamp_file_path(&self.config, self.testpaths, self.variant);
         fs::write(&stamp_file_path, compute_stamp_hash(&self.config, self.variant)).unwrap();
     }
 
@@ -3175,6 +3265,7 @@ enum AuxType {
     Lib,
     Dylib,
     ProcMacro,
+    Lint,
 }
 
 /// Outcome of comparing a stream to a blessed file,

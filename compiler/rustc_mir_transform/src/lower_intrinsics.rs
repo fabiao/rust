@@ -1,7 +1,7 @@
 //! Lowers intrinsic calls
 
 use rustc_middle::mir::*;
-use rustc_middle::ty::{self, TyCtxt};
+use rustc_middle::ty::{self, Intrinsic, TyCtxt};
 use rustc_span::{bug, span_bug, sym};
 
 use crate::{PassPolicy, take_array};
@@ -17,14 +17,15 @@ impl<'tcx> crate::MirPass<'tcx> for LowerIntrinsics {
                 &mut terminator.kind
                 && let ty::FnDef(def_id, generic_args) = *func.ty(local_decls, tcx).kind()
                 && let Some(intrinsic) = tcx.intrinsic(def_id)
+                && let Intrinsic::Rustc(name) = intrinsic.name
             {
                 let generic_args = generic_args.no_bound_vars().unwrap();
-                match intrinsic.name {
+                match name {
                     sym::unreachable => {
                         terminator.kind = TerminatorKind::Unreachable;
                     }
                     sym::ub_checks | sym::overflow_checks | sym::contract_checks => {
-                        let op = match intrinsic.name {
+                        let op = match name {
                             sym::ub_checks => RuntimeChecks::UbChecks,
                             sym::contract_checks => RuntimeChecks::ContractChecks,
                             sym::overflow_checks => RuntimeChecks::OverflowChecks,
@@ -47,11 +48,10 @@ impl<'tcx> crate::MirPass<'tcx> for LowerIntrinsics {
                             StatementKind::Assign(Box::new((
                                 *destination,
                                 Rvalue::Use(
-                                    Operand::Constant(Box::new(ConstOperand {
-                                        span: terminator.source_info.span,
-                                        user_ty: None,
-                                        const_: Const::zero_sized(tcx.types.unit),
-                                    })),
+                                    Operand::zero_sized_constant(
+                                        tcx.types.unit,
+                                        terminator.source_info.span,
+                                    ),
                                     WithRetag::Yes,
                                 ),
                             ))),
@@ -61,19 +61,30 @@ impl<'tcx> crate::MirPass<'tcx> for LowerIntrinsics {
                     sym::copy_nonoverlapping => {
                         let target = target.unwrap();
                         let Ok([src, dst, count]) = take_array(args) else {
-                            bug!("Wrong arguments for copy_non_overlapping intrinsic");
+                            bug!("Wrong arguments for copy_nonoverlapping intrinsic");
                         };
                         block.statements.push(Statement::new(
                             terminator.source_info,
                             StatementKind::Intrinsic(Box::new(
-                                NonDivergingIntrinsic::CopyNonOverlapping(
-                                    rustc_middle::mir::CopyNonOverlapping {
-                                        src: src.node,
-                                        dst: dst.node,
-                                        count: count.node,
-                                    },
-                                ),
+                                NonDivergingIntrinsic::CopyNonOverlapping(CopyNonOverlapping {
+                                    src: src.node,
+                                    dst: dst.node,
+                                    count: count.node,
+                                }),
                             )),
+                        ));
+                        block.statements.push(Statement::new(
+                            terminator.source_info,
+                            StatementKind::Assign(Box::new((
+                                *destination,
+                                Rvalue::Use(
+                                    Operand::zero_sized_constant(
+                                        tcx.types.unit,
+                                        terminator.source_info.span,
+                                    ),
+                                    WithRetag::Yes,
+                                ),
+                            ))),
                         ));
                         terminator.kind = TerminatorKind::goto(target);
                     }
@@ -86,6 +97,19 @@ impl<'tcx> crate::MirPass<'tcx> for LowerIntrinsics {
                             terminator.source_info,
                             StatementKind::Intrinsic(Box::new(NonDivergingIntrinsic::Assume(
                                 arg.node,
+                            ))),
+                        ));
+                        block.statements.push(Statement::new(
+                            terminator.source_info,
+                            StatementKind::Assign(Box::new((
+                                *destination,
+                                Rvalue::Use(
+                                    Operand::zero_sized_constant(
+                                        tcx.types.unit,
+                                        terminator.source_info.span,
+                                    ),
+                                    WithRetag::Yes,
+                                ),
                             ))),
                         ));
                         terminator.kind = TerminatorKind::goto(target);
@@ -103,9 +127,9 @@ impl<'tcx> crate::MirPass<'tcx> for LowerIntrinsics {
                     | sym::unchecked_shr => {
                         let target = target.unwrap();
                         let Ok([lhs, rhs]) = take_array(args) else {
-                            bug!("Wrong arguments for {} intrinsic", intrinsic.name);
+                            bug!("Wrong arguments for {} intrinsic", name);
                         };
-                        let bin_op = match intrinsic.name {
+                        let bin_op = match name {
                             sym::wrapping_add => BinOp::Add,
                             sym::wrapping_sub => BinOp::Sub,
                             sym::wrapping_mul => BinOp::Mul,
@@ -131,9 +155,9 @@ impl<'tcx> crate::MirPass<'tcx> for LowerIntrinsics {
                     sym::add_with_overflow | sym::sub_with_overflow | sym::mul_with_overflow => {
                         let target = target.unwrap();
                         let Ok([lhs, rhs]) = take_array(args) else {
-                            bug!("Wrong arguments for {} intrinsic", intrinsic.name);
+                            bug!("Wrong arguments for {} intrinsic", name);
                         };
-                        let bin_op = match intrinsic.name {
+                        let bin_op = match name {
                             sym::add_with_overflow => BinOp::AddWithOverflow,
                             sym::sub_with_overflow => BinOp::SubWithOverflow,
                             sym::mul_with_overflow => BinOp::MulWithOverflow,
