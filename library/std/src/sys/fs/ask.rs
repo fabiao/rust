@@ -556,6 +556,10 @@ pub fn rename(old: &Path, new: &Path) -> io::Result<()> {
     askrust::fs::rename(text(old)?, text(new)?).map_err(ask_error)
 }
 
+pub fn rename_noreplace(_old: &Path, _new: &Path) -> io::Result<()> {
+    unsupported()
+}
+
 pub fn rmdir(path: &Path) -> io::Result<()> {
     askrust::fs::rmdir(text(path)?).map_err(ask_error)
 }
