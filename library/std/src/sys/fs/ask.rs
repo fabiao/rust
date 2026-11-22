@@ -490,6 +490,14 @@ pub struct ReadDir {
     exhausted: bool,
 }
 
+impl ReadDir {
+    pub fn dir(&self) -> io::Result<Dir> {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        Dir::open(&self.root, &options)
+    }
+}
+
 impl crate::fmt::Debug for ReadDir {
     fn fmt(&self, f: &mut crate::fmt::Formatter<'_>) -> crate::fmt::Result {
         f.debug_struct("ReadDir").field("root", &self.root).finish()
