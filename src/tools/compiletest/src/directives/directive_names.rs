@@ -9,12 +9,14 @@ pub(crate) static KNOWN_DIRECTIVE_NAMES_SET: LazyLock<HashSet<&str>> =
 /// a best-effort approximation for diagnostics. Add new directives to this list when needed.
 pub(crate) const KNOWN_DIRECTIVE_NAMES: &[&str] = &[
     // tidy-alphabetical-start
+    "act-as-stable",
     "add-minicore",
     "assembly-output",
     "aux-bin",
     "aux-build",
     "aux-codegen-backend",
     "aux-crate",
+    "aux-lint",
     "build-aux-docs",
     "build-fail",
     "build-pass",
@@ -207,6 +209,7 @@ pub(crate) const KNOWN_DIRECTIVE_NAMES: &[&str] = &[
     "needs-target-has-atomic",
     "needs-target-std",
     "needs-threads",
+    "needs-tpde",
     "needs-unwind",
     "needs-wasmtime",
     "needs-xray",
@@ -273,7 +276,6 @@ pub(crate) const KNOWN_DIRECTIVE_NAMES: &[&str] = &[
     "only-wasm32",
     "only-wasm32-unknown-emscripten",
     "only-wasm32-unknown-unknown",
-    "only-wasm32-wasip1",
     "only-watchos",
     "only-windows",
     "only-windows-gnu",

@@ -5,7 +5,7 @@ use rustc_errors::formatting::DiagMessageAddArg;
 use rustc_errors::{Diag, DiagArgValue, MultiSpan, Subdiagnostic, msg};
 use rustc_hir::ConstContext;
 use rustc_macros::{Diagnostic, Subdiagnostic};
-use rustc_middle::ty::{Mutability, Ty};
+use rustc_middle::ty::{Intrinsic, Mutability, Ty};
 use rustc_span::{Span, Symbol};
 
 use crate::interpret::InternKind;
@@ -167,7 +167,7 @@ pub(crate) struct UnstableConstTrait {
 pub(crate) struct UnstableIntrinsic {
     #[primary_span]
     pub span: Span,
-    pub name: Symbol,
+    pub name: Intrinsic,
     pub feature: Symbol,
     #[suggestion(
         "add `#![feature({$feature})]` to the crate attributes to enable",
@@ -243,7 +243,7 @@ pub(crate) struct NonConstFnCall {
 pub(crate) struct NonConstIntrinsic {
     #[primary_span]
     pub span: Span,
-    pub name: Symbol,
+    pub name: Intrinsic,
     pub kind: ConstContext,
 }
 
@@ -310,6 +310,7 @@ pub(crate) struct NonConstImplNote {
 #[derive(Clone)]
 pub(crate) struct FrameNote {
     pub span: Span,
+    pub span_context: Vec<Span>,
     pub times: i32,
     pub where_: &'static str,
     pub instance: String,
@@ -321,6 +322,9 @@ impl Subdiagnostic for FrameNote {
         let mut span: MultiSpan = self.span.into();
         if self.has_label && !self.span.is_dummy() {
             span.push_span_label(self.span, msg!("the failure occurred here"));
+        }
+        for sp in &self.span_context {
+            span.push_span_context(*sp);
         }
         let msg = msg!(
             r#"{$times ->

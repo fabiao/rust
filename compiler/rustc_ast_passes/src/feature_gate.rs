@@ -2,7 +2,7 @@ use rustc_ast::visit::{self, AssocCtxt, FnKind, Visitor};
 use rustc_ast::{self as ast, AttrVec, GenericBound, NodeId, PatKind, attr, token};
 use rustc_attr_ir::{Attribute, AttributeKind};
 use rustc_attr_parsing::AttributeParser;
-use rustc_errors::msg;
+use rustc_errors::{StashKey, msg};
 use rustc_feature::{DependentFeature, Features};
 use rustc_session::Session;
 use rustc_session::config::NextSolverConfig;
@@ -241,12 +241,6 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
                 // Function pointers cannot be `const`
                 self.check_late_bound_lifetime_defs(&fn_ptr_ty.generic_params);
             }
-            ast::TyKind::Pat(..) => {
-                gate!(self, pattern_types, ty.span, "pattern types are unstable");
-            }
-            ast::TyKind::View(..) => {
-                gate!(self, view_types, ty.span, "view types are unstable");
-            }
             _ => {}
         }
         visit::walk_ty(self, ty)
@@ -299,6 +293,29 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
             _ => {}
         }
         visit::walk_expr(self, e)
+    }
+
+    fn visit_arm(&mut self, arm: &'a ast::Arm) {
+        // Emit a custom diagnostic instead of the generic `guard_pattern` feature gate error in the
+        // case of `match $expr { ($pat if $expr) => $expr }`.
+        if let PatKind::Paren(subpat) = &arm.pat.kind
+            && let PatKind::Guard(_, guard) = &subpat.kind
+            && arm.guard.is_none()
+            && !self.features.guard_patterns()
+            && !guard.span_with_leading_if.allows_unstable(sym::guard_patterns)
+        {
+            let left = arm.pat.span.shrink_to_lo().to(subpat.span.shrink_to_lo());
+            let right = subpat.span.shrink_to_hi().to(arm.pat.span.shrink_to_hi());
+
+            let diag = self.sess.dcx().create_err(diagnostics::ParenAroundGuardedPatInMatchArm {
+                span: vec![left, right],
+                sugg_removal: diagnostics::RemoveParenFromGuardedPatInMatchArm { left, right },
+                sugg_feature: self.sess.is_nightly_build().then_some(guard.span_with_leading_if),
+            });
+            diag.stash(guard.span_with_leading_if, StashKey::ParenAroundGuardedPatInMatchArm);
+        }
+
+        visit::walk_arm(self, arm)
     }
 
     fn visit_pat(&mut self, pattern: &'a ast::Pat) {
@@ -411,6 +428,7 @@ pub fn check_crate(krate: &ast::Crate, sess: &Session, features: &Features) {
     check_incompatible_features(sess, features);
     check_dependent_features(sess, features);
     warn_next_solver_and_gce(sess, features);
+    warn_next_solver_and_higher_ranked_assumptions(sess);
     check_features_requiring_new_solver(sess, features);
 
     let mut visitor = PostExpansionVisitor { sess, features };
@@ -430,7 +448,6 @@ pub fn check_crate(krate: &ast::Crate, sess: &Session, features: &Features) {
 
     // tidy-alphabetical-start
     gate_all!(async_for_loop, "`for await` loops are experimental");
-    gate_all!(builtin_syntax, "`builtin #` syntax is unstable");
     gate_all!(const_block_items, "const block items are experimental");
     gate_all!(const_closures, "const closures are experimental");
     gate_all!(const_trait_impl, "const trait impls are experimental");
@@ -444,12 +461,13 @@ pub fn check_crate(krate: &ast::Crate, sess: &Session, features: &Features) {
     gate_all!(fn_delegation, "functions delegation is not yet fully implemented");
     gate_all!(forced_keywords, "forced keywords are experimental");
     gate_all!(frontmatter, "frontmatters are experimental");
+    gate_all!(function_arg_const_generics, "function arg const generics are experimental");
     gate_all!(gca_min_const_items, "unbraced const blocks as const args are experimental");
     gate_all!(gen_blocks, "gen blocks are experimental");
     gate_all!(generic_const_items, "generic const items are experimental");
     gate_all!(global_registration, "global registration is experimental");
-    gate_all!(guard_patterns, "guard patterns are experimental", "consider using match arm guards");
     gate_all!(impl_restriction, "`impl` restrictions are experimental");
+    gate_all!(internal_syntax, "this syntax is internal");
     gate_all!(more_qualified_paths, "usage of qualified paths in this context is experimental");
     gate_all!(move_expr, "`move(expr)` syntax is experimental");
     gate_all!(mut_ref, "mutable by-reference bindings are experimental");
@@ -467,7 +485,6 @@ pub fn check_crate(krate: &ast::Crate, sess: &Session, features: &Features) {
     gate_all!(unnamed_enum_variants, "unnamed enum variants are experimental");
     gate_all!(unsafe_binders, "unsafe binder types are experimental");
     gate_all!(unsafe_fields, "`unsafe` fields are experimental");
-    gate_all!(view_types, "view types are experimental");
     gate_all!(where_clause_attrs, "attributes in `where` clause are unstable");
     gate_all!(yeet_expr, "`do yeet` expression is experimental");
     // tidy-alphabetical-end
@@ -489,7 +506,7 @@ pub fn check_crate(krate: &ast::Crate, sess: &Session, features: &Features) {
     );
     gate_all!(
         named_fn_trait_parameters,
-        "named parameters in parenthesized generic argument lists are experimental"
+        "parameters in parenthesized generic argument lists with names, attributes, or c-variadics are experimental"
     );
 
     // `associated_const_equality` will be stabilized as part of `gca_min_const_items`.
@@ -584,11 +601,28 @@ pub fn check_crate(krate: &ast::Crate, sess: &Session, features: &Features) {
     // -----------------------------------------------------------------------------
 
     visit::walk_crate(&mut visitor, krate);
+
+    // -----------------------------------------------------------------------------
+
+    // This is a pre-expansion feature gate except that we replace the default error diagnostic with
+    // a custom one if the guarded pattern is parenthesized and belongs to a match arm. E.g., in
+    // `match $expr { ($pat if $expr) => $expr }`. We construct & stash the tailored diagnostic in
+    // the post-expansion visitor above that's why this logic has to happen here below `walk_crate`.
+    for &span in spans.get(&sym::guard_patterns).into_flat_iter() {
+        if !visitor.features.guard_patterns()
+            && !span.allows_unstable(sym::guard_patterns)
+            && !sess.dcx().has_stashed_diagnostic(span, StashKey::ParenAroundGuardedPatInMatchArm)
+        {
+            feature_err(visitor.sess, sym::guard_patterns, span, "guard patterns are experimental")
+                .with_help("consider using match arm guards")
+                .emit();
+        }
+    }
 }
 
 fn maybe_stage_features(sess: &Session, features: &Features, krate: &ast::Crate) {
     // checks if `#![feature]` has been used to enable any feature.
-    if sess.opts.unstable_features.is_nightly_build() {
+    if sess.is_nightly_build() {
         return;
     }
     if features.enabled_features().is_empty() {
@@ -703,8 +737,8 @@ fn warn_next_solver_and_gce(sess: &Session, features: &Features) {
         return;
     }
 
-    // Warn people who uses GCE and -Znext-solver=globally
-    // that their trait solver was downgraded to -Znext-solver=no
+    // Warn people who use GCE and -Znext-solver=globally
+    // that their trait solver was downgraded to -Znext-solver=coherence
     if let Some(gce_span) = features
         .enabled_lang_features()
         .iter()
@@ -713,6 +747,16 @@ fn warn_next_solver_and_gce(sess: &Session, features: &Features) {
     {
         sess.dcx()
             .emit_warn(diagnostics::NextSolverDisabledForGenericConstExprs { span: gce_span });
+    }
+}
+
+fn warn_next_solver_and_higher_ranked_assumptions(sess: &Session) {
+    // Warn people who use -Zhigher-ranked-assumptions and -Znext-solver=globally
+    // that their trait solver was downgraded to -Znext-solver=coherence
+    if sess.opts.unstable_opts.next_solver == NextSolverConfig::Globally
+        && sess.opts.unstable_opts.higher_ranked_assumptions
+    {
+        sess.dcx().emit_warn(diagnostics::NextSolverDisabledForHigherRankedAssumptions);
     }
 }
 

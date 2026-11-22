@@ -1204,12 +1204,6 @@ crate::target_spec_enum! {
         /// Disable stack canary generation.
         None = "none",
 
-        /// On LLVM, mark all generated LLVM functions with the `ssp` attribute (see
-        /// llvm/docs/LangRef.rst). This triggers stack canary generation in
-        /// functions which contain an array of a byte-sized type with more than
-        /// eight elements.
-        Basic = "basic",
-
         /// On LLVM, mark all generated LLVM functions with the `sspstrong`
         /// attribute (see llvm/docs/LangRef.rst). This triggers stack canary
         /// generation in functions which either contain an array, or which take
@@ -1511,6 +1505,7 @@ supported_targets! {
     ("thumbv7a-pc-windows-msvc", thumbv7a_pc_windows_msvc),
     ("thumbv7a-uwp-windows-msvc", thumbv7a_uwp_windows_msvc),
 
+    ("wasm32-none-component", wasm32_none_component),
     ("wasm32-unknown-emscripten", wasm32_unknown_emscripten),
     ("wasm32-unknown-unknown", wasm32_unknown_unknown),
     ("wasm32v1-none", wasm32v1_none),
@@ -1519,6 +1514,7 @@ supported_targets! {
     ("wasm32-wasip3", wasm32_wasip3),
     ("wasm32-wasip1-threads", wasm32_wasip1_threads),
     ("wasm32-wali-linux-musl", wasm32_wali_linux_musl),
+    ("wasm64-unknown-emscripten", wasm64_unknown_emscripten),
     ("wasm64-unknown-unknown", wasm64_unknown_unknown),
 
     ("thumbv6m-none-eabi", thumbv6m_none_eabi),
@@ -1656,8 +1652,11 @@ supported_targets! {
     ("armv7-unknown-linux-uclibceabihf", armv7_unknown_linux_uclibceabihf),
 
     ("x86_64-unknown-none", x86_64_unknown_none),
+    ("i686-unknown-none", i686_unknown_none),
 
     ("aarch64-unknown-teeos", aarch64_unknown_teeos),
+
+    ("aarch64-unknown-qtee", aarch64_unknown_qtee),
 
     ("mips64-openwrt-linux-musl", mips64_openwrt_linux_musl),
 
@@ -1707,6 +1706,9 @@ supported_targets! {
 
     ("aarch64-unknown-hyperlight", aarch64_unknown_hyperlight),
     ("x86_64-unknown-hyperlight", x86_64_unknown_hyperlight),
+
+    ("aarch64-unknown-serenity", aarch64_unknown_serenity),
+    ("x86_64-unknown-serenity", x86_64_unknown_serenity),
 }
 
 /// Cow-Vec-Str: Cow<'static, [Cow<'static, str>]>
@@ -1881,9 +1883,11 @@ crate::target_spec_enum! {
         Psp = "psp",
         Psx = "psx",
         Qnx = "qnx",
+        Qtee = "qtee",
         Qurt = "qurt",
         Redox = "redox",
         Rtems = "rtems",
+        Serenity = "serenity",
         Solaris = "solaris",
         SolidAsp3 = "solid_asp3",
         TeeOs = "teeos",
@@ -2432,6 +2436,10 @@ pub struct TargetOptions {
     /// Don't use this field; instead use the `.max_atomic_width()` method.
     pub max_atomic_width: Option<u64>,
 
+    /// Don't use this field; instead use the `.min_atomic_width()` and
+    /// `max_atomic_width()` methods.
+    pub per_cpu_atomic_widths: BTreeMap<StaticCow<str>, (u64, u64)>,
+
     /// Whether the target supports atomic CAS operations natively
     pub atomic_cas: bool,
 
@@ -2544,7 +2552,7 @@ pub struct TargetOptions {
     /// rustc and not forwarded to LLVM.
     pub rustc_abi: Option<RustcAbi>,
 
-    /// Whether or not RelaxElfRelocation flag will be passed to the linker
+    /// Whether or not X86RelaxRelocations flag will be passed to LLVM (x86 only).
     pub relax_elf_relocations: bool,
 
     /// Additional arguments to pass to LLVM, similar to the `-C llvm-args` codegen option.
@@ -2806,6 +2814,7 @@ impl Default for TargetOptions {
             obj_is_bitcode: false,
             min_atomic_width: None,
             max_atomic_width: None,
+            per_cpu_atomic_widths: BTreeMap::new(),
             atomic_cas: true,
             panic_strategy: PanicStrategy::Unwind,
             crt_static_allows_dylibs: false,
@@ -2880,16 +2889,13 @@ impl Target {
         abi_map.canonize_abi(abi, false).is_mapped()
     }
 
-    /// Minimum integer size in bits that this target can perform atomic
-    /// operations on.
-    pub fn min_atomic_width(&self) -> u64 {
-        self.min_atomic_width.unwrap_or(8)
-    }
-
-    /// Maximum integer size in bits that this target can perform atomic
-    /// operations on.
-    pub fn max_atomic_width(&self) -> u64 {
-        self.max_atomic_width.unwrap_or_else(|| self.pointer_width.into())
+    /// Minimum and maximum integer size in bits that this target can perform
+    /// atomic operations on.
+    pub fn atomic_widths(&self, cpu: &str) -> (u64, u64) {
+        self.per_cpu_atomic_widths.get(cpu).copied().unwrap_or((
+            self.min_atomic_width.unwrap_or(8),
+            self.max_atomic_width.unwrap_or_else(|| self.pointer_width.into()),
+        ))
     }
 
     /// Test target self-consistency and JSON encoding/decoding roundtrip.

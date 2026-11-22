@@ -62,7 +62,7 @@ xz2 = "0.1"
 # tidy-alphabetical-end
 
 # Dependencies needed by the build-metrics feature
-sysinfo = { version = "0.39.2", default-features = false, optional = true, features = ["system"] }
+sysinfo = { version = "0.40.3", default-features = false, optional = true, features = ["system"] }
 
 # Dependencies needed by the `tracing` feature
 chrono = { version = "0.4", default-features = false, optional = true, features = ["now", "std"] }
@@ -88,8 +88,12 @@ features = [
     "Win32_System_Time",
 ]
 
+# src/utils/job.rs
+[target.'cfg(all(unix, not(any(target_os = "haiku", target_os = "hermit"))))'.dependencies]
+errno = "0.3.14"
+
 [dev-dependencies]
-insta = "1.43"
+expect-test = "1"
 
 # We care a lot about bootstrap's compile times, so don't include debuginfo for
 # dependencies, only bootstrap itself.

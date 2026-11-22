@@ -108,8 +108,6 @@ impl AsmExpr {
     #[inline]
     pub fn template(&self) -> AstChildren<Expr> { support::children(&self.syntax) }
     #[inline]
-    pub fn pound_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![#]) }
-    #[inline]
     pub fn l_paren_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T!['(']) }
     #[inline]
     pub fn r_paren_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![')']) }
@@ -117,8 +115,6 @@ impl AsmExpr {
     pub fn comma_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![,]) }
     #[inline]
     pub fn asm_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![asm]) }
-    #[inline]
-    pub fn builtin_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![builtin]) }
     #[inline]
     pub fn global_asm_token(&self) -> Option<SyntaxToken> {
         support::token(&self.syntax, T![global_asm])
@@ -442,6 +438,36 @@ impl CfgMeta {
     #[inline]
     pub fn cfg_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![cfg]) }
 }
+pub struct CfgPredExpr {
+    pub(crate) syntax: SyntaxNode,
+}
+impl CfgPredExpr {
+    #[inline]
+    pub fn cfg_predicate(&self) -> Option<CfgPredicate> { support::child(&self.syntax) }
+    #[inline]
+    pub fn l_paren_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T!['(']) }
+    #[inline]
+    pub fn r_paren_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![')']) }
+    #[inline]
+    pub fn comma_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![,]) }
+    #[inline]
+    pub fn cfg_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![cfg]) }
+}
+pub struct CfgPredPat {
+    pub(crate) syntax: SyntaxNode,
+}
+impl CfgPredPat {
+    #[inline]
+    pub fn cfg_predicate(&self) -> Option<CfgPredicate> { support::child(&self.syntax) }
+    #[inline]
+    pub fn l_paren_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T!['(']) }
+    #[inline]
+    pub fn r_paren_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![')']) }
+    #[inline]
+    pub fn comma_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![,]) }
+    #[inline]
+    pub fn cfg_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![cfg]) }
+}
 pub struct ClosureExpr {
     pub(crate) syntax: SyntaxNode,
 }
@@ -541,13 +567,9 @@ impl DerefPat {
     #[inline]
     pub fn pat(&self) -> Option<Pat> { support::child(&self.syntax) }
     #[inline]
-    pub fn pound_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![#]) }
-    #[inline]
     pub fn l_paren_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T!['(']) }
     #[inline]
     pub fn r_paren_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![')']) }
-    #[inline]
-    pub fn builtin_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![builtin]) }
     #[inline]
     pub fn deref_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![deref]) }
 }
@@ -746,15 +768,11 @@ impl FormatArgsExpr {
     #[inline]
     pub fn template(&self) -> Option<Expr> { support::child(&self.syntax) }
     #[inline]
-    pub fn pound_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![#]) }
-    #[inline]
     pub fn l_paren_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T!['(']) }
     #[inline]
     pub fn r_paren_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![')']) }
     #[inline]
     pub fn comma_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![,]) }
-    #[inline]
-    pub fn builtin_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![builtin]) }
     #[inline]
     pub fn format_args_token(&self) -> Option<SyntaxToken> {
         support::token(&self.syntax, T![format_args])
@@ -853,10 +871,6 @@ pub struct IncludeBytesExpr {
     pub(crate) syntax: SyntaxNode,
 }
 impl IncludeBytesExpr {
-    #[inline]
-    pub fn pound_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![#]) }
-    #[inline]
-    pub fn builtin_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![builtin]) }
     #[inline]
     pub fn include_bytes_token(&self) -> Option<SyntaxToken> {
         support::token(&self.syntax, T![include_bytes])
@@ -1218,15 +1232,11 @@ impl OffsetOfExpr {
     #[inline]
     pub fn ty(&self) -> Option<Type> { support::child(&self.syntax) }
     #[inline]
-    pub fn pound_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![#]) }
-    #[inline]
     pub fn l_paren_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T!['(']) }
     #[inline]
     pub fn r_paren_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![')']) }
     #[inline]
     pub fn comma_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![,]) }
-    #[inline]
-    pub fn builtin_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![builtin]) }
     #[inline]
     pub fn offset_of_token(&self) -> Option<SyntaxToken> {
         support::token(&self.syntax, T![offset_of])
@@ -1388,13 +1398,9 @@ impl PatternType {
     #[inline]
     pub fn ty(&self) -> Option<Type> { support::child(&self.syntax) }
     #[inline]
-    pub fn pound_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![#]) }
-    #[inline]
     pub fn l_paren_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T!['(']) }
     #[inline]
     pub fn r_paren_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![')']) }
-    #[inline]
-    pub fn builtin_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![builtin]) }
     #[inline]
     pub fn is_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![is]) }
     #[inline]
@@ -1898,10 +1904,6 @@ pub struct TypeAnchor {
 }
 impl TypeAnchor {
     #[inline]
-    pub fn path_type(&self) -> Option<PathType> { support::child(&self.syntax) }
-    #[inline]
-    pub fn ty(&self) -> Option<Type> { support::child(&self.syntax) }
-    #[inline]
     pub fn l_angle_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![<]) }
     #[inline]
     pub fn r_angle_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![>]) }
@@ -2216,6 +2218,7 @@ pub enum Expr {
     BreakExpr(BreakExpr),
     CallExpr(CallExpr),
     CastExpr(CastExpr),
+    CfgPredExpr(CfgPredExpr),
     ClosureExpr(ClosureExpr),
     ContinueExpr(ContinueExpr),
     FieldExpr(FieldExpr),
@@ -2312,6 +2315,7 @@ pub enum Meta {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Pat {
     BoxPat(BoxPat),
+    CfgPredPat(CfgPredPat),
     ConstBlockPat(ConstBlockPat),
     DerefPat(DerefPat),
     IdentPat(IdentPat),
@@ -3443,6 +3447,70 @@ impl Clone for CfgMeta {
 impl fmt::Debug for CfgMeta {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CfgMeta").field("syntax", &self.syntax).finish()
+    }
+}
+impl AstNode for CfgPredExpr {
+    #[inline]
+    fn kind() -> SyntaxKind
+    where
+        Self: Sized,
+    {
+        CFG_PRED_EXPR
+    }
+    #[inline]
+    fn can_cast(kind: SyntaxKind) -> bool { kind == CFG_PRED_EXPR }
+    #[inline]
+    fn cast(syntax: SyntaxNode) -> Option<Self> {
+        if Self::can_cast(syntax.kind()) { Some(Self { syntax }) } else { None }
+    }
+    #[inline]
+    fn syntax(&self) -> &SyntaxNode { &self.syntax }
+}
+impl hash::Hash for CfgPredExpr {
+    fn hash<H: hash::Hasher>(&self, state: &mut H) { self.syntax.hash(state); }
+}
+impl Eq for CfgPredExpr {}
+impl PartialEq for CfgPredExpr {
+    fn eq(&self, other: &Self) -> bool { self.syntax == other.syntax }
+}
+impl Clone for CfgPredExpr {
+    fn clone(&self) -> Self { Self { syntax: self.syntax.clone() } }
+}
+impl fmt::Debug for CfgPredExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CfgPredExpr").field("syntax", &self.syntax).finish()
+    }
+}
+impl AstNode for CfgPredPat {
+    #[inline]
+    fn kind() -> SyntaxKind
+    where
+        Self: Sized,
+    {
+        CFG_PRED_PAT
+    }
+    #[inline]
+    fn can_cast(kind: SyntaxKind) -> bool { kind == CFG_PRED_PAT }
+    #[inline]
+    fn cast(syntax: SyntaxNode) -> Option<Self> {
+        if Self::can_cast(syntax.kind()) { Some(Self { syntax }) } else { None }
+    }
+    #[inline]
+    fn syntax(&self) -> &SyntaxNode { &self.syntax }
+}
+impl hash::Hash for CfgPredPat {
+    fn hash<H: hash::Hasher>(&self, state: &mut H) { self.syntax.hash(state); }
+}
+impl Eq for CfgPredPat {}
+impl PartialEq for CfgPredPat {
+    fn eq(&self, other: &Self) -> bool { self.syntax == other.syntax }
+}
+impl Clone for CfgPredPat {
+    fn clone(&self) -> Self { Self { syntax: self.syntax.clone() } }
+}
+impl fmt::Debug for CfgPredPat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CfgPredPat").field("syntax", &self.syntax).finish()
     }
 }
 impl AstNode for ClosureExpr {
@@ -8137,6 +8205,10 @@ impl From<CastExpr> for Expr {
     #[inline]
     fn from(node: CastExpr) -> Expr { Expr::CastExpr(node) }
 }
+impl From<CfgPredExpr> for Expr {
+    #[inline]
+    fn from(node: CfgPredExpr) -> Expr { Expr::CfgPredExpr(node) }
+}
 impl From<ClosureExpr> for Expr {
     #[inline]
     fn from(node: ClosureExpr) -> Expr { Expr::ClosureExpr(node) }
@@ -8263,6 +8335,7 @@ impl AstNode for Expr {
                 | BREAK_EXPR
                 | CALL_EXPR
                 | CAST_EXPR
+                | CFG_PRED_EXPR
                 | CLOSURE_EXPR
                 | CONTINUE_EXPR
                 | FIELD_EXPR
@@ -8305,6 +8378,7 @@ impl AstNode for Expr {
             BREAK_EXPR => Expr::BreakExpr(BreakExpr { syntax }),
             CALL_EXPR => Expr::CallExpr(CallExpr { syntax }),
             CAST_EXPR => Expr::CastExpr(CastExpr { syntax }),
+            CFG_PRED_EXPR => Expr::CfgPredExpr(CfgPredExpr { syntax }),
             CLOSURE_EXPR => Expr::ClosureExpr(ClosureExpr { syntax }),
             CONTINUE_EXPR => Expr::ContinueExpr(ContinueExpr { syntax }),
             FIELD_EXPR => Expr::FieldExpr(FieldExpr { syntax }),
@@ -8349,6 +8423,7 @@ impl AstNode for Expr {
             Expr::BreakExpr(it) => &it.syntax,
             Expr::CallExpr(it) => &it.syntax,
             Expr::CastExpr(it) => &it.syntax,
+            Expr::CfgPredExpr(it) => &it.syntax,
             Expr::ClosureExpr(it) => &it.syntax,
             Expr::ContinueExpr(it) => &it.syntax,
             Expr::FieldExpr(it) => &it.syntax,
@@ -8726,6 +8801,10 @@ impl From<BoxPat> for Pat {
     #[inline]
     fn from(node: BoxPat) -> Pat { Pat::BoxPat(node) }
 }
+impl From<CfgPredPat> for Pat {
+    #[inline]
+    fn from(node: CfgPredPat) -> Pat { Pat::CfgPredPat(node) }
+}
 impl From<ConstBlockPat> for Pat {
     #[inline]
     fn from(node: ConstBlockPat) -> Pat { Pat::ConstBlockPat(node) }
@@ -8800,6 +8879,7 @@ impl AstNode for Pat {
         matches!(
             kind,
             BOX_PAT
+                | CFG_PRED_PAT
                 | CONST_BLOCK_PAT
                 | DEREF_PAT
                 | IDENT_PAT
@@ -8823,6 +8903,7 @@ impl AstNode for Pat {
     fn cast(syntax: SyntaxNode) -> Option<Self> {
         let res = match syntax.kind() {
             BOX_PAT => Pat::BoxPat(BoxPat { syntax }),
+            CFG_PRED_PAT => Pat::CfgPredPat(CfgPredPat { syntax }),
             CONST_BLOCK_PAT => Pat::ConstBlockPat(ConstBlockPat { syntax }),
             DEREF_PAT => Pat::DerefPat(DerefPat { syntax }),
             IDENT_PAT => Pat::IdentPat(IdentPat { syntax }),
@@ -8848,6 +8929,7 @@ impl AstNode for Pat {
     fn syntax(&self) -> &SyntaxNode {
         match self {
             Pat::BoxPat(it) => &it.syntax,
+            Pat::CfgPredPat(it) => &it.syntax,
             Pat::ConstBlockPat(it) => &it.syntax,
             Pat::DerefPat(it) => &it.syntax,
             Pat::IdentPat(it) => &it.syntax,
@@ -10218,6 +10300,16 @@ impl std::fmt::Display for CfgComposite {
     }
 }
 impl std::fmt::Display for CfgMeta {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.syntax(), f)
+    }
+}
+impl std::fmt::Display for CfgPredExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.syntax(), f)
+    }
+}
+impl std::fmt::Display for CfgPredPat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt(self.syntax(), f)
     }

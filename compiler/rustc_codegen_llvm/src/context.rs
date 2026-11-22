@@ -1,12 +1,11 @@
 use std::borrow::{Borrow, Cow};
 use std::cell::{Cell, RefCell};
-use std::ffi::{CStr, c_char, c_uint};
+use std::ffi::{CStr, c_uint};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::str;
 
 use rustc_abi::{HasDataLayout, Size, TargetDataLayout, VariantIdx};
-use rustc_codegen_ssa::back::versioned_llvm_target;
 use rustc_codegen_ssa::base::{wants_msvc_seh, wants_wasm_eh};
 use rustc_codegen_ssa::diagnostics as ssa_errors;
 use rustc_codegen_ssa::traits::*;
@@ -19,7 +18,7 @@ use rustc_middle::ty::layout::{
     FnAbiError, FnAbiOfHelpers, FnAbiRequest, HasTypingEnv, LayoutError, LayoutOfHelpers,
     codegen_handle_fn_abi_err,
 };
-use rustc_middle::ty::{self, Instance, Ty, TyCtxt};
+use rustc_middle::ty::{self, Instance, Intrinsic, Ty, TyCtxt};
 use rustc_sanitizers::ignorelist::{SanitizerIgnoreList, typename_for_ignore_list};
 use rustc_session::config::{
     BranchProtection, CFGuard, CFProtection, DebugInfo, FunctionReturn, PAuthKey, PacRet,
@@ -34,6 +33,7 @@ use rustc_target::spec::{
 use smallvec::SmallVec;
 
 use crate::abi::to_llvm_calling_convention;
+use crate::back::llvm_backend::ModuleRefs;
 use crate::back::write::to_llvm_code_model;
 use crate::builder::gpu_offload::{OffloadGlobals, OffloadKernelGlobals};
 use crate::callee::get_fn;
@@ -46,9 +46,9 @@ use crate::{attributes, common, coverageinfo, debuginfo, llvm_util};
 /// other compiler pieces. Here we define a small subset which has enough information and can be
 /// moved around more freely.
 pub(crate) struct SCx<'ll> {
-    pub llmod: &'ll llvm::Module,
-    pub llcx: &'ll llvm::Context,
-    pub isize_ty: &'ll Type,
+    pub llmod: llvm::Module<'ll>,
+    pub llcx: llvm::Context<'ll>,
+    pub isize_ty: Type<'ll>,
 }
 
 impl<'ll> Borrow<SCx<'ll>> for FullCx<'ll, '_> {
@@ -101,47 +101,50 @@ pub(crate) struct FullCx<'ll, 'tcx> {
     pub codegen_unit: &'tcx CodegenUnit<'tcx>,
 
     /// Cache instances of monomorphic and polymorphic items
-    pub instances: RefCell<FxHashMap<Instance<'tcx>, &'ll Value>>,
+    pub instances: RefCell<FxHashMap<Instance<'tcx>, Value<'ll>>>,
     /// Cache instances of intrinsics
-    pub intrinsic_instances: RefCell<FxHashMap<Instance<'tcx>, &'ll Value>>,
+    pub intrinsic_instances: RefCell<FxHashMap<Instance<'tcx>, Value<'ll>>>,
     /// Cache generated vtables
-    pub vtables: RefCell<FxHashMap<(Ty<'tcx>, Option<ty::ExistentialTraitRef<'tcx>>), &'ll Value>>,
+    pub vtables: RefCell<FxHashMap<(Ty<'tcx>, Option<ty::ExistentialTraitRef<'tcx>>), Value<'ll>>>,
     /// Cache of constant strings,
-    pub const_str_cache: RefCell<FxHashMap<String, &'ll Value>>,
+    pub const_str_cache: RefCell<FxHashMap<String, Value<'ll>>>,
 
     /// Cache of emitted const globals (value -> global)
-    pub const_globals: RefCell<FxHashMap<&'ll Value, &'ll Value>>,
+    pub const_globals: RefCell<FxHashMap<Value<'ll>, Value<'ll>>>,
+
+    /// Cache of globally unique names for const operands to global assembly (value -> name)
+    pub global_asm_symbols: RefCell<FxHashMap<Value<'ll>, String>>,
 
     /// List of globals for static variables which need to be passed to the
     /// LLVM function ReplaceAllUsesWith (RAUW) when codegen is complete.
     /// (We have to make sure we don't invalidate any Values referring
     /// to constants.)
-    pub statics_to_rauw: RefCell<Vec<(&'ll Value, &'ll Value)>>,
+    pub statics_to_rauw: RefCell<Vec<(Value<'ll>, Value<'ll>)>>,
 
     /// Statics that will be placed in the llvm.used variable
     /// See <https://llvm.org/docs/LangRef.html#the-llvm-used-global-variable> for details
-    pub used_statics: Vec<&'ll Value>,
+    pub used_statics: Vec<Value<'ll>>,
 
     /// Statics that will be placed in the llvm.compiler.used variable
     /// See <https://llvm.org/docs/LangRef.html#the-llvm-compiler-used-global-variable> for details
-    pub compiler_used_statics: RefCell<Vec<&'ll Value>>,
+    pub compiler_used_statics: RefCell<Vec<Value<'ll>>>,
 
     /// Mapping of non-scalar types to llvm types.
-    pub type_lowering: RefCell<FxHashMap<(Ty<'tcx>, Option<VariantIdx>), &'ll Type>>,
+    pub type_lowering: RefCell<FxHashMap<(Ty<'tcx>, Option<VariantIdx>), Type<'ll>>>,
 
     /// Mapping of scalar types to llvm types.
-    pub scalar_lltypes: RefCell<FxHashMap<Ty<'tcx>, &'ll Type>>,
+    pub scalar_lltypes: RefCell<FxHashMap<Ty<'tcx>, Type<'ll>>>,
 
     /// Extra per-CGU codegen state needed when coverage instrumentation is enabled.
     pub coverage_cx: Option<coverageinfo::CguCoverageContext<'ll, 'tcx>>,
     pub dbg_cx: Option<debuginfo::CodegenUnitDebugContext<'ll, 'tcx>>,
     pub sanitizer_ignorelist: Option<SanitizerIgnoreList>,
 
-    eh_personality: Cell<Option<&'ll Value>>,
-    pub rust_try_fn: Cell<Option<(&'ll Type, &'ll Value)>>,
+    eh_personality: Cell<Option<Value<'ll>>>,
+    pub rust_try_fn: Cell<Option<(Type<'ll>, Value<'ll>)>>,
 
     intrinsics:
-        RefCell<FxHashMap<(Cow<'static, str>, SmallVec<[&'ll Type; 2]>), (&'ll Type, &'ll Value)>>,
+        RefCell<FxHashMap<(Cow<'static, str>, SmallVec<[Type<'ll>; 2]>), (Type<'ll>, Value<'ll>)>>,
 
     /// A counter that is used for generating local symbol names
     local_gen_sym_counter: Cell<usize>,
@@ -153,16 +156,16 @@ pub(crate) struct FullCx<'ll, 'tcx> {
     /// different type and clear the symbol name of the original global.
     /// `global_asm!` needs to be able to find this new global so that it can
     /// compute the correct mangled symbol name to insert into the asm.
-    pub renamed_statics: RefCell<FxHashMap<DefId, &'ll Value>>,
+    pub renamed_statics: RefCell<FxHashMap<DefId, Value<'ll>>>,
 
     /// Cached Objective-C class type
-    pub objc_class_t: Cell<Option<&'ll Type>>,
+    pub objc_class_t: Cell<Option<Type<'ll>>>,
 
     /// Cache of Objective-C class references
-    pub objc_classrefs: RefCell<FxHashMap<Symbol, &'ll Value>>,
+    pub objc_classrefs: RefCell<FxHashMap<Symbol, Value<'ll>>>,
 
     /// Cache of Objective-C selector references
-    pub objc_selrefs: RefCell<FxHashMap<Symbol, &'ll Value>>,
+    pub objc_selrefs: RefCell<FxHashMap<Symbol, Value<'ll>>>,
 
     /// Globals shared by the offloading runtime
     pub offload_globals: RefCell<Option<OffloadGlobals<'ll>>>,
@@ -183,13 +186,17 @@ fn to_llvm_tls_model(tls_model: TlsModel) -> llvm::ThreadLocalMode {
 
 pub(crate) unsafe fn create_module<'ll>(
     tcx: TyCtxt<'_>,
-    llcx: &'ll llvm::Context,
+    llcx: llvm::Context<'ll>,
     mod_name: &str,
-) -> &'ll llvm::Module {
-    let sess = tcx.sess;
-    let mod_name = SmallCStr::new(mod_name);
-    let llmod = unsafe { llvm::LLVMModuleCreateWithNameInContext(mod_name.as_ptr(), llcx) };
+) -> llvm::Module<'ll> {
+    let mod_name_cstr = SmallCStr::new(mod_name);
+    let llmod = unsafe { llvm::LLVMModuleCreateWithNameInContext(mod_name_cstr.as_ptr(), llcx) };
+    init_module(tcx, llcx, llmod);
+    llmod
+}
 
+fn init_module<'ll, 'tcx>(tcx: TyCtxt<'tcx>, llcx: llvm::Context<'ll>, llmod: llvm::Module<'ll>) {
+    let sess = tcx.sess;
     let cx = SimpleCx::new(llmod, llcx, tcx.data_layout.pointer_size());
 
     let mut target_data_layout = sess.target.data_layout.to_string();
@@ -201,7 +208,18 @@ pub(crate) unsafe fn create_module<'ll>(
             target_data_layout = target_data_layout.replace("-S64", "");
         }
     }
-
+    if llvm_version < (24, 0, 0) {
+        if sess.target.arch == Arch::AmdGpu {
+            // LLVM 24 updated the amdgpu layout: http://github.com/llvm/llvm-project/pull/209746 Add BARRIER address space
+            target_data_layout = target_data_layout
+                .replace("-p10:32:32-p11:32:32-p12:32:32-p13:32:32-p14:32:32-p15:32:32", "");
+        }
+        if sess.target.arch == Arch::PowerPC64 && sess.target.os == Os::FreeBsd {
+            // LLVM 24 updated the powerpc64 FreeBSD layout to use 16-byte stack and vector
+            // alignment: https://github.com/llvm/llvm-project/pull/232336
+            target_data_layout = target_data_layout.replace("-S128-v256:256:256-v512:512:512", "");
+        }
+    }
     // Ensure the data-layout values hardcoded remain the defaults.
     {
         let tm = crate::back::write::create_informational_target_machine(sess);
@@ -229,7 +247,7 @@ pub(crate) unsafe fn create_module<'ll>(
         llvm::LLVMSetDataLayout(llmod, data_layout.as_ptr());
     }
 
-    let llvm_target = SmallCStr::new(&versioned_llvm_target(sess));
+    let llvm_target = SmallCStr::new(&llvm_util::llvm_target(sess));
     unsafe {
         llvm::LLVMRustSetNormalizedTarget(llmod, llvm_target.as_ptr());
     }
@@ -506,20 +524,19 @@ pub(crate) unsafe fn create_module<'ll>(
         );
     }
 
-    match (sess.opts.unstable_opts.small_data_threshold, sess.target.small_data_threshold_support())
+    // Set up the small-data optimization limit for architectures that use
+    // an LLVM module flag to control this.
+    if let Some(threshold) = sess.opts.unstable_opts.small_data_threshold
+        && let SmallDataThresholdSupport::LlvmModuleFlag(flag) =
+            sess.target.small_data_threshold_support()
     {
-        // Set up the small-data optimization limit for architectures that use
-        // an LLVM module flag to control this.
-        (Some(threshold), SmallDataThresholdSupport::LlvmModuleFlag(flag)) => {
-            llvm::add_module_flag_u32(
-                llmod,
-                llvm::ModuleFlagMergeBehavior::Error,
-                &flag,
-                threshold as u32,
-            );
-        }
-        _ => (),
-    };
+        llvm::add_module_flag_u32(
+            llmod,
+            llvm::ModuleFlagMergeBehavior::Error,
+            &flag,
+            threshold as u32,
+        );
+    }
 
     // Insert `llvm.ident` metadata.
     //
@@ -592,15 +609,13 @@ pub(crate) unsafe fn create_module<'ll>(
         };
         llvm::add_module_flag_u32(llmod, merge_behavior, key, *value);
     }
-
-    llmod
 }
 
 impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
     pub(crate) fn new(
         tcx: TyCtxt<'tcx>,
         codegen_unit: &'tcx CodegenUnit<'tcx>,
-        llvm_module: &'ll crate::ModuleLlvm,
+        module_refs: ModuleRefs<'ll>,
         bitcode_needed: bool,
     ) -> Self {
         // An interesting part of Windows which MSVC forces our hand on (and
@@ -659,7 +674,7 @@ impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
 
         let tls_model = to_llvm_tls_model(tcx.sess.tls_model());
 
-        let (llcx, llmod) = (&*llvm_module.llcx, llvm_module.llmod());
+        let ModuleRefs { llcx, llmod, .. } = module_refs;
 
         let coverage_cx =
             tcx.sess.instrument_coverage().then(coverageinfo::CguCoverageContext::new);
@@ -707,6 +722,7 @@ impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
                 vtables: Default::default(),
                 const_str_cache: Default::default(),
                 const_globals: Default::default(),
+                global_asm_symbols: Default::default(),
                 statics_to_rauw: RefCell::new(Vec::new()),
                 used_statics: Vec::new(),
                 compiler_used_statics: Default::default(),
@@ -731,7 +747,7 @@ impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
         )
     }
 
-    pub(crate) fn statics_to_rauw(&self) -> &RefCell<Vec<(&'ll Value, &'ll Value)>> {
+    pub(crate) fn statics_to_rauw(&self) -> &RefCell<Vec<(Value<'ll>, Value<'ll>)>> {
         &self.statics_to_rauw
     }
 
@@ -742,7 +758,7 @@ impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
         self.coverage_cx.as_ref().expect("only called when coverage instrumentation is enabled")
     }
 
-    pub(crate) fn create_used_variable_impl(&self, name: &'static CStr, values: &[&'ll Value]) {
+    pub(crate) fn create_used_variable_impl(&self, name: &'static CStr, values: &[Value<'ll>]) {
         let array = self.const_array(self.type_ptr(), values);
 
         let g = llvm::add_global(self.llmod, self.val_ty(array), name);
@@ -867,17 +883,17 @@ impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
     }
 }
 impl<'ll> SimpleCx<'ll> {
-    pub(crate) fn get_type_of_global(&self, val: &'ll Value) -> &'ll Type {
+    pub(crate) fn get_type_of_global(&self, val: Value<'ll>) -> Type<'ll> {
         unsafe { llvm::LLVMGlobalGetValueType(val) }
     }
-    pub(crate) fn val_ty(&self, v: &'ll Value) -> &'ll Type {
+    pub(crate) fn val_ty(&self, v: Value<'ll>) -> Type<'ll> {
         common::val_ty(v)
     }
 }
 impl<'ll> SimpleCx<'ll> {
     pub(crate) fn new(
-        llmod: &'ll llvm::Module,
-        llcx: &'ll llvm::Context,
+        llmod: llvm::Module<'ll>,
+        llcx: llvm::Context<'ll>,
         pointer_size: Size,
     ) -> Self {
         let isize_ty = llvm::LLVMIntTypeInContext(llcx, pointer_size.bits() as c_uint);
@@ -886,47 +902,39 @@ impl<'ll> SimpleCx<'ll> {
 }
 
 impl<'ll, CX: Borrow<SCx<'ll>>> GenericCx<'ll, CX> {
-    pub(crate) fn get_metadata_value(&self, metadata: &'ll Metadata) -> &'ll Value {
+    pub(crate) fn get_metadata_value(&self, metadata: &'ll Metadata) -> Value<'ll> {
         llvm::LLVMMetadataAsValue(self.llcx(), metadata)
     }
 
-    pub(crate) fn get_const_int(&self, ty: &'ll Type, val: u64) -> &'ll Value {
+    pub(crate) fn get_const_int(&self, ty: Type<'ll>, val: u64) -> Value<'ll> {
         unsafe { llvm::LLVMConstInt(ty, val, llvm::FALSE) }
     }
 
-    pub(crate) fn get_const_i64(&self, n: u64) -> &'ll Value {
+    pub(crate) fn get_const_i64(&self, n: u64) -> Value<'ll> {
         self.get_const_int(self.type_i64(), n)
     }
 
-    pub(crate) fn get_const_i32(&self, n: u64) -> &'ll Value {
+    pub(crate) fn get_const_i32(&self, n: u64) -> Value<'ll> {
         self.get_const_int(self.type_i32(), n)
     }
 
-    pub(crate) fn get_const_i16(&self, n: u64) -> &'ll Value {
+    pub(crate) fn get_const_i16(&self, n: u64) -> Value<'ll> {
         self.get_const_int(self.type_i16(), n)
     }
 
-    pub(crate) fn get_const_i8(&self, n: u64) -> &'ll Value {
+    pub(crate) fn get_const_i8(&self, n: u64) -> Value<'ll> {
         self.get_const_int(self.type_i8(), n)
     }
 
     pub(crate) fn get_md_kind_id(&self, name: &str) -> llvm::MetadataKindId {
-        unsafe {
-            llvm::LLVMGetMDKindIDInContext(
-                self.llcx(),
-                name.as_ptr() as *const c_char,
-                name.len() as c_uint,
-            )
-        }
+        unsafe { llvm::LLVMGetMDKindIDInContext(self.llcx(), name.as_ptr(), name.len() as c_uint) }
     }
 
     pub(crate) fn create_metadata(&self, name: &[u8]) -> &'ll Metadata {
-        unsafe {
-            llvm::LLVMMDStringInContext2(self.llcx(), name.as_ptr() as *const c_char, name.len())
-        }
+        unsafe { llvm::LLVMMDStringInContext2(self.llcx(), name.as_ptr(), name.len()) }
     }
 
-    pub(crate) fn get_functions(&self) -> Vec<&'ll Value> {
+    pub(crate) fn get_functions(&self) -> Vec<Value<'ll>> {
         let mut functions = vec![];
         let mut func = unsafe { llvm::LLVMGetFirstFunction(self.llmod()) };
         while let Some(f) = func {
@@ -940,20 +948,19 @@ impl<'ll, CX: Borrow<SCx<'ll>>> GenericCx<'ll, CX> {
 impl<'ll, 'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'ll, 'tcx> {
     fn vtables(
         &self,
-    ) -> &RefCell<FxHashMap<(Ty<'tcx>, Option<ty::ExistentialTraitRef<'tcx>>), &'ll Value>> {
+    ) -> &RefCell<FxHashMap<(Ty<'tcx>, Option<ty::ExistentialTraitRef<'tcx>>), Value<'ll>>> {
         &self.vtables
     }
 
     fn apply_vcall_visibility_metadata(
         &self,
-        ty: Ty<'tcx>,
-        poly_trait_ref: Option<ty::ExistentialTraitRef<'tcx>>,
-        vtable: &'ll Value,
+        trait_hierarchy: &[ty::ExistentialTraitRef<'tcx>],
+        vtable: Value<'ll>,
     ) {
-        apply_vcall_visibility_metadata(self, ty, poly_trait_ref, vtable);
+        apply_vcall_visibility_metadata(self, trait_hierarchy, vtable);
     }
 
-    fn get_fn(&self, instance: Instance<'tcx>) -> &'ll Value {
+    fn get_fn(&self, instance: Instance<'tcx>) -> Value<'ll> {
         get_fn(self, instance)
     }
 
@@ -961,7 +968,7 @@ impl<'ll, 'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'ll, 'tcx> {
         &self,
         instance: Instance<'tcx>,
         pointer_auth_schema: Option<&PointerAuthSchema>,
-    ) -> &'ll Value {
+    ) -> Value<'ll> {
         // When pointer authentication metadata is provided, `get_fn_addr` will
         // attempt to sign the pointer using LLVM's `ConstPtrAuth` constant
         // expression.
@@ -981,7 +988,7 @@ impl<'ll, 'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'ll, 'tcx> {
         }
     }
 
-    fn eh_personality(&self) -> &'ll Value {
+    fn eh_personality(&self) -> Value<'ll> {
         // The exception handling personality function.
         //
         // If our compilation unit has the `eh_personality` lang item somewhere
@@ -1025,13 +1032,20 @@ impl<'ll, 'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'ll, 'tcx> {
                     tcx,
                     self.typing_env(),
                     def_id,
-                    ty::List::empty(),
+                    ty::GenericArgs::empty(),
                     DUMMY_SP,
                 ),
                 tcx.sess.pointer_authentication_functions(),
             ),
             _ => {
-                let name = name.unwrap_or("rust_eh_personality");
+                let mangled_symbol;
+                let name = match name {
+                    Some(name) => name,
+                    None => {
+                        mangled_symbol = rustc_symbol_mangling::eh_personality_symbol(tcx);
+                        mangled_symbol.as_str()
+                    }
+                };
                 if let Some(llfn) = self.get_declared_value(name) {
                     llfn
                 } else {
@@ -1051,16 +1065,21 @@ impl<'ll, 'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'ll, 'tcx> {
         self.tcx.sess
     }
 
-    fn set_frame_pointer_type(&self, llfn: &'ll Value) {
+    fn set_frame_pointer_type(&self, llfn: Value<'ll>) {
         if let Some(attr) = attributes::frame_pointer_type_attr(self, self.sess()) {
             attributes::apply_to_llfn(llfn, llvm::AttributePlace::Function, &[attr]);
         }
     }
 
-    fn apply_target_cpu_attr(&self, llfn: &'ll Value) {
+    fn apply_target_cpu_attr(&self, llfn: Value<'ll>) {
         let mut attrs = SmallVec::<[_; 2]>::new();
         attrs.push(attributes::target_cpu_attr(self, self.sess()));
         attrs.extend(attributes::tune_cpu_attr(self, self.sess()));
+        attributes::apply_to_llfn(llfn, llvm::AttributePlace::Function, &attrs);
+    }
+
+    fn apply_default_optimisation_attrs(&self, llfn: Value<'ll>) {
+        let attrs = attributes::default_optimisation_attrs(self, self.sess());
         attributes::apply_to_llfn(llfn, llvm::AttributePlace::Function, &attrs);
     }
 
@@ -1086,8 +1105,8 @@ impl<'ll, 'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'ll, 'tcx> {
         }
     }
 
-    fn intrinsic_call_expects_place_always(&self, name: Symbol) -> bool {
-        matches!(name, sym::black_box)
+    fn intrinsic_call_expects_place_always(&self, name: Intrinsic) -> bool {
+        matches!(name, Intrinsic::Rustc(sym::black_box))
     }
 }
 
@@ -1095,8 +1114,8 @@ impl<'ll> CodegenCx<'ll, '_> {
     pub(crate) fn get_intrinsic(
         &self,
         base_name: Cow<'static, str>,
-        type_params: &[&'ll Type],
-    ) -> (&'ll Type, &'ll Value) {
+        type_params: &[Type<'ll>],
+    ) -> (Type<'ll>, Value<'ll>) {
         *self
             .intrinsics
             .borrow_mut()
@@ -1109,8 +1128,8 @@ impl<'ll> CodegenCx<'ll, '_> {
     fn declare_intrinsic(
         &self,
         base_name: &str,
-        type_params: &[&'ll Type],
-    ) -> (&'ll Type, &'ll Value) {
+        type_params: &[Type<'ll>],
+    ) -> (Type<'ll>, Value<'ll>) {
         match base_name {
             // This isn't an "LLVM intrinsic", but LLVM's optimization passes
             // recognize it like one (including turning it into `bcmp` sometimes)
@@ -1148,7 +1167,7 @@ impl<'ll> CodegenCx<'ll, '_> {
             _ => {
                 let intrinsic = llvm::Intrinsic::lookup(base_name.as_bytes())
                     .unwrap_or_else(|| bug!("Unknown intrinsic: `{base_name}`"));
-                let f = intrinsic.get_declaration(self.llmod, &type_params);
+                let f = intrinsic.get_declaration(self.llmod, type_params);
                 (self.get_type_of_global(f), f)
             }
         }
@@ -1192,12 +1211,7 @@ impl<'ll, CX: Borrow<SCx<'ll>>> GenericCx<'ll, CX> {
     }
 
     /// A wrapper for [`llvm::LLVMSetMetadata`], but it takes `Metadata` as a parameter instead of `Value`.
-    pub(crate) fn set_metadata<'a>(
-        &self,
-        val: &'a Value,
-        kind_id: MetadataKindId,
-        md: &'ll Metadata,
-    ) {
+    pub(crate) fn set_metadata(&self, val: Value<'ll>, kind_id: MetadataKindId, md: &'ll Metadata) {
         let node = self.get_metadata_value(md);
         llvm::LLVMSetMetadata(val, kind_id, node);
     }
@@ -1208,7 +1222,7 @@ impl<'ll, CX: Borrow<SCx<'ll>>> GenericCx<'ll, CX> {
     /// - `LLVMSetMetadata` (to set that node as metadata of `kind_id` for `instruction`)
     pub(crate) fn set_metadata_node(
         &self,
-        instruction: &'ll Value,
+        instruction: Value<'ll>,
         kind_id: MetadataKindId,
         md_list: &[&'ll Metadata],
     ) -> &'ll Metadata {
@@ -1223,7 +1237,7 @@ impl<'ll, CX: Borrow<SCx<'ll>>> GenericCx<'ll, CX> {
     /// - `LLVMAddNamedMetadataOperand` (to set that node as metadata of `kind_name` for `module`)
     pub(crate) fn module_add_named_metadata_node(
         &self,
-        module: &'ll Module,
+        module: Module<'ll>,
         kind_name: &CStr,
         md_list: &[&'ll Metadata],
     ) {
@@ -1234,15 +1248,15 @@ impl<'ll, CX: Borrow<SCx<'ll>>> GenericCx<'ll, CX> {
 
     /// Helper method for the sequence of calls:
     /// - `LLVMMDNodeInContext2` (to create an `llvm::MDNode` from a list of metadata)
-    /// - `LLVMRustGlobalAddMetadata` (to set that node as metadata of `kind_id` for `global`)
+    /// - `LLVMGlobalAddMetadata` (to set that node as metadata of `kind_id` for `global`)
     pub(crate) fn global_add_metadata_node(
         &self,
-        global: &'ll Value,
+        global: Value<'ll>,
         kind_id: MetadataKindId,
         md_list: &[&'ll Metadata],
     ) {
         let md = self.md_node_in_context(md_list);
-        unsafe { llvm::LLVMRustGlobalAddMetadata(global, kind_id, md) };
+        unsafe { llvm::LLVMGlobalAddMetadata(global, kind_id, md) };
     }
 
     /// Helper method for the sequence of calls:
@@ -1250,7 +1264,7 @@ impl<'ll, CX: Borrow<SCx<'ll>>> GenericCx<'ll, CX> {
     /// - `LLVMGlobalSetMetadata` (to set that node as metadata of `kind_id` for `global`)
     pub(crate) fn global_set_metadata_node(
         &self,
-        global: &'ll Value,
+        global: Value<'ll>,
         kind_id: MetadataKindId,
         md_list: &[&'ll Metadata],
     ) {

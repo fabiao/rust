@@ -1,11 +1,13 @@
 use hir::HirId;
 use rustc_abi::Primitive::Pointer;
 use rustc_abi::VariantIdx;
+use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::codes::*;
 use rustc_errors::struct_span_code_err;
 use rustc_hir as hir;
 use rustc_index::Idx;
 use rustc_middle::ty::layout::{LayoutError, SizeSkeleton};
+use rustc_middle::ty::offload_meta::is_region_ty;
 use rustc_middle::ty::{self, Ty, TyCtxt, Unnormalized};
 use rustc_span::def_id::LocalDefId;
 use rustc_span::{ErrorGuaranteed, bug};
@@ -55,6 +57,13 @@ fn skeleton_string<'tcx>(
                 bug!("{:?} overflow for u128", size)
             }
         }
+        Ok(SizeSkeleton::Array { base, const_lens, .. }) => {
+            let base_bits = u128::from(base.bytes())
+                .checked_mul(8)
+                .unwrap_or_else(|| bug!("{:?} overflow for u128", base));
+            let lens = const_lens.iter().map(|l| format!("({l})")).collect::<Vec<_>>().join(" * ");
+            format!("{base_bits} * {lens} bits")
+        }
         Err(LayoutError::TooGeneric(bad)) => {
             if *bad == ty {
                 "this type does not have a fixed size".to_owned()
@@ -95,10 +104,10 @@ fn check_transmute<'tcx>(
     trace!(?sk_from, ?sk_to);
 
     // Check for same size using the skeletons.
-    if let Ok(sk_from) = sk_from
-        && let Ok(sk_to) = sk_to
+    if let Ok(sk_from) = &sk_from
+        && let Ok(sk_to) = &sk_to
     {
-        if sk_from.same_size(sk_to) {
+        if sk_from.same_size(&sk_to) {
             return Ok(());
         }
 
@@ -107,7 +116,7 @@ fn check_transmute<'tcx>(
         let from = unpack_option_like(tcx, from);
         if let ty::FnDef(..) = from.kind()
             && let SizeSkeleton::Known(size_to, _) = sk_to
-            && size_to == Pointer(tcx.data_layout.instruction_address_space).size(&tcx)
+            && *size_to == Pointer(tcx.data_layout.instruction_address_space).size(&tcx)
         {
             struct_span_code_err!(tcx.sess.dcx(), span, E0591, "can't transmute zero-sized type")
                 .with_note(format!("source type: {from}"))
@@ -132,6 +141,28 @@ fn check_transmute<'tcx>(
         err.note(format!("target type: `{}` ({})", to, skeleton_string(to, sk_to)));
         Err(err.emit_err())
     }
+}
+
+fn contains_nested_offload_region<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
+    let mut visited = FxHashSet::default();
+    let mut stack = vec![ty];
+    let mut is_root = true;
+
+    while let Some(ty) = stack.pop() {
+        if !is_root && is_region_ty(tcx, ty) {
+            return true;
+        }
+        is_root = false;
+
+        if let ty::Adt(def, args) = *ty.kind()
+            && visited.insert(def.did())
+        {
+            stack.extend(def.all_fields().map(|field| field.ty(tcx, args).skip_norm_wip()));
+        }
+        stack.extend(ty.walk().skip(1).filter_map(|arg| arg.as_type()));
+    }
+
+    false
 }
 
 fn check_offload<'tcx>(
@@ -205,7 +236,23 @@ fn check_offload<'tcx>(
     {
         let norm_input_ty = normalize(input_ty);
         let norm_arg_ty = normalize(arg_ty);
-        if norm_input_ty != norm_arg_ty {
+
+        if contains_nested_offload_region(tcx, norm_input_ty)
+            || contains_nested_offload_region(tcx, norm_arg_ty)
+        {
+            let guar = tcx
+                .sess
+                .dcx()
+                .struct_span_err(
+                    span,
+                    format!(
+                        "offload kernel argument {i} contains a `Region` nested inside another \
+                        type. Pass the `Region` by value so it can be mapped like a slice"
+                    ),
+                )
+                .emit_err();
+            result = Err(guar);
+        } else if norm_input_ty != norm_arg_ty {
             let guar = tcx
                 .sess
                 .dcx()

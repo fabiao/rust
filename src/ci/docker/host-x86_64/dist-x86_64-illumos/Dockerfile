@@ -1,4 +1,4 @@
-FROM ubuntu:18.04
+FROM ubuntu:22.04
 
 # Enable source repositories, which are disabled by default on Ubuntu >= 18.04
 RUN sed -i 's/^# deb-src/deb-src/' /etc/apt/sources.list
@@ -36,5 +36,8 @@ ENV \
 
 ENV HOSTS=x86_64-unknown-illumos
 
-ENV RUST_CONFIGURE_ARGS="--enable-extended --disable-docs"
+ENV RUST_CONFIGURE_ARGS="--enable-extended \
+      --disable-docs \
+      --set rust.lto=thin \
+      --set rust.codegen-units=1"
 ENV SCRIPT="python2.7 ../x.py dist --host $HOSTS --target $HOSTS"

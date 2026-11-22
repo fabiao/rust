@@ -126,7 +126,7 @@ pub unsafe fn init() {
             if !NEED_ALTSTACK.load(Ordering::Relaxed) {
                 // haven't set up our sigaltstack yet
                 NEED_ALTSTACK.store(true, Ordering::Release);
-                let handler = make_handler(true);
+                let handler = install_sigaltstack();
                 MAIN_ALTSTACK.store(handler.data, Ordering::Relaxed);
                 mem::forget(handler);
 
@@ -145,6 +145,18 @@ pub unsafe fn init() {
             unsafe { sigaction(signal, &action, ptr::null_mut()) };
         }
     }
+}
+
+pub fn make_handler() -> Handler {
+    if cfg!(panic = "immediate-abort") || !NEED_ALTSTACK.load(Ordering::Acquire) {
+        return Handler::null();
+    }
+
+    if let Some(guard_page_range) = current_guard() {
+        set_current_info(guard_page_range);
+    }
+
+    install_sigaltstack()
 }
 
 fn get_stack() -> libc::stack_t {
@@ -189,17 +201,7 @@ fn get_stack() -> libc::stack_t {
     libc::stack_t { ss_sp: stackp, ss_flags: 0, ss_size: sigstack_size }
 }
 
-pub fn make_handler(main_thread: bool) -> Handler {
-    if cfg!(panic = "immediate-abort") || !NEED_ALTSTACK.load(Ordering::Acquire) {
-        return Handler::null();
-    }
-
-    if !main_thread {
-        if let Some(guard_page_range) = current_guard() {
-            set_current_info(guard_page_range);
-        }
-    }
-
+fn install_sigaltstack() -> Handler {
     // Load the current alternate signal stack to see if we need to install
     // our own.
     //
@@ -235,6 +237,12 @@ pub fn make_handler(main_thread: bool) -> Handler {
 /// Must only be called with a pointer returned by `make_handler`, and only
 /// once per `Handler`.
 pub unsafe fn drop_handler(data: *mut libc::c_void) {
+    if cfg!(panic = "immediate-abort") || !NEED_ALTSTACK.load(Ordering::Relaxed) {
+        debug_assert!(data.is_null());
+        // Skip the thread-info-store access below.
+        return;
+    }
+
     if !data.is_null() {
         let sigstack_size = sigstack_size();
         let page_size = PAGE_SIZE.load(Ordering::Relaxed);
@@ -266,6 +274,9 @@ pub unsafe fn drop_handler(data: *mut libc::c_void) {
         unsafe { munmap(data.sub(page_size), sigstack_size + page_size) };
     }
 
+    // `make_handler` inserts the current thread's info into the store even if
+    // there is already a signal stack in place, so this cannot be conditional
+    // on `data`.
     delete_current_info();
 }
 
@@ -471,29 +482,18 @@ fn install_main_guard_freebsd(page_size: usize) -> Option<Range<usize>> {
     // the builtin guard page.
     let stackptr = stack_start_aligned(page_size)?;
     let guardaddr = stackptr.addr();
-    // Technically the number of guard pages is tunable and controlled
-    // by the security.bsd.stack_guard_page sysctl.
-    // By default it is 1, checking once is enough since it is
-    // a boot time config value.
-    // FIXME(joboet): this function is only called once, remove the caching.
-    static PAGES: crate::sync::OnceLock<usize> = crate::sync::OnceLock::new();
 
-    let pages = PAGES.get_or_init(|| {
-        let mut guard: usize = 0;
-        let mut size = size_of_val(&guard);
-        let oid = c"security.bsd.stack_guard_page";
+    // The number of guard pages is tunable and controlled by the
+    // security.bsd.stack_guard_page sysctl. By default it is 1,
+    // checking once is enough since it is a boot time config value.
+    let mut guard: usize = 0;
+    let mut size = size_of_val(&guard);
+    let oid = c"security.bsd.stack_guard_page";
+    let r = unsafe {
+        libc::sysctlbyname(oid.as_ptr(), (&raw mut guard).cast(), &raw mut size, ptr::null_mut(), 0)
+    };
+    let pages = if r == 0 { guard } else { 1 };
 
-        let r = unsafe {
-            libc::sysctlbyname(
-                oid.as_ptr(),
-                (&raw mut guard).cast(),
-                &raw mut size,
-                ptr::null_mut(),
-                0,
-            )
-        };
-        if r == 0 { guard } else { 1 }
-    });
     Some(guardaddr..guardaddr + pages * page_size)
 }
 

@@ -29,7 +29,7 @@ pub use self::select::{EvaluationCache, EvaluationResult, OverflowError, Selecti
 use crate::mir::ConstraintCategory;
 pub use crate::traits::solve::BuiltinImplSource;
 use crate::ty::abstract_const::NotConstEvaluatable;
-use crate::ty::{self, AdtKind, GenericArgsRef, Ty};
+use crate::ty::{self, AdtKind, GenericArgs, Ty};
 
 /// The reason why we incurred this obligation; used for error reporting.
 ///
@@ -188,7 +188,7 @@ pub enum ObligationCauseCode<'tcx> {
     SliceOrArrayElem,
 
     /// An array `[T; N]` can only be indexed (and is only well-formed if) `N` has type usize.
-    ArrayLen(Ty<'tcx>),
+    ArrayLen(Ty<'tcx>, Span),
 
     /// A tuple is WF only if its middle elements are `Sized`.
     TupleElem,
@@ -238,7 +238,7 @@ pub enum ObligationCauseCode<'tcx> {
     /// Return type must be `Sized`.
     SizedReturnType,
     /// Return type of a call expression must be `Sized`.
-    SizedCallReturnType,
+    SizedCallReturnType(HirId),
     /// Yield type must be `Sized`.
     SizedYieldType,
     /// Inline asm operand type must be `Sized`.
@@ -366,6 +366,8 @@ pub enum ObligationCauseCode<'tcx> {
     /// Opaque return type of this function
     OpaqueReturnType(Option<(Ty<'tcx>, HirId)>),
 
+    ReturnType,
+
     /// Block implicit return
     BlockTailExpression(HirId, hir::MatchSource),
 
@@ -384,7 +386,7 @@ pub enum ObligationCauseCode<'tcx> {
     /// This is purely for diagnostic purposes - it is always
     /// correct to use `Misc` instead, or to specify
     /// `WellFormed(None)`.
-    WellFormed(Option<WellFormedLoc>),
+    WellFormed(WellFormedLoc),
 
     /// From `match_impl`. The cause for us having to match an impl, and the DefId we are matching
     /// against.
@@ -414,6 +416,10 @@ pub enum ObligationCauseCode<'tcx> {
 
     /// Requirement for a `const N: Ty` to implement `Ty: ConstParamTy`
     ConstParam(Ty<'tcx>),
+
+    /// Requirement for the type of a const item used in the type system to implement
+    /// `ConstParamTy`.
+    ConstItemTy(Ty<'tcx>),
 
     /// Obligations emitted during the normalization of a free type alias.
     TypeAlias(ObligationCauseCodeHandle<'tcx>, Span, DefId),
@@ -461,6 +467,8 @@ pub enum WellFormedLoc {
         /// being the last 'parameter'
         param_idx: usize,
     },
+    HirId(HirId),
+    None,
 }
 
 impl<'tcx> ObligationCauseCode<'tcx> {
@@ -752,7 +760,7 @@ impl<'tcx, N> ImplSource<'tcx, N> {
 #[derive(TypeFoldable, TypeVisitable)]
 pub struct ImplSourceUserDefinedData<'tcx, N> {
     pub impl_def_id: DefId,
-    pub args: GenericArgsRef<'tcx>,
+    pub args: GenericArgs<'tcx>,
     pub nested: ThinVec<N>,
 }
 

@@ -215,7 +215,7 @@ pub struct Parser<'a> {
     // token. For example, capturing the `Vec<u8>` in `Option<Vec<u8>>`
     // requires us to unglue the trailing `>>` token. The `break_last_token`
     // field is used to track these tokens. They get appended to the captured
-    // stream when we evaluate a `LazyAttrTokenStream`.
+    // stream when we evaluate a `LazyTokenStream`.
     //
     // This value is always 0, 1, or 2. It can only reach 2 when splitting
     // `>>=` or `<<=`.
@@ -260,14 +260,12 @@ struct ClosureSpans {
     body: Span,
 }
 
-/// Controls how we capture tokens. Capturing can be expensive,
-/// so we try to avoid performing capturing in cases where
-/// we will never need an `AttrTokenStream`.
+/// Controls how we capture tokens. Capturing can be expensive, so we avoid it when possible.
 #[derive(Copy, Clone, Debug)]
 enum Capturing {
     /// We aren't performing any capturing - this is the default mode.
     No,
-    /// We are capturing tokens
+    /// We are capturing tokens.
     Yes,
 }
 
@@ -632,6 +630,15 @@ impl<'a> Parser<'a> {
         if !self.eat_keyword(exp) { self.unexpected() } else { Ok(()) }
     }
 
+    #[must_use]
+    pub(crate) fn eat_forced_keyword_noexpect(&mut self, kw: Symbol) -> bool {
+        if self.token.is_forced_keyword(kw) {
+            self.bump();
+            return true;
+        }
+        false
+    }
+
     /// Consume a sequence produced by a metavar expansion, if present.
     pub fn eat_metavar_seq<T>(
         &mut self,
@@ -876,6 +883,10 @@ impl<'a> Parser<'a> {
                             break;
                         }
                         Err(mut expect_err) => {
+                            if !self.may_recover() {
+                                return Err(expect_err);
+                            }
+
                             let sp = self.prev_token.span.shrink_to_hi();
                             let token_str = pprust::token_kind_to_string(&exp.tok);
 
@@ -1094,7 +1105,7 @@ impl<'a> Parser<'a> {
     /// Parses a comma-separated sequence, including both delimiters.
     /// The function `f` must consume tokens until reaching the next separator or
     /// closing bracket.
-    pub fn parse_delim_comma_seq<T>(
+    fn parse_delim_comma_seq<T>(
         &mut self,
         open: ExpTokenPair,
         close: ExpTokenPair,
@@ -1344,7 +1355,7 @@ impl<'a> Parser<'a> {
     /// ```enbf
     /// FieldName = IntLit | Ident
     /// ```
-    pub fn parse_field_name(&mut self) -> PResult<'a, Ident> {
+    fn parse_field_name(&mut self) -> PResult<'a, Ident> {
         if let token::Literal(token::Lit { kind: token::Integer, symbol, suffix }) = self.token.kind
         {
             if let Some(suffix) = suffix {

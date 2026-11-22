@@ -174,7 +174,7 @@ pub(super) fn check<'tcx>(
             && !is_local_used(cx, non_binding_location, hir_id)
             && let l_ty = typeck.expr_ty(l)
             && l_ty == typeck.expr_ty(r)
-            && let Some(partial_eq) = cx.tcx.lang_items().eq_trait()
+            && let Some(partial_eq) = cx.tcx.lang_items().partial_eq_trait()
             && implements_trait(cx, recv_ty, partial_eq, &[recv_ty.into()])
             && is_copy(cx, l_ty)
     {
@@ -199,7 +199,7 @@ pub(super) fn check<'tcx>(
         );
 
         let sugg = if let Some(parent_expr) = get_parent_expr(cx, expr) {
-            if parent_expr.span.eq_ctxt(expr.span) {
+            if parent_expr.span.ctxt() == expr.span.ctxt() {
                 match parent_expr.kind {
                     ExprKind::Binary(..) | ExprKind::Unary(..) | ExprKind::Cast(..) => binop.maybe_paren(),
                     ExprKind::MethodCall(_, receiver, _, _) if receiver.hir_id == expr.hir_id => binop.maybe_paren(),

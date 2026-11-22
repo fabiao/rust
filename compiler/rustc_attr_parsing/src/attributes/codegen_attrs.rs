@@ -8,6 +8,7 @@ use rustc_structures::SanitizerSet;
 
 use super::prelude::*;
 use crate::attributes::AttributeSafety;
+use crate::context::FinalizeCheckFn;
 use crate::diagnostics::{
     EmptyExportName, EmptySection, NakedFunctionIncompatibleAttribute, NullOnExport,
     NullOnObjcClass, NullOnObjcSelector, NullOnSection, ObjcClassExpectedStringLiteral,
@@ -28,7 +29,7 @@ impl SingleAttributeParser for OptimizeParser {
         Allow(Target::Method(MethodKind::Inherent)),
     ]);
     const TEMPLATE: AttributeTemplate = template!(List: &["size", "speed", "none"]);
-    const STABILITY: AttributeStability = unstable!(optimize_attribute);
+    const STABILITY: AttributeStability = AttributeStability::Stable;
 
     fn convert(cx: &mut AcceptContext<'_, '_>, args: &ArgParser) -> Option<AttributeKind> {
         let single = cx.expect_single_element_list(args, cx.attr_span)?;
@@ -60,6 +61,7 @@ impl NoArgsAttributeParser for ColdParser {
         Allow(Target::Method(MethodKind::Inherent)),
         Allow(Target::ForeignFn),
         Allow(Target::Closure),
+        Error(Target::Param),
     ]);
     const STABILITY: AttributeStability = AttributeStability::Stable;
     const CREATE: fn(Span) -> AttributeKind = |_| AttributeKind::Cold;
@@ -219,7 +221,7 @@ impl AttributeParser for NakedParser {
 
             if let Some(earlier) = this.span {
                 let span = cx.attr_span;
-                cx.warn_unused_duplicate(earlier, span);
+                cx.warn_unused_duplicate(earlier, span, sym::naked, false);
             } else {
                 this.span = Some(cx.attr_span);
             }
@@ -292,7 +294,7 @@ impl AttributeParser for NakedParser {
                 if other_attr
                     .segments()
                     .next()
-                    .is_some_and(|i| tools.iter().any(|tool| tool.name == i.name))
+                    .is_some_and(|i| tools.iter().any(|(tool, _)| tool.name == i.name))
                 {
                     // effectively skips the error message  being emitted below
                     // if it's a tool attribute
@@ -327,6 +329,40 @@ impl AttributeParser for NakedParser {
 
         Some(AttributeKind::Naked(span))
     }
+
+    fn deferred_finalize_check(&self) -> Option<(FinalizeCheckFn, Span)> {
+        // FIXME(rtjkro): Currently, we're enum matching on `cx.target` instead of `cx.ast_target`
+        // because `AstTarget::Method` doesn't contain `MethodKind` yet. In the future, when this field is available to `AstTarget::Method`,
+        // update this check to use `cx.ast_target` instead of `cx.target`.
+        Some((
+            |cx, _| match cx.target {
+                Target::Fn
+                | Target::Method(
+                    MethodKind::Trait { body: true } | MethodKind::TraitImpl | MethodKind::Inherent,
+                ) => {
+                    let fn_sig =
+                        cx.ast_target.get_fn_sig().expect("missing fn signature for AST target");
+                    let Some(abi) = cx.ast_target.get_abi() else {
+                        return;
+                    };
+
+                    if abi.is_rustic_abi() && !cx.features().naked_functions_rustic_abi() {
+                        feature_err(
+                            cx.sess(),
+                            sym::naked_functions_rustic_abi,
+                            fn_sig.span,
+                            format!(
+                                "`#[naked]` is currently unstable on `extern {abi}` functions",
+                            ),
+                        )
+                        .emit();
+                    }
+                }
+                _ => {}
+            },
+            self.span?,
+        ))
+    }
 }
 
 pub(crate) struct TrackCallerParser;
@@ -354,7 +390,7 @@ impl NoArgsAttributeParser for TrackCallerParser {
             Target::Fn => {
                 // `#[track_caller]` is not valid on weak lang items because they are called via
                 // `extern` declarations and `#[track_caller]` would alter their ABI.
-                if let Some(item) = find_attr!(cx.parsed_attrs, Lang(item) => item)
+                if let Some(item) = find_attr!(cx.parsed_attrs, Lang(item, _) => item)
                     && item.is_weak()
                 {
                     cx.emit_err(TrackCallerOnLangItem {
@@ -393,6 +429,7 @@ impl NoArgsAttributeParser for NoMangleParser {
         Allow(Target::Method(MethodKind::TraitImpl)),
         AllowSilent(Target::Const), // Handled in the `InvalidNoMangleItems` pass
         Error(Target::Closure),
+        Error(Target::Param),
     ]);
     const STABILITY: AttributeStability = AttributeStability::Stable;
     const CREATE: fn(Span) -> AttributeKind = AttributeKind::NoMangle;
@@ -468,14 +505,14 @@ impl AttributeParser for UsedParser {
                 UsedBy::Compiler => &mut group.first_compiler,
                 UsedBy::Linker => {
                     if let Some(prev) = group.first_default {
-                        cx.warn_unused_duplicate(prev, attr_span);
+                        cx.warn_unused_duplicate(prev, attr_span, sym::used, false);
                         return;
                     }
                     &mut group.first_linker
                 }
                 UsedBy::Default => {
                     if let Some(prev) = group.first_linker {
-                        cx.warn_unused_duplicate(prev, attr_span);
+                        cx.warn_unused_duplicate(prev, attr_span, sym::used, false);
                         return;
                     }
                     &mut group.first_default
@@ -483,7 +520,7 @@ impl AttributeParser for UsedParser {
             };
 
             if let Some(prev) = *target {
-                cx.warn_unused_duplicate(prev, attr_span);
+                cx.warn_unused_duplicate(prev, attr_span, sym::used, false);
             } else {
                 *target = Some(attr_span);
             }

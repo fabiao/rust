@@ -107,6 +107,8 @@ mod ok {
     #[test]
     fn cfg_meta() { run_and_expect_no_errors("test_data/parser/inline/ok/cfg_meta.rs"); }
     #[test]
+    fn cfg_pred_pat() { run_and_expect_no_errors("test_data/parser/inline/ok/cfg_pred_pat.rs"); }
+    #[test]
     fn cfg_true_false_pred() {
         run_and_expect_no_errors("test_data/parser/inline/ok/cfg_true_false_pred.rs");
     }
@@ -262,6 +264,10 @@ mod ok {
     }
     #[test]
     fn field_expr() { run_and_expect_no_errors("test_data/parser/inline/ok/field_expr.rs"); }
+    #[test]
+    fn final_assoc_fn() {
+        run_and_expect_no_errors("test_data/parser/inline/ok/final_assoc_fn.rs");
+    }
     #[test]
     fn fn_() { run_and_expect_no_errors("test_data/parser/inline/ok/fn_.rs"); }
     #[test]
@@ -823,6 +829,10 @@ mod err {
         run_and_expect_errors("test_data/parser/inline/err/async_without_semicolon.rs");
     }
     #[test]
+    fn attr_end_of_stmt_list() {
+        run_and_expect_errors("test_data/parser/inline/err/attr_end_of_stmt_list.rs");
+    }
+    #[test]
     fn bad_asm_expr() { run_and_expect_errors("test_data/parser/inline/err/bad_asm_expr.rs"); }
     #[test]
     fn closure_ret_recovery() {
@@ -849,12 +859,20 @@ mod err {
     #[test]
     fn empty_segment() { run_and_expect_errors("test_data/parser/inline/err/empty_segment.rs"); }
     #[test]
+    fn enum_variant_attrs_without_variant() {
+        run_and_expect_errors("test_data/parser/inline/err/enum_variant_attrs_without_variant.rs");
+    }
+    #[test]
     fn fn_pointer_type_missing_fn() {
         run_and_expect_errors("test_data/parser/inline/err/fn_pointer_type_missing_fn.rs");
     }
     #[test]
     fn fn_ret_recovery() {
         run_and_expect_errors("test_data/parser/inline/err/fn_ret_recovery.rs");
+    }
+    #[test]
+    fn function_missing_name() {
+        run_and_expect_errors("test_data/parser/inline/err/function_missing_name.rs");
     }
     #[test]
     fn function_ret_type_missing_arrow() {
@@ -953,6 +971,10 @@ mod err {
     }
     #[test]
     fn pub_expr() { run_and_expect_errors("test_data/parser/inline/err/pub_expr.rs"); }
+    #[test]
+    fn record_field_attrs_without_field() {
+        run_and_expect_errors("test_data/parser/inline/err/record_field_attrs_without_field.rs");
+    }
     #[test]
     fn record_literal_before_ellipsis_recovery() {
         run_and_expect_errors(

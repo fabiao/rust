@@ -98,6 +98,11 @@ pub struct DefaultTypes<'db> {
 pub struct DefaultConsts<'db> {
     pub error: Const<'db>,
     pub u8_values: [Const<'db>; 256],
+    pub unit: Const<'db>,
+    pub true_: Const<'db>,
+    pub false_: Const<'db>,
+    /// Use [`ValTree::zst`] instead.
+    pub valtree_zst: ValTree<'db>,
 }
 
 pub struct DefaultRegions<'db> {
@@ -158,6 +163,12 @@ pub fn default_types<'db>() -> &'db DefaultAny<'db> {
             let ty = ManuallyDrop::new(ty.store());
             ty.as_ref()
         };
+        let create_valtree = |kind| {
+            let vt = ValTree::new(kind);
+            // We need to increase the refcount (forever), so that the types won't be freed.
+            let vt = ManuallyDrop::new(vt.store());
+            vt.as_ref()
+        };
         let create_region = |kind| {
             let ty = Region::new_without_interner(kind);
             // We need to increase the refcount (forever), so that the types won't be freed.
@@ -165,79 +176,79 @@ pub fn default_types<'db>() -> &'db DefaultAny<'db> {
             ty.as_ref()
         };
         let create_generic_args = |slice| {
-            let ty = GenericArgs::new_from_slice(slice);
+            let ty = GenericArgs::new_from_slice_no_empty_check(slice);
             // We need to increase the refcount (forever), so that the types won't be freed.
             let ty = ManuallyDrop::new(ty.store());
             ty.as_ref()
         };
         let create_bound_var_kinds = |slice| {
-            let ty = BoundVarKinds::new_from_slice(slice);
+            let ty = BoundVarKinds::new_from_slice_no_empty_check(slice);
             // We need to increase the refcount (forever), so that the types won't be freed.
             let ty = ManuallyDrop::new(ty.store());
             ty.as_ref()
         };
         let create_canonical_vars = |slice| {
-            let ty = CanonicalVarKinds::new_from_slice(slice);
+            let ty = CanonicalVarKinds::new_from_slice_no_empty_check(slice);
             // We need to increase the refcount (forever), so that the types won't be freed.
             let ty = ManuallyDrop::new(ty.store());
             ty.as_ref()
         };
         let create_variances_of = |slice| {
-            let ty = VariancesOf::new_from_slice(slice);
+            let ty = VariancesOf::new_from_slice_no_empty_check(slice);
             // We need to increase the refcount (forever), so that the types won't be freed.
             let ty = ManuallyDrop::new(ty.store());
             ty.as_ref()
         };
         let create_pat_list = |slice| {
-            let ty = PatList::new_from_slice(slice);
+            let ty = PatList::new_from_slice_no_empty_check(slice);
             // We need to increase the refcount (forever), so that the types won't be freed.
             let ty = ManuallyDrop::new(ty.store());
             ty.as_ref()
         };
         let create_predefined_opaques = |slice| {
-            let ty = PredefinedOpaques::new_from_slice(slice);
+            let ty = PredefinedOpaques::new_from_slice_no_empty_check(slice);
             // We need to increase the refcount (forever), so that the types won't be freed.
             let ty = ManuallyDrop::new(ty.store());
             ty.as_ref()
         };
         let create_solver_def_ids = |slice| {
-            let ty = SolverDefIds::new_from_slice(slice);
+            let ty = SolverDefIds::new_from_slice_no_empty_check(slice);
             // We need to increase the refcount (forever), so that the types won't be freed.
             let ty = ManuallyDrop::new(ty.store());
             ty.as_ref()
         };
         let create_bound_existential_predicates = |slice| {
-            let ty = BoundExistentialPredicates::new_from_slice(slice);
+            let ty = BoundExistentialPredicates::new_from_slice_no_empty_check(slice);
             // We need to increase the refcount (forever), so that the types won't be freed.
             let ty = ManuallyDrop::new(ty.store());
             ty.as_ref()
         };
         let create_clauses = |slice| {
-            let ty = Clauses::new_from_slice(slice);
+            let ty = Clauses::new_from_slice_no_empty_check(slice);
             // We need to increase the refcount (forever), so that the types won't be freed.
             let ty = ManuallyDrop::new(ty.store());
             ty.as_ref()
         };
         let create_region_assumptions = |slice| {
-            let ty = RegionAssumptions::new_from_slice(slice);
+            let ty = RegionAssumptions::new_from_slice_no_empty_check(slice);
             // We need to increase the refcount (forever), so that the types won't be freed.
             let ty = ManuallyDrop::new(ty.store());
             ty.as_ref()
         };
         let create_tys = |slice| {
-            let ty = Tys::new_from_slice(slice);
+            let ty = Tys::new_from_slice_no_empty_check(slice);
             // We need to increase the refcount (forever), so that the types won't be freed.
             let ty = ManuallyDrop::new(ty.store());
             ty.as_ref()
         };
         let create_consts = |slice| {
-            let ty = Consts::new_from_slice(slice);
+            let ty = Consts::new_from_slice_no_empty_check(slice);
             // We need to increase the refcount (forever), so that the types won't be freed.
             let ty = ManuallyDrop::new(ty.store());
             ty.as_ref()
         };
         let create_projection = |slice| {
-            let it = crate::mir::Projection::new_from_slice(slice);
+            let it = crate::mir::Projection::new_from_slice_no_empty_check(slice);
             // We need to increase the refcount (forever), so that the types won't be freed.
             let it = ManuallyDrop::new(it.store());
             it.as_ref()
@@ -247,9 +258,12 @@ pub fn default_types<'db>() -> &'db DefaultAny<'db> {
         let statik = create_region(RegionKind::ReStatic);
         let empty_tys = create_tys(&[]);
         let unit = create_ty(TyKind::Tuple(empty_tys));
+        let bool = create_ty(TyKind::Bool);
         let u8 = create_ty(TyKind::Uint(rustc_ast_ir::UintTy::U8));
         let u8_slice = create_ty(TyKind::Slice(u8));
         let static_u8_slice = create_ty(TyKind::Ref(statik, u8_slice, Mutability::Not));
+        let empty_consts = create_consts(&[]);
+        let valtree_zst = create_valtree(ValTreeKind::Branch(empty_consts));
         DefaultAny {
             types: DefaultTypes {
                 usize: create_ty(TyKind::Uint(rustc_ast_ir::UintTy::Usize)),
@@ -269,7 +283,7 @@ pub fn default_types<'db>() -> &'db DefaultAny<'db> {
                 f64: create_ty(TyKind::Float(rustc_ast_ir::FloatTy::F64)),
                 f128: create_ty(TyKind::Float(rustc_ast_ir::FloatTy::F128)),
                 unit,
-                bool: create_ty(TyKind::Bool),
+                bool,
                 char: create_ty(TyKind::Char),
                 str,
                 never: create_ty(TyKind::Never),
@@ -289,6 +303,16 @@ pub fn default_types<'db>() -> &'db DefaultAny<'db> {
                         value: ValTree::new(ValTreeKind::Leaf(ScalarInt::from(u8_value as u8))),
                     }))
                 }),
+                unit: create_const(ConstKind::Value(ValueConst { ty: unit, value: valtree_zst })),
+                true_: create_const(ConstKind::Value(ValueConst {
+                    ty: bool,
+                    value: create_valtree(ValTreeKind::Leaf(ScalarInt::TRUE)),
+                })),
+                false_: create_const(ConstKind::Value(ValueConst {
+                    ty: bool,
+                    value: create_valtree(ValTreeKind::Leaf(ScalarInt::FALSE)),
+                })),
+                valtree_zst,
             },
             regions: DefaultRegions {
                 error: create_region(RegionKind::ReError(ErrorGuaranteed)),
@@ -307,7 +331,7 @@ pub fn default_types<'db>() -> &'db DefaultAny<'db> {
                 bound_existential_predicates: create_bound_existential_predicates(&[]),
                 clauses: create_clauses(&[]),
                 region_assumptions: create_region_assumptions(&[]),
-                consts: create_consts(&[]),
+                consts: empty_consts,
                 projection: create_projection(&[]),
             },
             one_invariant: create_variances_of(&[rustc_type_ir::Variance::Invariant]),

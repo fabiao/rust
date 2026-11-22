@@ -411,7 +411,7 @@ impl<'a, 'tcx> Visitor<'a, 'tcx> for UnsafetyVisitor<'a, 'tcx> {
             }
             ExprKind::Call { fun, ty: _, args: _, from_hir_call: _, fn_span: _ } => {
                 let fn_ty = self.thir[fun].ty;
-                let sig = fn_ty.fn_sig(self.tcx);
+                let safety = fn_ty.fn_sig_safety(self.tcx);
                 let (callee_features, safe_target_features): (&[_], _) = match *fn_ty.kind() {
                     ty::FnDef(func_id, ..) => {
                         let cg_attrs = self.tcx.codegen_fn_attrs(func_id);
@@ -419,7 +419,7 @@ impl<'a, 'tcx> Visitor<'a, 'tcx> for UnsafetyVisitor<'a, 'tcx> {
                     }
                     _ => (&[], false),
                 };
-                if sig.safety().is_unsafe() && !safe_target_features {
+                if safety.is_unsafe() && !safe_target_features {
                     let func_id = if let ty::FnDef(func_id, _) = fn_ty.kind() {
                         Some(*func_id)
                     } else {
@@ -1091,7 +1091,7 @@ pub(crate) fn check_unsafety(tcx: TyCtxt<'_>, def: LocalDefId) {
         body_target_features,
         assignment_info: None,
         in_union_destructure: false,
-        typing_env: ty::TypingEnv::post_typeck_until_borrowck_for_mir_build(tcx, def),
+        typing_env: ty::TypingEnv::post_typeck_through_borrowck_for_mir_build(tcx, def),
         inside_adt: false,
         warnings: &mut warnings,
         suggest_unsafe_block: true,

@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use std::{debug_assert_matches, iter};
 
 use itertools::{EitherOrBoth, Itertools};
-use rustc_abi::ExternAbi;
 use rustc_attr_ir::lang_items::{self, LangItem};
 use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::codes::*;
@@ -24,7 +23,6 @@ use rustc_infer::traits::ImplSource;
 use rustc_middle::middle::privacy::Level;
 use rustc_middle::traits::IsConstable;
 use rustc_middle::ty::adjustment::{Adjust, DerefAdjustKind};
-use rustc_middle::ty::consts::ConstExt;
 use rustc_middle::ty::error::TypeError;
 use rustc_middle::ty::print::{
     PrintPolyTraitClauseExt as _, PrintPolyTraitRefExt, PrintTraitClauseExt as _,
@@ -32,9 +30,10 @@ use rustc_middle::ty::print::{
     with_types_for_suggestion,
 };
 use rustc_middle::ty::{
-    self, AdtKind, GenericArgs, InferTy, IsSuggestable, Ty, TyCtxt, TypeFoldable, TypeFolder,
-    TypeSuperFoldable, TypeSuperVisitable, TypeVisitableExt, TypeVisitor, TypeckResults,
-    Unnormalized, Upcast, suggest_arbitrary_trait_bound, suggest_constraining_type_param,
+    self, AdtKind, CallerBoundsIterator, GenericArgs, InferTy, IsSuggestable, Ty, TyCtxt,
+    TypeFoldable, TypeFolder, TypeSuperFoldable, TypeSuperVisitable, TypeVisitableExt, TypeVisitor,
+    TypeckResults, Unnormalized, Upcast, suggest_arbitrary_trait_bound,
+    suggest_constraining_type_param,
 };
 use rustc_span::def_id::LocalDefId;
 use rustc_span::{
@@ -363,7 +362,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 .unwrap_or_else(|| self.tcx.def_span(field_def.did));
 
             if field_def.vis.is_accessible_from(def_scope, self.tcx) {
-                let accessible_field_ty = field_def.ty(self.tcx, args).skip_norm_wip();
+                let accessible_field_ty = field_def.ty(self.tcx, *args).skip_norm_wip();
                 if let Some((private_base_ty, private_field_ty, private_field_span)) =
                     private_candidate
                     && !self.can_eq(param_env, private_field_ty, accessible_field_ty)
@@ -455,7 +454,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
 
             private_candidate.get_or_insert((
                 deref_base_ty,
-                field_def.ty(self.tcx, args).skip_norm_wip(),
+                field_def.ty(self.tcx, *args).skip_norm_wip(),
                 field_span,
             ));
         }
@@ -610,7 +609,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     // this that we do in `suggest_restriction` and pull the
                     // `impl Trait` into a new generic if it shows up somewhere
                     // else in the predicate.
-                    if !trait_pred.skip_binder().trait_ref.args[1..]
+                    if !trait_pred.skip_binder().trait_ref.args.as_slice()[1..]
                         .iter()
                         .all(|g| g.is_suggestable(self.tcx, false))
                     {
@@ -869,8 +868,11 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                                     self.tcx,
                                     inner.trait_ref.def_id,
                                     self.tcx.mk_args(
-                                        &[&[l_ty.into(), r_ty.into()], &inner.trait_ref.args[2..]]
-                                            .concat(),
+                                        &[
+                                            &[l_ty.into(), r_ty.into()],
+                                            &inner.trait_ref.args.as_slice()[2..],
+                                        ]
+                                        .concat(),
                                     ),
                                 ),
                                 ..inner
@@ -1574,7 +1576,8 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     } else {
                         DefIdOrName::Name("type parameter")
                     };
-                    param_env.caller_bounds().find_map(|clause| {
+
+                    param_env.caller_bounds().non_trait_clauses().iter().find_map(|clause| {
                         if let ty::ClauseKind::Projection(proj) = clause.kind().skip_binder()
                             && self
                                 .tcx
@@ -3893,6 +3896,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 );
             }
         };
+
         match *cause_code {
             ObligationCauseCode::ExprAssignable
             | ObligationCauseCode::MatchExpressionArm { .. }
@@ -3917,6 +3921,8 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             | ObligationCauseCode::AscribeUserTypeProvePredicate(..)
             | ObligationCauseCode::AlwaysApplicableImpl
             | ObligationCauseCode::ConstParam(_)
+            | ObligationCauseCode::ConstItemTy(_)
+            | ObligationCauseCode::ReturnType
             | ObligationCauseCode::ReferenceOutlivesReferent(..)
             | ObligationCauseCode::ObjectTypeBound(..) => {}
             ObligationCauseCode::BinOp { lhs_hir_id, rhs_hir_id, .. } => {
@@ -3939,7 +3945,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             ObligationCauseCode::SliceOrArrayElem => {
                 err.note("slice and array elements must have `Sized` type");
             }
-            ObligationCauseCode::ArrayLen(array_ty) => {
+            ObligationCauseCode::ArrayLen(array_ty, _) => {
                 err.note(format!("the length of array `{array_ty}` must be type `usize`"));
             }
             ObligationCauseCode::TupleElem => {
@@ -4031,6 +4037,13 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                                     && !bounds.iter()
                                         .filter_map(|bound| bound.trait_ref())
                                         .any(|tr| tr.trait_def_id().is_some_and(|def_id| tcx.is_lang_item(def_id, LangItem::Sized)))
+                                    // Only suggest relaxing the implicit `Sized` restriction if the
+                                    // failing obligation is that restriction. Relaxing it cannot
+                                    // satisfy an explicit where clause of the item, e.g.
+                                    // `type Assoc where Self: Sized;`.
+                                    && !generics.predicates.iter().any(|pred| {
+                                        pred.kind.in_where_clause() && pred.span.contains(span)
+                                    })
                                 {
                                     let (span, separator) = if let [.., last] = bounds {
                                         (last.span().shrink_to_hi(), " +")
@@ -4325,7 +4338,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     err.help("unsized fn params are gated as an unstable feature");
                 }
             }
-            ObligationCauseCode::SizedReturnType | ObligationCauseCode::SizedCallReturnType => {
+            ObligationCauseCode::SizedReturnType | ObligationCauseCode::SizedCallReturnType(_) => {
                 err.note("the return type of a function must have a statically known size");
             }
             ObligationCauseCode::SizedYieldType => {
@@ -4731,7 +4744,12 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                         );
                     }
                     _ => {
-                        err.note(msg);
+                        // If the `parent_trait_pred` is about `CoerceUnsized`, it's generated
+                        // internally by the next solver and should not be reported as a note
+                        // because the user won't know what we're talking about.
+                        if !tcx.is_lang_item(parent_trait_pred.def_id(), LangItem::CoerceUnsized) {
+                            err.note(msg);
+                        }
                     }
                 };
 
@@ -4974,8 +4992,10 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                         .as_ref()
                         .and_then(|typeck| typeck.node_type_opt(expr.hir_id))
                     && let Some(pred) = predicate.as_clause()
-                    && let ty::ClauseKind::Trait(pred) = pred.kind().skip_binder()
-                    && self.can_eq(param_env, pred.self_ty(), expr_ty)
+                    && let Some(pred) = pred.as_trait_clause()
+                    && self
+                        .infcx
+                        .enter_forall(pred, |pred| self.can_eq(param_env, pred.self_ty(), expr_ty))
                 {
                     (expr_ty, expr)
                 } else {
@@ -5142,7 +5162,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
         is_derivable_trait &&
             // Ensure all fields impl the trait.
             adt.all_fields().all(|field| {
-                let field_ty = ty::GenericArg::from(field.ty(self.tcx, args).skip_norm_wip());
+                let field_ty = ty::GenericArg::from(field.ty(self.tcx, *args).skip_norm_wip());
                 let trait_args = match diagnostic_name {
                     sym::PartialEq | sym::PartialOrd => {
                         Some(field_ty)
@@ -5514,13 +5534,9 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             && tcx.is_fn_trait(trait_ref.def_id)
             && let [self_ty, found_ty] = trait_ref.args.as_slice()
             && let Some(fn_ty) = self_ty.as_type().filter(|ty| ty.is_fn())
-            && let fn_sig @ ty::FnSig {
-                ..
-            } = fn_ty.fn_sig(tcx).skip_binder()
+            && let fn_sig = fn_ty.fn_sig(tcx).skip_binder()
             // FIXME(splat): this might need to change if the Fn* traits start using/supporting splat
-            && fn_sig.abi() == ExternAbi::Rust
-            && !fn_sig.c_variadic()
-            && fn_sig.safety() == hir::Safety::Safe
+            && fn_sig.is_fn_trait_compatible()
 
             // Extract first param of fn sig with peeled refs, e.g. `fn(&T)` -> `T`
             && let Some(&ty::Ref(_, target_ty, needs_mut)) = fn_sig.inputs().first().map(|t| t.kind())
@@ -5961,7 +5977,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
     ///    |     | `Iterator::Item` is `&mut Vec<u8>` here
     ///    |     this expression has type `Vec<Vec<u8>>`
     /// ```
-    fn point_at_chain_in_return_position(
+    pub fn point_at_chain_in_return_position(
         &self,
         body_def_id: LocalDefId,
         expr: &hir::Expr<'_>,
@@ -6337,8 +6353,10 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
         let Some(fn_def_id) = fn_def_id.as_local() else {
             // If it's not local, we can at least mention that the method is async, if it is.
             if self.tcx.asyncness(fn_def_id).is_async() {
+                let mut span: MultiSpan = self.tcx.def_span(fn_def_id).into();
+                span.push_span_context(self.tcx.def_span(self.tcx.parent(fn_def_id)));
                 err.span_note(
-                    self.tcx.def_span(fn_def_id),
+                    span,
                     format!(
                         "`{}::{}` is an `async fn` in trait, which does not \
                     automatically imply that its future is `{auto_trait}`",
@@ -6778,7 +6796,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     tcx,
                     ObligationCause::dummy(),
                     param_env,
-                    ty::TraitRef::new(tcx, trait_def_id, trait_args),
+                    parent_trait_pred.rebind(ty::TraitRef::new(tcx, trait_def_id, trait_args)),
                 );
                 self.predicate_may_hold(&obligation)
             })

@@ -15,8 +15,8 @@ use super::ty::{AllowPlus, RecoverQPath, RecoverReturnSign};
 use super::{Parser, Restrictions, TokenType};
 use crate::ast::{PatKind, TyKind};
 use crate::diagnostics::{
-    self, ConstGenericWithoutBraces, ConstGenericWithoutBracesSugg, PathFoundAttributeInParams,
-    PathFoundCVariadicParams, PathSingleColon, PathTripleColon,
+    self, ConstGenericWithoutBraces, ConstGenericWithoutBracesSugg, PathSingleColon,
+    PathTripleColon,
 };
 use crate::exp;
 use crate::parser::{CommaRecoveryMode, Expr, FnContext, FnParseMode, RecoverColon, RecoverComma};
@@ -74,8 +74,9 @@ impl<'a> Parser<'a> {
     /// `<T as U>::F::a<S>` (without disambiguator)
     /// `<T as U>::F::a::<S>` (with disambiguator)
     pub(super) fn parse_qpath(&mut self, style: PathStyle) -> PResult<'a, (Box<QSelf>, Path)> {
-        let lo = self.prev_token.span;
+        let mut qpath_span = Some(self.prev_token.span);
         let ty = self.parse_ty()?;
+        chain_span(&mut qpath_span, ty.span);
 
         // `path` will contain the prefix of the path up to the `>`,
         // if any (e.g., `U` in the `<T as U>::*` examples
@@ -83,16 +84,18 @@ impl<'a> Parser<'a> {
         // span in the case of something like `<T>::Bar`.
         let (mut path, path_span);
         if self.eat_keyword(exp!(As)) {
-            let path_lo = self.token.span;
+            chain_span(&mut qpath_span, self.prev_token.span);
             path = self.parse_path(PathStyle::Type)?;
-            path_span = path_lo.to(self.prev_token.span);
+            path_span = path.span;
+            chain_span(&mut qpath_span, path_span);
         } else {
-            path_span = self.token.span.to(self.token.span);
+            path_span = self.token.span; // `>`
             path = ast::Path { segments: ThinVec::new(), span: path_span };
         }
 
         // See doc comment for `unmatched_angle_bracket_count`.
         self.expect(exp!(Gt))?;
+        chain_span(&mut qpath_span, self.prev_token.span);
         if self.unmatched_angle_bracket_count > 0 {
             self.unmatched_angle_bracket_count -= 1;
             debug!("parse_qpath: (decrement) count={:?}", self.unmatched_angle_bracket_count);
@@ -105,10 +108,16 @@ impl<'a> Parser<'a> {
 
         let qself = Box::new(QSelf { ty, path_span, position: path.segments.len() });
         if !is_import_coupler {
-            self.parse_path_segments(&mut path.segments, style, None)?;
+            chain_span(&mut qpath_span, self.prev_token.span); // `::`
+            self.parse_path_segments_with_path_span(
+                &mut path.segments,
+                style,
+                None,
+                &mut qpath_span,
+            )?;
         }
 
-        Ok((qself, Path { segments: path.segments, span: lo.to(self.prev_token.span) }))
+        Ok((qself, Path { segments: path.segments, span: qpath_span.unwrap() }))
     }
 
     /// Recover from an invalid single colon, when the user likely meant a qualified path.
@@ -208,13 +217,15 @@ impl<'a> Parser<'a> {
         }
 
         let lo = self.token.span;
+        let mut path_span = None;
         let mut segments = ThinVec::new();
         let mod_sep_ctxt = self.token.span.ctxt();
         if self.eat_path_sep() {
+            chain_span(&mut path_span, self.prev_token.span);
             segments.push(PathSegment::path_root(lo.shrink_to_lo().with_ctxt(mod_sep_ctxt)));
         }
-        self.parse_path_segments(&mut segments, style, ty_generics)?;
-        Ok(Path { segments, span: lo.to(self.prev_token.span) })
+        self.parse_path_segments_with_path_span(&mut segments, style, ty_generics, &mut path_span)?;
+        Ok(Path { segments, span: path_span.unwrap() })
     }
 
     pub(super) fn parse_path_segments(
@@ -223,8 +234,18 @@ impl<'a> Parser<'a> {
         style: PathStyle,
         ty_generics: Option<&Generics>,
     ) -> PResult<'a, ()> {
+        self.parse_path_segments_with_path_span(segments, style, ty_generics, &mut None)
+    }
+
+    fn parse_path_segments_with_path_span(
+        &mut self,
+        segments: &mut ThinVec<PathSegment>,
+        style: PathStyle,
+        ty_generics: Option<&Generics>,
+        path_span: &mut Option<Span>,
+    ) -> PResult<'a, ()> {
         loop {
-            let segment = self.parse_path_segment(style, ty_generics)?;
+            let segment = self.parse_path_segment_with_path_span(style, ty_generics, path_span)?;
             if style.has_generic_ambiguity() {
                 // In order to check for trailing angle brackets, we must have finished
                 // recursing (`parse_path_segment` can indirectly call this function),
@@ -263,6 +284,7 @@ impl<'a> Parser<'a> {
                         && self.look_ahead(1, |token| self.token.span.hi() == token.span.lo())
                     {
                         self.bump(); // bump past the colon
+                        chain_span(path_span, self.prev_token.span);
                         self.dcx().emit_err(PathSingleColon {
                             span: self.prev_token.span,
                             suggestion: self.prev_token.span.shrink_to_hi(),
@@ -273,6 +295,7 @@ impl<'a> Parser<'a> {
 
                 return Ok(());
             }
+            chain_span(path_span, self.prev_token.span); // `::`
         }
     }
 
@@ -293,7 +316,17 @@ impl<'a> Parser<'a> {
         style: PathStyle,
         ty_generics: Option<&Generics>,
     ) -> PResult<'a, PathSegment> {
+        self.parse_path_segment_with_path_span(style, ty_generics, &mut None)
+    }
+
+    fn parse_path_segment_with_path_span(
+        &mut self,
+        style: PathStyle,
+        ty_generics: Option<&Generics>,
+        path_span: &mut Option<Span>,
+    ) -> PResult<'a, PathSegment> {
         let ident = self.parse_path_segment_ident()?;
+        chain_span(path_span, self.prev_token.span);
         let is_args_start = |token: &Token| {
             matches!(token.kind, token::Lt | token::Shl | token::OpenParen | token::LArrow)
         };
@@ -303,9 +336,20 @@ impl<'a> Parser<'a> {
             is_args_start(&this.token)
         };
 
+        // A lifetime followed by `>` or `,` can never start a valid expression, so `<` here
+        // must be the start of generic arguments with a missing `::`.
+        let is_missing_turbofish_for_lifetime = |this: &mut Self| {
+            this.token == token::Lt
+                && this.may_recover()
+                && style == PathStyle::Expr
+                && this.look_ahead(1, |t| t.is_lifetime())
+                && this.look_ahead(2, |t| matches!(t.kind, token::Gt | token::Comma))
+        };
+
         Ok(
             if style == PathStyle::Type && check_args_start(self)
                 || style != PathStyle::Mod && self.check_path_sep_and_look_ahead(is_args_start)
+                || is_missing_turbofish_for_lifetime(self)
             {
                 // We use `style == PathStyle::Expr` to check if this is in a recursion or not. If
                 // it isn't, then we reset the unmatched angle bracket count as we're about to start
@@ -314,12 +358,20 @@ impl<'a> Parser<'a> {
                     self.unmatched_angle_bracket_count = 0;
                 }
 
+                let missing_turbofish =
+                    style == PathStyle::Expr && !self.check_path_sep_and_look_ahead(is_args_start);
+
                 // Generic arguments are found - `<`, `(`, `::<` or `::(`.
                 // First, eat `::` if it exists.
-                let _ = self.eat_path_sep();
+                if self.eat_path_sep() {
+                    chain_span(path_span, self.prev_token.span);
+                }
 
                 let lo = self.token.span;
                 let args = if self.eat_lt() {
+                    if missing_turbofish {
+                        self.recover_missing_turbofish_for_lifetimes(lo);
+                    }
                     // `<'a, T, A = U>`
                     let args = self.parse_angle_args_with_leading_angle_bracket_recovery(
                         style,
@@ -395,7 +447,6 @@ impl<'a> Parser<'a> {
                         snapshot = Some(self.create_snapshot_for_diagnostic());
                     }
 
-                    let dcx = self.dcx();
                     let mut first_param = true;
                     let parse_params_result = self.parse_paren_comma_seq(|p| {
                         // Inside parenthesized type arguments, we want types only, not names.
@@ -403,6 +454,7 @@ impl<'a> Parser<'a> {
                             context: FnContext::ParenthesizedArgumentList,
                             req_name: |_, _| false,
                             req_body: false,
+                            allow_const_params: false,
                         };
                         let param = p.parse_param_general(&mode, first_param)?;
                         first_param = false;
@@ -412,10 +464,14 @@ impl<'a> Parser<'a> {
                                 .gate(sym::named_fn_trait_parameters, param.pat.span);
                         }
                         if matches!(param.ty.kind, TyKind::CVarArgs) {
-                            dcx.emit_err(PathFoundCVariadicParams { span: param.pat.span });
+                            self.psess
+                                .gated_spans
+                                .gate(sym::named_fn_trait_parameters, param.ty.span);
                         }
                         if !param.attrs.is_empty() {
-                            dcx.emit_err(PathFoundAttributeInParams { span: param.attrs[0].span });
+                            self.psess
+                                .gated_spans
+                                .gate(sym::named_fn_trait_parameters, param.attrs[0].span);
                         }
                         Ok(param)
                     });
@@ -441,11 +497,18 @@ impl<'a> Parser<'a> {
                         Err(error) => return Err(error),
                     };
                     let inputs_span = lo.to(self.prev_token.span);
+                    let mut span = inputs_span;
+                    if self.token == token::RArrow {
+                        span = span.to(self.token.span);
+                    }
                     let output =
                         self.parse_ret_ty(AllowPlus::No, RecoverQPath::No, RecoverReturnSign::No)?;
-                    let span = ident.span.to(self.prev_token.span);
+                    if let ast::FnRetTy::Ty(ret_ty) = &output {
+                        span = span.to(ret_ty.span);
+                    }
                     ParenthesizedArgs { span, inputs, inputs_span, output }.into()
                 };
+                chain_span(path_span, args.span());
 
                 PathSegment { ident, args: Some(args), id: ast::DUMMY_NODE_ID }
             } else {
@@ -998,4 +1061,9 @@ impl<'a> Parser<'a> {
         }
         Err(())
     }
+}
+
+/// Chains `span` into `node_span`.
+fn chain_span(node_span: &mut Option<Span>, span: Span) {
+    *node_span = Some(node_span.map_or(span, |s| s.to(span)));
 }

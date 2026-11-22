@@ -44,6 +44,7 @@ pub(super) const ITEM_RECOVERY_SET: TokenSet = TokenSet::new(&[
     T![macro],
     T![;],
 ]);
+const ITEM_PAREN_RECOVERY_SET: TokenSet = ITEM_RECOVERY_SET.union(TokenSet::new(&[T!['(']]));
 
 pub(super) fn item_or_macro(p: &mut Parser<'_>, stop_on_r_curly: bool, is_in_extern: bool) {
     let m = p.start();
@@ -135,6 +136,14 @@ pub(super) fn opt_item(p: &mut Parser<'_>, m: Marker, is_in_extern: bool) -> Res
             p.error("expected an impl restriction");
         }
         m.complete(p, IMPL_RESTRICTION);
+        has_mods = true;
+    }
+
+    // test final_assoc_fn
+    // trait Trait {
+    //     final fn f() {}
+    // }
+    if p.eat(T![final]) {
         has_mods = true;
     }
 
@@ -284,16 +293,9 @@ fn opt_item_without_modifiers(p: &mut Parser<'_>, m: Marker) -> Result<(), Marke
         T![const] if (la == IDENT || la == T![_] || la == T![mut]) => consts::konst(p, m),
         T![static] if (la == IDENT || la == T![_] || la == T![mut]) => consts::static_(p, m),
 
-        IDENT
-            if p.at_contextual_kw(T![builtin])
-                && p.nth_at(1, T![#])
-                && p.nth_at_contextual_kw(2, T![global_asm]) =>
-        {
-            p.bump_remap(T![builtin]);
-            p.bump(T![#]);
-            p.bump_remap(T![global_asm]);
+        _ if p.eat_builtin_kw(T![global_asm]) => {
             // test global_asm
-            // builtin#global_asm("")
+            // k#global_asm("")
             expressions::parse_asm_expr(p, m);
         }
 
@@ -432,7 +434,9 @@ fn macro_def(p: &mut Parser<'_>, m: Marker) {
 fn fn_(p: &mut Parser<'_>, m: Marker) {
     p.bump(T![fn]);
 
-    name_r(p, ITEM_RECOVERY_SET);
+    // test_err function_missing_name
+    // fn () {}
+    name_r(p, ITEM_PAREN_RECOVERY_SET);
     // test function_type_params
     // fn foo<T: Clone + Copy>(){}
     generic_params::opt_generic_param_list(p);

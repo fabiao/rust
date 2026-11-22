@@ -17,7 +17,7 @@ use itertools::{Either, Itertools};
 use stdx::never;
 use syntax::{
     SmolStr,
-    SyntaxKind::{CLOSURE_EXPR, EXPR_STMT, MATCH_ARM, STMT_LIST},
+    SyntaxKind::{CLOSURE_EXPR, MATCH_ARM},
     T, TextRange, TextSize, ToSmolStr,
     ast::{self, AstNode, AstToken},
     format_smolstr, match_ast,
@@ -118,7 +118,7 @@ pub(crate) fn complete_postfix(
     postfix_snippet("call", "function(expr)", format!("${{1}}({receiver_text})"))
         .add_to(acc, ctx.db);
 
-    if let Some(expected_ty) = ctx.expected_type.as_ref()
+    if let Some(expected_ty) = ctx.expected.ty.as_ref()
         && let Some(adt) = expected_ty.as_adt()
     {
         let is_valid_new = expected_ty
@@ -189,7 +189,7 @@ pub(crate) fn complete_postfix(
                 postfix_snippet("let", "let", format!("let $1 = {receiver_text}"))
                     .add_to(acc, ctx.db);
             }
-            _ if matches!(parent.kind(), STMT_LIST | EXPR_STMT) => {
+            _ if expr_ctx.in_block_expr => {
                 postfix_snippet("let", "let", format!("let $0 = {receiver_text}{semi}"))
                     .add_to(acc, ctx.db);
                 postfix_snippet("letm", "let mut", format!("let mut $0 = {receiver_text}{semi}"))
@@ -305,13 +305,11 @@ pub(crate) fn complete_postfix(
                 format!("while {receiver_text} {{\n    $0\n}}"),
             )
             .add_to(acc, ctx.db);
-        } else if let Some(trait_) = ctx.famous_defs().core_iter_IntoIterator()
-            && receiver_ty.impls_trait(ctx.db, trait_, &[])
-        {
+        } else if let Some(extra) = seems_impls_into_iterator(ctx, receiver_ty, &prefix) {
             postfix_snippet(
                 "for",
                 "for ele in expr {}",
-                format!("for ele in {receiver_text} {{\n    $0\n}}"),
+                format!("for ele in {extra}{receiver_text} {{\n    $0\n}}"),
             )
             .add_to(acc, ctx.db);
         }
@@ -545,6 +543,31 @@ fn add_custom_postfix_completions(
     None
 }
 
+/// Heuristic: roughly check for existing/needs references prefix
+fn seems_impls_into_iterator(
+    ctx: &CompletionContext<'_, '_>,
+    receiver_ty: &hir::Type<'_>,
+    prefix: &str,
+) -> Option<&'static str> {
+    let trait_ = ctx.famous_defs().core_iter_IntoIterator()?;
+
+    if receiver_ty.impls_trait(ctx.db, trait_, &[]) {
+        return Some("");
+    }
+    let mutability = hir::Mutability::from_mutable(prefix.starts_with("&mut"));
+    let added_ref = receiver_ty.add_reference(ctx.db, mutability);
+
+    if !added_ref.impls_trait(ctx.db, trait_, &[]) {
+        return None;
+    }
+
+    match (prefix.starts_with('&'), mutability) {
+        (true, _) => Some(""),
+        (false, hir::Mutability::Shared) => Some("&"),
+        (false, hir::Mutability::Mut) => Some("&mut "),
+    }
+}
+
 pub(crate) fn is_in_condition(it: &ast::Expr) -> bool {
     it.syntax()
         .parent()
@@ -771,6 +794,38 @@ fn main() {
                 sn unsafe    unsafe {}
                 sn while while expr {}
             "#]],
+        );
+
+        check_edit(
+            "let",
+            r#"
+fn foo() -> (i32, i32) {
+    "a".let$0
+    (2, 3).clone()
+}
+"#,
+            r#"
+fn foo() -> (i32, i32) {
+    let $0 = "a";
+    (2, 3).clone()
+}
+"#,
+        );
+
+        check_edit(
+            "let",
+            r#"
+fn foo() -> (i32, i32) {
+    "a".l$0
+    (2, 3).clone()
+}
+"#,
+            r#"
+fn foo() -> (i32, i32) {
+    let $0 = "a";
+    (2, 3).clone()
+}
+"#,
         );
     }
 
@@ -1466,6 +1521,40 @@ fn main() {
             "loge",
             r#"fn main() { "{2+2}".$0 }"#,
             r#"fn main() { log::error!("{}", 2+2); }"#,
+        );
+    }
+
+    #[test]
+    fn postfix_completion_for_for_loop() {
+        check_edit(
+            "for",
+            r#"
+//- minicore: iterator
+fn main() { [2].$0 }"#,
+            r#"
+fn main() { for ele in [2] {
+    $0
+} }"#,
+        );
+        check_edit(
+            "for",
+            r#"
+//- minicore: iterator, index, slice
+fn main() { &[2][..].$0 }"#,
+            r#"
+fn main() { for ele in &[2][..] {
+    $0
+} }"#,
+        );
+        check_edit(
+            "for",
+            r#"
+//- minicore: iterator, index, slice
+fn main() { [2][..].$0 }"#,
+            r#"
+fn main() { for ele in &[2][..] {
+    $0
+} }"#,
         );
     }
 

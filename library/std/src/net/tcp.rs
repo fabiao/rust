@@ -605,6 +605,46 @@ impl TcpStream {
         self.0.ttl()
     }
 
+    /// Sets the value for the `IPV6_UNICAST_HOPS` option on this socket.
+    ///
+    /// This value sets the unicast hop limit field that is used in every packet
+    /// sent from this socket.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// #![feature(ipv6_hop_limit)]
+    /// use std::net::TcpStream;
+    ///
+    /// let stream = TcpStream::connect("[::1]:12345")
+    ///     .expect("Couldn't connect to the server...");
+    /// stream.set_hop_limit_v6(88).expect("set_hop_limit_v6 call failed");
+    /// ```
+    #[unstable(feature = "ipv6_hop_limit", issue = "139166")]
+    pub fn set_hop_limit_v6(&self, limit: u8) -> io::Result<()> {
+        self.0.set_hop_limit_v6(limit)
+    }
+
+    /// Gets the value of the `IPV6_UNICAST_HOPS` option on this socket.
+    ///
+    /// For more information about this option, see [`TcpStream::set_hop_limit_v6`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// #![feature(ipv6_hop_limit)]
+    /// use std::net::TcpStream;
+    ///
+    /// let stream = TcpStream::connect("[::1]:12345")
+    ///     .expect("Couldn't connect to the server...");
+    /// stream.set_hop_limit_v6(88).expect("set_hop_limit_v6 call failed");
+    /// assert_eq!(stream.hop_limit_v6().unwrap(), 88);
+    /// ```
+    #[unstable(feature = "ipv6_hop_limit", issue = "139166")]
+    pub fn hop_limit_v6(&self) -> io::Result<u8> {
+        self.0.hop_limit_v6()
+    }
+
     /// Gets the value of the `SO_ERROR` option on this socket.
     ///
     /// This will retrieve the stored error in the underlying socket, clearing
@@ -913,9 +953,9 @@ impl TcpListener {
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
-        // On WASM, `TcpStream` is uninhabited (as it's unsupported) and so
-        // the `a` variable here is technically unused.
-        #[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
+        // On wasm*-unknown-unknown, `TcpStream` is uninhabited (as it's
+        // unsupported) and so the `a` variable here is technically unused.
+        #[cfg_attr(all(target_family = "wasm", target_os = "unknown"), allow(unused_variables))]
         self.0.accept().map(|(a, b)| (TcpStream(a), b))
     }
 
@@ -1032,16 +1072,58 @@ impl TcpListener {
         self.0.ttl()
     }
 
+    /// Sets the value for the `IPV6_UNICAST_HOPS` option on this socket.
+    ///
+    /// This value sets the unicast hop limit field that is used in every packet
+    /// sent from this socket.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// #![feature(ipv6_hop_limit)]
+    /// use std::net::TcpListener;
+    ///
+    /// let listener = TcpListener::bind("[::1]:12345").unwrap();
+    /// listener.set_hop_limit_v6(88).expect("set_hop_limit_v6 call failed");
+    /// ```
+    #[unstable(feature = "ipv6_hop_limit", issue = "139166")]
+    pub fn set_hop_limit_v6(&self, limit: u8) -> io::Result<()> {
+        self.0.set_hop_limit_v6(limit)
+    }
+
+    /// Gets the value of the `IPV6_UNICAST_HOPS` option on this socket.
+    ///
+    /// For more information about this option, see [`TcpListener::set_hop_limit_v6`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// #![feature(ipv6_hop_limit)]
+    /// use std::net::TcpListener;
+    ///
+    /// let listener = TcpListener::bind("[::1]:12345").unwrap();
+    /// listener.set_hop_limit_v6(88).expect("set_hop_limit_v6 call failed");
+    /// assert_eq!(listener.hop_limit_v6().unwrap(), 88);
+    /// ```
+    #[unstable(feature = "ipv6_hop_limit", issue = "139166")]
+    pub fn hop_limit_v6(&self) -> io::Result<u8> {
+        self.0.hop_limit_v6()
+    }
+
+    /// Only allow v6 for this socket.
+    ///
+    /// ⚠️: This option can only be set before the socket is bound.
     #[stable(feature = "net2_mutators", since = "1.9.0")]
     #[deprecated(since = "1.16.0", note = "this option can only be set before the socket is bound")]
-    #[allow(missing_docs)]
     pub fn set_only_v6(&self, only_v6: bool) -> io::Result<()> {
         self.0.set_only_v6(only_v6)
     }
 
+    /// Checks if this socket only allow v6.
+    ///
+    /// ⚠️: This option can only be set before the socket is bound.
     #[stable(feature = "net2_mutators", since = "1.9.0")]
     #[deprecated(since = "1.16.0", note = "this option can only be set before the socket is bound")]
-    #[allow(missing_docs)]
     pub fn only_v6(&self) -> io::Result<bool> {
         self.0.only_v6()
     }

@@ -136,7 +136,38 @@ fn in_item_list_after_inner_attr() {
             sn tfn (Test function)
             sn tmod (Test module)
         "#]],
-    )
+    );
+    check_with_base_items(
+        r#"//! doc
+        $0"#,
+        expect![[r#"
+            ma makro!(…) macro_rules! makro
+            md module::
+            kw async
+            kw const
+            kw crate::
+            kw enum
+            kw extern
+            kw fn
+            kw impl
+            kw impl for
+            kw mod
+            kw pub
+            kw pub(crate)
+            kw pub(super)
+            kw self::
+            kw static
+            kw struct
+            kw trait
+            kw type
+            kw union
+            kw unsafe
+            kw use
+            sn macro_rules
+            sn tfn (Test function)
+            sn tmod (Test module)
+        "#]],
+    );
 }
 
 #[test]
@@ -161,6 +192,38 @@ fn after_unsafe_token() {
             kw impl
             kw impl for
             kw trait
+        "#]],
+    );
+}
+
+#[test]
+fn after_const_token() {
+    check_with_base_items(
+        r#"const $0"#,
+        expect![[r#"
+            kw fn
+            kw unsafe
+        "#]],
+    );
+    check_with_base_items(
+        r#"const f$0"#,
+        expect![[r#"
+            kw fn
+            kw unsafe
+        "#]],
+    );
+    check_with_base_items(
+        r#"const $0fn f() {}"#,
+        expect![[r#"
+            kw fn
+            kw unsafe
+        "#]],
+    );
+    check_with_base_items(
+        r#"fn main(){ const $0 }"#,
+        expect![[r#"
+            kw fn
+            kw unsafe
         "#]],
     );
 }

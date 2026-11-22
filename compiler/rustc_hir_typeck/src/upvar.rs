@@ -1824,7 +1824,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             })
                             .collect();
 
-                        let after_field_ty = field.ty(self.tcx, args).skip_norm_wip();
+                        let after_field_ty = field.ty(self.tcx, *args).skip_norm_wip();
                         self.has_significant_drop_outside_of_captures(
                             closure_def_id,
                             closure_span,
@@ -1867,7 +1867,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             }
 
             // Anything else would be completely captured and therefore handled already.
-            _ => unreachable!(),
+            _ => unreachable!("unexpected base_path_ty: {base_path_ty:?}",),
         }
     }
 
@@ -2642,19 +2642,16 @@ fn truncate_place_to_len_and_update_capture_kind<'tcx>(
     // Note that if the place contained Deref of a raw pointer it would've not been MutBorrow, so
     // we don't need to worry about that case here.
     match curr_mode {
-        ty::UpvarCapture::ByRef(ty::BorrowKind::Mutable) => {
-            for i in len..place.projections.len() {
-                if place.projections[i].kind == ProjectionKind::Deref
+        ty::UpvarCapture::ByRef(ty::BorrowKind::Mutable)
+            if (len..place.projections.len()).any(|i| {
+                place.projections[i].kind == ProjectionKind::Deref
                     && is_mut_ref(place.ty_before_projection(i))
-                {
-                    *curr_mode = ty::UpvarCapture::ByRef(ty::BorrowKind::UniqueImmutable);
-                    break;
-                }
-            }
+            }) =>
+        {
+            *curr_mode = ty::UpvarCapture::ByRef(ty::BorrowKind::UniqueImmutable);
         }
 
-        ty::UpvarCapture::ByRef(..) => {}
-        ty::UpvarCapture::ByValue | ty::UpvarCapture::ByUse => {}
+        ty::UpvarCapture::ByRef(_) | ty::UpvarCapture::ByValue | ty::UpvarCapture::ByUse => {}
     }
 
     place.projections.truncate(len);

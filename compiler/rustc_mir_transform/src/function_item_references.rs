@@ -2,9 +2,8 @@ use itertools::Itertools;
 use rustc_abi::ExternAbi;
 use rustc_hir::def_id::DefId;
 use rustc_lint_defs::builtin::FUNCTION_ITEM_REFERENCES;
-use rustc_middle::mir::visit::Visitor;
 use rustc_middle::mir::*;
-use rustc_middle::ty::{self, EarlyBinder, GenericArgsRef, Ty, TyCtxt};
+use rustc_middle::ty::{self, CallerBoundsIterator, EarlyBinder, GenericArgs, Ty, TyCtxt};
 use rustc_span::{Span, Spanned, sym};
 
 use crate::diagnostics;
@@ -14,7 +13,9 @@ pub(super) struct FunctionItemReferences;
 impl<'tcx> crate::MirLint<'tcx> for FunctionItemReferences {
     fn run_lint(&self, tcx: TyCtxt<'tcx>, body: &Body<'tcx>) {
         let mut checker = FunctionItemRefChecker { tcx, body };
-        checker.visit_body(body);
+        for bb in body.basic_blocks.iter() {
+            checker.check_terminator(bb.terminator())
+        }
     }
 }
 
@@ -23,11 +24,11 @@ struct FunctionItemRefChecker<'a, 'tcx> {
     body: &'a Body<'tcx>,
 }
 
-impl<'tcx> Visitor<'tcx> for FunctionItemRefChecker<'_, 'tcx> {
+impl<'tcx> FunctionItemRefChecker<'_, 'tcx> {
     /// Emits a lint for function reference arguments bound by `fmt::Pointer` or passed to
     /// `transmute`. This only handles arguments in calls outside macro expansions to avoid double
     /// counting function references formatted as pointers by macros.
-    fn visit_terminator(&mut self, terminator: &Terminator<'tcx>, location: Location) {
+    fn check_terminator(&mut self, terminator: &Terminator<'tcx>) {
         if let TerminatorKind::Call {
             func,
             args,
@@ -38,7 +39,11 @@ impl<'tcx> Visitor<'tcx> for FunctionItemRefChecker<'_, 'tcx> {
             fn_span: _,
         } = &terminator.kind
         {
-            let source_info = *self.body.source_info(location);
+            if args.is_empty() {
+                // This lint is applied to function arguments, we have nothing to check here.
+                return;
+            }
+            let source_info = terminator.source_info;
             let func_ty = func.ty(self.body, self.tcx);
             if let ty::FnDef(def_id, args_ref) = *func_ty.kind() {
                 // Handle calls to `transmute`
@@ -61,48 +66,53 @@ impl<'tcx> Visitor<'tcx> for FunctionItemRefChecker<'_, 'tcx> {
                 }
             }
         }
-        self.super_terminator(terminator, location);
     }
-}
 
-impl<'tcx> FunctionItemRefChecker<'_, 'tcx> {
     /// Emits a lint for function reference arguments bound by `fmt::Pointer` in calls to the
     /// function defined by `def_id` with the generic parameters `args_ref`.
     fn check_bound_args(
         &self,
         def_id: DefId,
-        args_ref: GenericArgsRef<'tcx>,
+        args_ref: GenericArgs<'tcx>,
         args: &[Spanned<Operand<'tcx>>],
         source_info: SourceInfo,
     ) {
-        let param_env = self.tcx.param_env(def_id);
-        let bounds = param_env.caller_bounds();
-        for bound in bounds {
-            if let Some(bound_ty) = self.is_pointer_trait(bound) {
-                // Get the argument types as they appear in the function signature.
-                let arg_defs =
-                    self.tcx.fn_sig(def_id).instantiate_identity().skip_binder().inputs();
-                for (arg_num, arg_def) in arg_defs.iter().enumerate() {
-                    // For all types reachable from the argument type in the fn sig
-                    for inner_ty in arg_def.walk().filter_map(|arg| arg.as_type()) {
-                        // If the inner type matches the type bound by `Pointer`
-                        if inner_ty == bound_ty {
-                            // Do an instantiation using the parameters from the callsite
-                            let instantiated_ty = EarlyBinder::bind(self.tcx, inner_ty)
-                                .instantiate(self.tcx, args_ref)
-                                .skip_norm_wip();
-                            if let Some((fn_id, fn_args)) =
-                                FunctionItemRefChecker::is_fn_ref(instantiated_ty)
-                            {
-                                let mut span = self.nth_arg_span(args, arg_num);
-                                if span.from_expansion() {
-                                    // The operand's ctxt wouldn't display the lint since it's
-                                    // inside a macro so we have to use the callsite's ctxt.
-                                    let callsite_ctxt = span.source_callsite().ctxt();
-                                    span = span.with_ctxt(callsite_ctxt);
-                                }
-                                self.emit_lint(fn_id, fn_args, source_info, span);
+        let param_env: ty::ParamEnv<'tcx> = self.tcx.param_env(def_id);
+        let Some(pointer_trait) = self.tcx.get_diagnostic_item(sym::Pointer) else {
+            return;
+        };
+
+        for bound in param_env
+            .caller_bounds()
+            .trait_clauses(self.tcx)
+            .with_polarity(ty::ClausePolarity::Positive)
+            .for_trait(pointer_trait)
+            .iter()
+        {
+            let bound_ty = bound.self_ty().skip_binder();
+
+            // Get the argument types as they appear in the function signature.
+            let arg_defs = self.tcx.fn_sig(def_id).instantiate_identity().skip_binder().inputs();
+            for (arg_num, arg_def) in arg_defs.iter().enumerate() {
+                // For all types reachable from the argument type in the fn sig
+                for inner_ty in arg_def.walk().filter_map(|arg| arg.as_type()) {
+                    // If the inner type matches the type bound by `Pointer`
+                    if inner_ty == bound_ty {
+                        // Do an instantiation using the parameters from the callsite
+                        let instantiated_ty = EarlyBinder::bind(self.tcx, inner_ty)
+                            .instantiate(self.tcx, args_ref)
+                            .skip_norm_wip();
+                        if let Some((fn_id, fn_args)) =
+                            FunctionItemRefChecker::is_fn_ref(instantiated_ty)
+                        {
+                            let mut span = self.nth_arg_span(args, arg_num);
+                            if span.from_expansion() {
+                                // The operand's ctxt wouldn't display the lint since it's
+                                // inside a macro so we have to use the callsite's ctxt.
+                                let callsite_ctxt = span.source_callsite().ctxt();
+                                span = span.with_ctxt(callsite_ctxt);
                             }
+                            self.emit_lint(fn_id, fn_args, source_info, span);
                         }
                     }
                 }
@@ -110,20 +120,9 @@ impl<'tcx> FunctionItemRefChecker<'_, 'tcx> {
         }
     }
 
-    /// If the given predicate is the trait `fmt::Pointer`, returns the bound parameter type.
-    fn is_pointer_trait(&self, bound: ty::Clause<'tcx>) -> Option<Ty<'tcx>> {
-        if let ty::ClauseKind::Trait(predicate) = bound.kind().skip_binder() {
-            self.tcx
-                .is_diagnostic_item(sym::Pointer, predicate.def_id())
-                .then(|| predicate.trait_ref.self_ty())
-        } else {
-            None
-        }
-    }
-
     /// If a type is a reference or raw pointer to the anonymous type of a function definition,
-    /// returns that function's `DefId` and `GenericArgsRef`.
-    fn is_fn_ref(ty: Ty<'tcx>) -> Option<(DefId, GenericArgsRef<'tcx>)> {
+    /// returns that function's `DefId` and `GenericArgs`.
+    fn is_fn_ref(ty: Ty<'tcx>) -> Option<(DefId, GenericArgs<'tcx>)> {
         let referent_ty = match ty.kind() {
             ty::Ref(_, referent_ty, _) => Some(referent_ty),
             ty::RawPtr(referent_ty, _) => Some(referent_ty),
@@ -147,7 +146,7 @@ impl<'tcx> FunctionItemRefChecker<'_, 'tcx> {
     fn emit_lint(
         &self,
         fn_id: DefId,
-        fn_args: GenericArgsRef<'tcx>,
+        fn_args: GenericArgs<'tcx>,
         source_info: SourceInfo,
         span: Span,
     ) {

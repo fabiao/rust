@@ -508,6 +508,9 @@ impl<'tcx> Stable<'tcx> for ty::TyKind<'tcx> {
             ty::Placeholder(..) | ty::Infer(_) | ty::Error(_) => {
                 unreachable!();
             }
+
+            // FIXME(scrabsha)
+            ty::View(..) => unimplemented!(),
         }
     }
 }
@@ -705,7 +708,7 @@ impl<'tcx> Stable<'tcx> for rustc_middle::ty::GenericParamDefKind {
             ty::GenericParamDefKind::Type { has_default, synthetic } => {
                 GenericParamDefKind::Type { has_default, synthetic }
             }
-            ty::GenericParamDefKind::Const { has_default } => {
+            ty::GenericParamDefKind::Const { has_default, arg_pos: _ } => {
                 GenericParamDefKind::Const { has_default }
             }
         }
@@ -796,6 +799,9 @@ impl<'tcx> Stable<'tcx> for ty::ClauseKind<'tcx> {
             }
             ClauseKind::ConstEvaluatable(const_) => {
                 crate::ty::ClauseKind::ConstEvaluatable(const_.stable(tables, cx))
+            }
+            ClauseKind::CompressedTrait(_) => {
+                unreachable!()
             }
             ClauseKind::HostEffect(..) => {
                 unimplemented!()
@@ -1075,9 +1081,14 @@ impl<'tcx> Stable<'tcx> for ty::AssocKind {
         tables: &mut Tables<'cx, BridgeTys>,
         cx: &CompilerCtxt<'cx, BridgeTys>,
     ) -> Self::T {
-        use crate::ty::{AssocKind, AssocTypeData};
+        use crate::ty::{AssocConstData, AssocKind, AssocTypeData};
         match *self {
-            ty::AssocKind::Const { name, .. } => AssocKind::Const { name: name.to_string() },
+            ty::AssocKind::Const { data, .. } => AssocKind::Const {
+                data: match data {
+                    ty::AssocConstData::Named(name) => AssocConstData::Named(name.to_string()),
+                    ty::AssocConstData::Anonymous => AssocConstData::Anonymous,
+                },
+            },
             ty::AssocKind::Fn { name, has_self } => {
                 AssocKind::Fn { name: name.to_string(), has_self }
             }

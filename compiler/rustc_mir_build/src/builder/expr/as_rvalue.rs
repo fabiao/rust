@@ -8,7 +8,6 @@ use rustc_middle::mir::*;
 use rustc_middle::thir::*;
 use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::cast::{CastTy, mir_cast_kind};
-use rustc_middle::ty::consts::ConstExt;
 use rustc_middle::ty::util::IntTypeExt;
 use rustc_middle::ty::{self, Ty, UpvarArgs};
 use rustc_span::{DUMMY_SP, Span, Spanned, bug};
@@ -31,12 +30,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         block: BasicBlock,
         expr_id: ExprId,
     ) -> BlockAnd<Rvalue<'tcx>> {
-        let local_scope = self.local_scope();
-        self.as_rvalue(
-            block,
-            TempLifetime { temp_lifetime: Some(local_scope), backwards_incompatible: None },
-            expr_id,
-        )
+        self.as_rvalue(block, self.local_temp_lifetime(), expr_id)
     }
 
     /// Compile `expr`, yielding an rvalue.
@@ -348,11 +342,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             ExprKind::Assign { .. } | ExprKind::AssignOp { .. } => {
                 block = this.stmt_expr(block, expr_id, None).into_block();
                 block.and(Rvalue::Use(
-                    Operand::Constant(Box::new(ConstOperand {
-                        span: expr_span,
-                        user_ty: None,
-                        const_: Const::zero_sized(this.tcx.types.unit),
-                    })),
+                    Operand::zero_sized_constant(this.tcx.types.unit, expr_span),
                     WithRetag::Yes,
                 ))
             }
@@ -736,7 +726,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 
     // Helper to get a `-1` value of the appropriate type
     fn neg_1_literal(&mut self, span: Span, ty: Ty<'tcx>) -> Operand<'tcx> {
-        let typing_env = ty::TypingEnv::fully_monomorphized();
+        let typing_env = self.typing_env();
         let size = self.tcx.layout_of(typing_env.as_query_input(ty)).unwrap().size;
         let literal = Const::from_bits(self.tcx, size.unsigned_int_max(), typing_env, ty);
 
@@ -746,7 +736,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     // Helper to get the minimum value of the appropriate type
     fn minval_literal(&mut self, span: Span, ty: Ty<'tcx>) -> Operand<'tcx> {
         assert!(ty.is_signed());
-        let typing_env = ty::TypingEnv::fully_monomorphized();
+        let typing_env = self.typing_env();
         let bits = self.tcx.layout_of(typing_env.as_query_input(ty)).unwrap().size.bits();
         let n = 1 << (bits - 1);
         let literal = Const::from_bits(self.tcx, n, typing_env, ty);

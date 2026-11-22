@@ -1,5 +1,4 @@
 #![feature(rustc_attrs)]
-#![feature(optimize_attribute)]
 #![feature(coverage_attribute)]
 #![feature(custom_test_frameworks)]
 #![allow(unused_attributes)]
@@ -21,7 +20,7 @@
 //~^ ERROR malformed
 #[optimize(size(x, y, z))]
 //~^ ERROR malformed
-//~| ERROR multiple `optimize` attributes
+//~| ERROR duplicate `optimize` attributes
 #[coverage(off = 5)]
 //~^ ERROR malformed
 #[coverage(off(x, y, z))]

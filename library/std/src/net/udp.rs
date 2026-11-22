@@ -155,7 +155,14 @@ impl UdpSocket {
     ///
     /// The function must be called with valid byte array `buf` of sufficient size to
     /// hold the message bytes. If a message is too long to fit in the supplied buffer,
-    /// excess bytes may be discarded.
+    /// only the bytes that fit are copied into `buf`; the excess bytes are not returned
+    /// by this call. The datagram itself is left in the queue in full, so a later call
+    /// to [`UdpSocket::recv_from`] with a large enough buffer still receives the whole
+    /// message.
+    ///
+    /// Whether peeking with a too-small buffer succeeds with a truncated length or
+    /// fails is platform-specific. For example, Windows returns an error
+    /// (`WSAEMSGSIZE`) in this case.
     ///
     /// Successive calls return the same data. This is accomplished by passing
     /// `MSG_PEEK` as a flag to the underlying `recvfrom` system call.
@@ -589,6 +596,82 @@ impl UdpSocket {
         self.0.ttl()
     }
 
+    /// Sets the value for the `IPV6_UNICAST_HOPS` option on this socket.
+    ///
+    /// This value sets the unicast hop limit field that is used in every packet
+    /// sent from this socket.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// #![feature(ipv6_hop_limit)]
+    /// use std::net::UdpSocket;
+    ///
+    /// let socket = UdpSocket::bind("[::1]:12345").expect("couldn't bind to address");
+    /// socket.set_hop_limit_v6(88).expect("set_hop_limit_v6 call failed");
+    /// ```
+    #[unstable(feature = "ipv6_hop_limit", issue = "139166")]
+    pub fn set_hop_limit_v6(&self, limit: u8) -> io::Result<()> {
+        self.0.set_hop_limit_v6(limit)
+    }
+
+    /// Gets the value of the `IPV6_UNICAST_HOPS` option on this socket.
+    ///
+    /// For more information about this option, see [`UdpSocket::set_hop_limit_v6`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// #![feature(ipv6_hop_limit)]
+    /// use std::net::UdpSocket;
+    ///
+    /// let socket = UdpSocket::bind("[::1]:12345").expect("couldn't bind to address");
+    /// socket.set_hop_limit_v6(88).expect("set_hop_limit_v6 call failed");
+    /// assert_eq!(socket.hop_limit_v6().unwrap(), 88);
+    /// ```
+    #[unstable(feature = "ipv6_hop_limit", issue = "139166")]
+    pub fn hop_limit_v6(&self) -> io::Result<u8> {
+        self.0.hop_limit_v6()
+    }
+
+    /// Sets the value for the `IPV6_MULTICAST_HOPS` option on this socket.
+    ///
+    /// This value sets the hop limit field for outgoing multicast packets
+    /// sent from this socket.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// #![feature(ipv6_hop_limit)]
+    /// use std::net::UdpSocket;
+    ///
+    /// let socket = UdpSocket::bind("[::1]:12345").expect("couldn't bind to address");
+    /// socket.set_multicast_hop_limit_v6(88).expect("set_multicast_hop_limit_v6 call failed");
+    /// ```
+    #[unstable(feature = "ipv6_hop_limit", issue = "139166")]
+    pub fn set_multicast_hop_limit_v6(&self, limit: u8) -> io::Result<()> {
+        self.0.set_multicast_hop_limit_v6(limit)
+    }
+
+    /// Gets the value of the `IPV6_MULTICAST_HOPS` option on this socket.
+    ///
+    /// For more information about this option, see [`UdpSocket::set_multicast_hop_limit_v6`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// #![feature(ipv6_hop_limit)]
+    /// use std::net::UdpSocket;
+    ///
+    /// let socket = UdpSocket::bind("[::1]:12345").expect("couldn't bind to address");
+    /// socket.set_multicast_hop_limit_v6(88).expect("set_multicast_hop_limit_v6 call failed");
+    /// assert_eq!(socket.multicast_hop_limit_v6().unwrap(), 88);
+    /// ```
+    #[unstable(feature = "ipv6_hop_limit", issue = "139166")]
+    pub fn multicast_hop_limit_v6(&self) -> io::Result<u8> {
+        self.0.multicast_hop_limit_v6()
+    }
+
     /// Executes an operation of the `IP_ADD_MEMBERSHIP` type.
     ///
     /// This function specifies a new multicast group for this socket to join.
@@ -747,7 +830,14 @@ impl UdpSocket {
     ///
     /// The function must be called with valid byte array `buf` of sufficient size to
     /// hold the message bytes. If a message is too long to fit in the supplied buffer,
-    /// excess bytes may be discarded.
+    /// only the bytes that fit are copied into `buf`; the excess bytes are not returned
+    /// by this call. The datagram itself is left in the queue in full, so a later call
+    /// to [`UdpSocket::recv`] with a large enough buffer still receives the whole
+    /// message.
+    ///
+    /// Whether peeking with a too-small buffer succeeds with a truncated length or
+    /// fails is platform-specific. For example, Windows returns an error
+    /// (`WSAEMSGSIZE`) in this case.
     ///
     /// Successive calls return the same data. This is accomplished by passing
     /// `MSG_PEEK` as a flag to the underlying `recv` system call.

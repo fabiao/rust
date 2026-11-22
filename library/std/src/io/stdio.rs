@@ -95,38 +95,17 @@ const fn stderr_raw() -> StderrRaw {
     StderrRaw(stdio::Stderr::new())
 }
 
-#[cfg(windows)]
-impl StdoutRaw {
-    /// Starts a new lock session: stream state cached per lock session (the
-    /// handle and its console mode) is re-queried at the next write, so that
-    /// changing the process stdio handles (e.g. with `SetStdHandle`) between
-    /// lock sessions keeps working.
-    #[inline]
-    fn refresh(&mut self) {
-        self.0.refresh();
-    }
-}
-
-#[cfg(windows)]
-impl StderrRaw {
-    /// See `StdoutRaw::refresh`.
-    #[inline]
-    fn refresh(&mut self) {
-        self.0.refresh();
-    }
-}
-
 impl Read for StdinRaw {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        handle_ebadf(self.0.read(buf), || Ok(0))
+        self.0.read(buf)
     }
 
     fn read_buf(&mut self, buf: BorrowedCursor<'_, u8>) -> io::Result<()> {
-        handle_ebadf(self.0.read_buf(buf), || Ok(()))
+        self.0.read_buf(buf)
     }
 
     fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
-        handle_ebadf(self.0.read_vectored(bufs), || Ok(0))
+        self.0.read_vectored(bufs)
     }
 
     #[inline]
@@ -138,33 +117,32 @@ impl Read for StdinRaw {
         if buf.is_empty() {
             return Ok(());
         }
-        handle_ebadf(self.0.read_exact(buf), || Err(io::Error::READ_EXACT_EOF))
+        self.0.read_exact(buf)
     }
 
     fn read_buf_exact(&mut self, buf: BorrowedCursor<'_, u8>) -> io::Result<()> {
         if buf.capacity() == 0 {
             return Ok(());
         }
-        handle_ebadf(self.0.read_buf_exact(buf), || Err(io::Error::READ_EXACT_EOF))
+        self.0.read_buf_exact(buf)
     }
 
     fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
-        handle_ebadf(self.0.read_to_end(buf), || Ok(0))
+        self.0.read_to_end(buf)
     }
 
     fn read_to_string(&mut self, buf: &mut String) -> io::Result<usize> {
-        handle_ebadf(self.0.read_to_string(buf), || Ok(0))
+        self.0.read_to_string(buf)
     }
 }
 
 impl Write for StdoutRaw {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        handle_ebadf(self.0.write(buf), || Ok(buf.len()))
+        self.0.write(buf)
     }
 
     fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-        let total = || Ok(bufs.iter().map(|b| b.len()).sum());
-        handle_ebadf(self.0.write_vectored(bufs), total)
+        self.0.write_vectored(bufs)
     }
 
     #[inline]
@@ -173,30 +151,29 @@ impl Write for StdoutRaw {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        handle_ebadf(self.0.flush(), || Ok(()))
+        self.0.flush()
     }
 
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
-        handle_ebadf(self.0.write_all(buf), || Ok(()))
+        self.0.write_all(buf)
     }
 
     fn write_all_vectored(&mut self, bufs: &mut [IoSlice<'_>]) -> io::Result<()> {
-        handle_ebadf(self.0.write_all_vectored(bufs), || Ok(()))
+        self.0.write_all_vectored(bufs)
     }
 
     fn write_fmt(&mut self, fmt: fmt::Arguments<'_>) -> io::Result<()> {
-        handle_ebadf(self.0.write_fmt(fmt), || Ok(()))
+        self.0.write_fmt(fmt)
     }
 }
 
 impl Write for StderrRaw {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        handle_ebadf(self.0.write(buf), || Ok(buf.len()))
+        self.0.write(buf)
     }
 
     fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-        let total = || Ok(bufs.iter().map(|b| b.len()).sum());
-        handle_ebadf(self.0.write_vectored(bufs), total)
+        self.0.write_vectored(bufs)
     }
 
     #[inline]
@@ -205,26 +182,19 @@ impl Write for StderrRaw {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        handle_ebadf(self.0.flush(), || Ok(()))
+        self.0.flush()
     }
 
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
-        handle_ebadf(self.0.write_all(buf), || Ok(()))
+        self.0.write_all(buf)
     }
 
     fn write_all_vectored(&mut self, bufs: &mut [IoSlice<'_>]) -> io::Result<()> {
-        handle_ebadf(self.0.write_all_vectored(bufs), || Ok(()))
+        self.0.write_all_vectored(bufs)
     }
 
     fn write_fmt(&mut self, fmt: fmt::Arguments<'_>) -> io::Result<()> {
-        handle_ebadf(self.0.write_fmt(fmt), || Ok(()))
-    }
-}
-
-fn handle_ebadf<T>(r: io::Result<T>, default: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
-    match r {
-        Err(ref e) if stdio::is_ebadf(e) => default(),
-        r => r,
+        self.0.write_fmt(fmt)
     }
 }
 
@@ -615,9 +585,8 @@ impl fmt::Debug for StdinLock<'_> {
 ///
 /// ### Note: Windows Portability Considerations
 ///
-/// When operating in a console, the Windows implementation of this stream does not support
-/// non-UTF-8 byte sequences. Attempting to write bytes that are not valid UTF-8 will return
-/// an error.
+/// When operating in a console, the Windows implementation of this stream decodes bytes
+/// as UTF-8, replacing malformed sequences with the Unicode replacement character (U+FFFD).
 ///
 /// In a process with a detached console, such as one using
 /// `#![windows_subsystem = "windows"]`, or in a child process spawned from such a process,
@@ -648,9 +617,8 @@ pub struct Stdout {
 ///
 /// ### Note: Windows Portability Considerations
 ///
-/// When operating in a console, the Windows implementation of this stream does not support
-/// non-UTF-8 byte sequences. Attempting to write bytes that are not valid UTF-8 will return
-/// an error.
+/// When operating in a console, the Windows implementation of this stream decodes bytes
+/// as UTF-8, replacing malformed sequences with the Unicode replacement character (U+FFFD).
 ///
 /// In a process with a detached console, such as one using
 /// `#![windows_subsystem = "windows"]`, or in a child process spawned from such a process,
@@ -680,9 +648,8 @@ static STDOUT: OnceLock<ReentrantLock<RefCell<LineWriter<StdoutRaw>>>> = OnceLoc
 ///
 /// ### Note: Windows Portability Considerations
 ///
-/// When operating in a console, the Windows implementation of this stream does not support
-/// non-UTF-8 byte sequences. Attempting to write bytes that are not valid UTF-8 will return
-/// an error.
+/// When operating in a console, the Windows implementation of this stream decodes bytes
+/// as UTF-8, replacing malformed sequences with the Unicode replacement character (U+FFFD).
 ///
 /// In a process with a detached console, such as one using
 /// `#![windows_subsystem = "windows"]`, or in a child process spawned from such a process,
@@ -823,19 +790,7 @@ impl Stdout {
         // Locks this handle with 'static lifetime. This depends on the
         // implementation detail that the underlying `ReentrantMutex` is
         // static.
-        let lock = StdoutLock { inner: self.inner.lock() };
-        // A new lock session begins, so let Windows re-query cached stream
-        // state at the next write; other platforms cache nothing, and skip
-        // this entirely so their `lock()` is unchanged. Skipped also if the
-        // cell is already borrowed (a nested lock during an ongoing write);
-        // such a lock is part of the outer session anyway.
-        #[cfg(windows)]
-        {
-            if let Ok(mut w) = lock.inner.try_borrow_mut() {
-                w.get_mut().refresh();
-            }
-        }
-        lock
+        StdoutLock { inner: self.inner.lock() }
     }
 }
 
@@ -948,9 +903,8 @@ impl fmt::Debug for StdoutLock<'_> {
 ///
 /// ### Note: Windows Portability Considerations
 ///
-/// When operating in a console, the Windows implementation of this stream does not support
-/// non-UTF-8 byte sequences. Attempting to write bytes that are not valid UTF-8 will return
-/// an error.
+/// When operating in a console, the Windows implementation of this stream decodes bytes
+/// as UTF-8, replacing malformed sequences with the Unicode replacement character (U+FFFD).
 ///
 /// In a process with a detached console, such as one using
 /// `#![windows_subsystem = "windows"]`, or in a child process spawned from such a process,
@@ -969,9 +923,8 @@ pub struct Stderr {
 ///
 /// ### Note: Windows Portability Considerations
 ///
-/// When operating in a console, the Windows implementation of this stream does not support
-/// non-UTF-8 byte sequences. Attempting to write bytes that are not valid UTF-8 will return
-/// an error.
+/// When operating in a console, the Windows implementation of this stream decodes bytes
+/// as UTF-8, replacing malformed sequences with the Unicode replacement character (U+FFFD).
 ///
 /// In a process with a detached console, such as one using
 /// `#![windows_subsystem = "windows"]`, or in a child process spawned from such a process,
@@ -990,9 +943,8 @@ pub struct StderrLock<'a> {
 ///
 /// ### Note: Windows Portability Considerations
 ///
-/// When operating in a console, the Windows implementation of this stream does not support
-/// non-UTF-8 byte sequences. Attempting to write bytes that are not valid UTF-8 will return
-/// an error.
+/// When operating in a console, the Windows implementation of this stream decodes bytes
+/// as UTF-8, replacing malformed sequences with the Unicode replacement character (U+FFFD).
 ///
 /// In a process with a detached console, such as one using
 /// `#![windows_subsystem = "windows"]`, or in a child process spawned from such a process,
@@ -1067,15 +1019,7 @@ impl Stderr {
         // Locks this handle with 'static lifetime. This depends on the
         // implementation detail that the underlying `ReentrantMutex` is
         // static.
-        let lock = StderrLock { inner: self.inner.lock() };
-        // See `Stdout::lock`: a new lock session begins (Windows only).
-        #[cfg(windows)]
-        {
-            if let Ok(mut w) = lock.inner.try_borrow_mut() {
-                w.refresh();
-            }
-        }
-        lock
+        StderrLock { inner: self.inner.lock() }
     }
 }
 
@@ -1238,7 +1182,9 @@ where
         return;
     }
 
-    if let Err(e) = global_s().write_fmt(args) {
+    if let Err(e) = global_s().write_fmt(args)
+        && !stdio::is_ebadf(&e)
+    {
         panic!("failed printing to {label}: {e}");
     }
 }

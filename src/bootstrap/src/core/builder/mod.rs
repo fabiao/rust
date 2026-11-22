@@ -790,6 +790,7 @@ impl<'a> Builder<'a> {
                 tool::Linkchecker,
                 tool::CargoTest,
                 tool::Compiletest,
+                tool::CompiletestLintDriver,
                 tool::RemoteTestServer,
                 tool::RemoteTestClient,
                 tool::RustInstaller,
@@ -813,13 +814,14 @@ impl<'a> Builder<'a> {
                 llvm::Enzyme,
                 llvm::RustOffload,
                 llvm::CrtBeginEnd,
+                llvm::Tpde,
                 tool::RustdocGUITest,
                 tool::OptimizedDist,
                 tool::CoverageDump,
                 tool::LlvmBitcodeLinker,
                 tool::RustcPerf,
                 tool::WasmComponentLd,
-                tool::LldWrapper
+                tool::LldWrapper,
             ),
             Kind::Clippy => describe!(
                 clippy::Std,
@@ -832,6 +834,7 @@ impl<'a> Builder<'a> {
                 clippy::CodegenGcc,
                 clippy::CollectLicenseMetadata,
                 clippy::Compiletest,
+                clippy::CompiletestLintDriver,
                 clippy::CoverageDump,
                 clippy::Jsondocck,
                 clippy::Jsondoclint,
@@ -858,7 +861,6 @@ impl<'a> Builder<'a> {
                 check::Clippy,
                 check::Miri,
                 check::CargoMiri,
-                check::Priroda,
                 check::MiroptTestTools,
                 check::Rustfmt,
                 check::RustAnalyzer,
@@ -866,6 +868,7 @@ impl<'a> Builder<'a> {
                 check::Bootstrap,
                 check::RunMakeSupport,
                 check::Compiletest,
+                check::CompiletestLintDriver,
                 check::RustdocGuiTest,
                 check::FeaturesStatusDump,
                 check::CoverageDump,
@@ -932,6 +935,7 @@ impl<'a> Builder<'a> {
                 test::Clippy,
                 test::CompiletestTest,
                 test::StdarchVerify,
+                test::StdarchGenCheck,
                 test::CrateRunMakeSupport,
                 test::CrateBuildHelper,
                 test::RustdocJSStd,
@@ -943,6 +947,7 @@ impl<'a> Builder<'a> {
                 test::HtmlCheck,
                 test::RustInstaller,
                 test::TestFloatParse,
+                test::CompilerBuiltins,
                 test::CollectLicenseMetadata,
                 test::RunMake,
                 test::RunMakeCargo,
@@ -1016,7 +1021,7 @@ impl<'a> Builder<'a> {
                 dist::BuildManifest,
                 dist::ReproducibleArtifacts,
                 dist::GccDev,
-                dist::Gcc
+                dist::Gcc,
             ),
             Kind::Install => describe!(
                 install::Docs,
@@ -1127,10 +1132,9 @@ impl<'a> Builder<'a> {
             Subcommand::Run { .. } => (Kind::Run, &paths[..]),
             Subcommand::Clean { .. } => (Kind::Clean, &paths[..]),
             Subcommand::Format { .. } => (Kind::Format, &[][..]),
-            Subcommand::Setup { profile: ref path } => (
-                Kind::Setup,
-                path.as_ref().map_or([].as_slice(), |path| std::slice::from_ref(path)),
-            ),
+            Subcommand::Setup { profile: ref path } => {
+                (Kind::Setup, path.as_ref().map_or([].as_slice(), std::slice::from_ref))
+            }
             Subcommand::Vendor { .. } => (Kind::Vendor, &paths[..]),
             Subcommand::Perf { .. } => (Kind::Perf, &paths[..]),
         };

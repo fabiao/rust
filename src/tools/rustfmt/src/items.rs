@@ -2720,27 +2720,33 @@ fn rewrite_fn_base(
         }
 
         // Comment between return type and the end of the decl.
-        let snippet_lo = fd.output.span().hi();
         if where_clause.predicates.is_empty() {
+            let snippet_lo = fd.output.span().hi();
             let snippet_hi = span.hi();
             let snippet = context.snippet(mk_sp(snippet_lo, snippet_hi));
-            // Try to preserve the layout of the original snippet.
-            let original_starts_with_newline = snippet
-                .find(|c| c != ' ')
-                .map_or(false, |i| starts_with_newline(&snippet[i..]));
-            let original_ends_with_newline = snippet
-                .rfind(|c| c != ' ')
-                .map_or(false, |i| snippet[i..].ends_with('\n'));
-            let snippet = snippet.trim();
-            if !snippet.is_empty() {
-                result.push(if original_starts_with_newline {
-                    '\n'
-                } else {
-                    ' '
-                });
-                result.push_str(snippet);
-                if original_ends_with_newline {
-                    force_new_line_for_brace = true;
+            let remove_empty_where = context.config.style_edition() >= StyleEdition::Edition2027
+                && where_clause.has_where_token
+                && !contains_comment(snippet);
+
+            if !remove_empty_where {
+                // Try to preserve the layout of the original snippet.
+                let original_starts_with_newline = snippet
+                    .find(|c| c != ' ')
+                    .map_or(false, |i| starts_with_newline(&snippet[i..]));
+                let original_ends_with_newline = snippet
+                    .rfind(|c| c != ' ')
+                    .map_or(false, |i| snippet[i..].ends_with('\n'));
+                let snippet = snippet.trim();
+                if !snippet.is_empty() {
+                    result.push(if original_starts_with_newline {
+                        '\n'
+                    } else {
+                        ' '
+                    });
+                    result.push_str(snippet);
+                    if original_ends_with_newline {
+                        force_new_line_for_brace = true;
+                    }
                 }
             }
         }
@@ -3121,8 +3127,13 @@ fn rewrite_where_keyword(
 
     let (span_before, span_after) =
         missing_span_before_after_where(span_end_before_where, predicates, where_span);
-    let (comment_before, comment_after) =
-        rewrite_comments_before_after_where(context, span_before, span_after, shape)?;
+    let (comment_before, comment_after) = rewrite_comments_before_after_where(
+        context,
+        span_before,
+        span_after,
+        block_shape,
+        clause_shape,
+    )?;
 
     let starting_newline = match where_clause_option.snuggle {
         WhereClauseSpace::Space if comment_before.is_empty() => Cow::from(" "),
@@ -3316,14 +3327,11 @@ fn rewrite_comments_before_after_where(
     context: &RewriteContext<'_>,
     span_before_where: Span,
     span_after_where: Span,
-    shape: Shape,
+    before_shape: Shape,
+    after_shape: Shape,
 ) -> Result<(String, String), RewriteError> {
-    let before_comment = rewrite_missing_comment(span_before_where, shape, context)?;
-    let after_comment = rewrite_missing_comment(
-        span_after_where,
-        shape.block_indent(context.config.tab_spaces()),
-        context,
-    )?;
+    let before_comment = rewrite_missing_comment(span_before_where, before_shape, context)?;
+    let after_comment = rewrite_missing_comment(span_after_where, after_shape, context)?;
     Ok((before_comment, after_comment))
 }
 

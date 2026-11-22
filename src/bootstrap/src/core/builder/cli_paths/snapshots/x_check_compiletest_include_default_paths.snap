@@ -15,7 +15,6 @@ expression: check compiletest --include-default-paths
     - Set({compiler/rustc_ast_pretty})
     - Set({compiler/rustc_attr_ir})
     - Set({compiler/rustc_attr_parsing})
-    - Set({compiler/rustc_baked_icu_data})
     - Set({compiler/rustc_borrowck})
     - Set({compiler/rustc_builtin_macros})
     - Set({compiler/rustc_codegen_llvm})
@@ -103,9 +102,6 @@ expression: check compiletest --include-default-paths
 [Check] check::CargoMiri
     targets: [x86_64-unknown-linux-gnu]
     - Set({src/tools/miri/cargo-miri})
-[Check] check::Priroda
-    targets: [x86_64-unknown-linux-gnu]
-    - Set({src/tools/miri/priroda})
 [Check] check::MiroptTestTools
     targets: [x86_64-unknown-linux-gnu]
     - Set({src/tools/miropt-test-tools})

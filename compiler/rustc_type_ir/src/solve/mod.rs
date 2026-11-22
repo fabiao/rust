@@ -17,8 +17,8 @@ use crate::inherent::*;
 use crate::lang_items::SolverTraitLangItem;
 use crate::region_constraint::RegionConstraint;
 use crate::{
-    self as ty, Canonical, CanonicalVarValues, CantBeErased, Const, ConstVid, FloatVid,
-    GenericArgKind, InferConst, IntVid, Interner, TermKind, TyVid, TypingMode, Upcast,
+    self as ty, Canonical, CantBeErased, Const, ConstVid, FloatVid, GenericArgKind, InferConst,
+    IntVid, Interner, TermKind, TyVid, TypingMode, Upcast,
 };
 
 pub type CanonicalInputData<I> =
@@ -233,7 +233,7 @@ impl<I: Interner> RerunCondition<I> {
             | (
                 Self::OpaqueInStorageOrAnyOpaqueHasInferAsHidden(a),
                 Self::AnyOpaqueHasInferAsHidden,
-            ) => Self::OpaqueInStorage(a),
+            ) => Self::OpaqueInStorageOrAnyOpaqueHasInferAsHidden(a),
 
             (
                 Self::OpaqueInStorageOrAnyOpaqueHasInferAsHidden(a),
@@ -461,9 +461,8 @@ pub enum CandidatePreferenceMode {
 impl CandidatePreferenceMode {
     /// Given `trait_def_id`, which candidate preference mode should be used?
     pub fn compute<I: Interner>(cx: I, trait_id: I::TraitId) -> CandidatePreferenceMode {
-        let is_sizedness_or_auto_or_default_goal = cx.is_sizedness_trait(trait_id)
-            || cx.trait_is_auto(trait_id)
-            || cx.is_default_trait(trait_id);
+        let is_sizedness_or_auto_or_default_goal = cx.trait_is_auto(trait_id)
+            || cx.is_implicit_trait(trait_id, ty::IncludeSizedImplicitBounds::Yes);
         if is_sizedness_or_auto_or_default_goal {
             CandidatePreferenceMode::Marker
         } else {
@@ -582,14 +581,69 @@ pub enum FetchEligibleAssocItemResponse<I: Interner> {
     NotFoundBecauseErased,
 }
 
+/// The variant order here matters for the `PartialOrd`/`Ord` impls.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "nightly", derive(StableHash_NoContext))]
+pub enum IsIdentity {
+    No,
+    ModuloRegions,
+    Yes,
+}
+
 #[derive_where(Clone, Copy, Hash, PartialEq, Debug; I: Interner)]
 #[derive(TypeVisitable_Generic, GenericTypeVisitable, TypeFoldable_Generic)]
 #[cfg_attr(feature = "nightly", derive(StableHash_NoContext))]
 pub struct Response<I: Interner> {
     pub certainty: Certainty,
-    pub var_values: CanonicalVarValues<I>,
+    pub var_values: I::GenericArgs,
+    /// Is `var_values` an identity?
+    pub var_values_is_identity: IsIdentity,
     /// Additional constraints returned by this query.
     pub external_constraints: I::ExternalConstraints,
+}
+
+impl<I: Interner> Response<I> {
+    pub fn update_var_values_is_identity(&mut self) {
+        // We start optimistic and downgrade if necessary along the way.
+        self.var_values_is_identity = IsIdentity::Yes;
+
+        let mut bv = ty::BoundVar::ZERO;
+        for arg in self.var_values.iter() {
+            match arg.kind() {
+                ty::GenericArgKind::Lifetime(r) => {
+                    if let ty::ReBound(ty::BoundVarIndexKind::Canonical, br) = r.kind()
+                        && bv == br.var()
+                    {
+                        bv = bv + 1;
+                    } else {
+                        // If this region var isn't an identity variable we can't be
+                        // `IsIdentity::Yes`, but we can still be `IsIdentity::ModuloRegions`.
+                        self.var_values_is_identity = IsIdentity::ModuloRegions;
+                    }
+                }
+                ty::GenericArgKind::Type(ty) => {
+                    if let ty::Bound(ty::BoundVarIndexKind::Canonical, bt) = ty.kind()
+                        && bv == bt.var()
+                    {
+                        bv = bv + 1;
+                    } else {
+                        self.var_values_is_identity = IsIdentity::No;
+                        break;
+                    }
+                }
+                ty::GenericArgKind::Const(ct) => {
+                    if let ty::ConstKind::Bound(ty::BoundVarIndexKind::Canonical, bc) = ct.kind()
+                        && bv == bc.var()
+                    {
+                        bv = bv + 1;
+                    } else {
+                        self.var_values_is_identity = IsIdentity::No;
+                        break;
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl<I: Interner> Eq for Response<I> {}

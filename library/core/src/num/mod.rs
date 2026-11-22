@@ -46,6 +46,7 @@ mod uint_macros; // import uint_impl!
 mod bfloat;
 mod complex;
 mod error;
+pub(crate) mod float_macros;
 #[cfg(not(no_fp_fmt_parse))]
 mod float_parse;
 mod nonzero;
@@ -67,6 +68,9 @@ pub use error::IntErrorKind;
 pub use error::ParseIntError;
 #[stable(feature = "try_from", since = "1.34.0")]
 pub use error::TryFromIntError;
+#[unstable(feature = "extended_float_error_kind", issue = "164793")]
+#[cfg(not(no_fp_fmt_parse))]
+pub use float_parse::FloatErrorKind;
 #[stable(feature = "rust1", since = "1.0.0")]
 #[cfg(not(no_fp_fmt_parse))]
 pub use float_parse::ParseFloatError;
@@ -1716,17 +1720,13 @@ macro_rules! from_str_int_impl {
             /// # Examples
             ///
             /// ```
-            /// #![feature(int_from_ascii)]
-            ///
             #[doc = concat!("assert_eq!(", stringify!($int_ty), "::from_ascii_bytes(b\"+10\"), Ok(10));")]
             /// ```
             /// Trailing space returns error:
             /// ```
-            /// # #![feature(int_from_ascii)]
-            /// #
             #[doc = concat!("assert!(", stringify!($int_ty), "::from_ascii_bytes(b\"1 \").is_err());")]
             /// ```
-            #[unstable(feature = "int_from_ascii", issue = "134821")]
+            #[stable(feature = "int_from_ascii", since = "CURRENT_RUSTC_VERSION")]
             #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
             #[inline]
             pub const fn from_ascii_bytes<T>(src: T) -> Result<$int_ty, ParseIntError>
@@ -1764,17 +1764,13 @@ macro_rules! from_str_int_impl {
             /// # Examples
             ///
             /// ```
-            /// #![feature(int_from_ascii)]
-            ///
             #[doc = concat!("assert_eq!(", stringify!($int_ty), "::from_ascii_bytes_radix(b\"A\", 16), Ok(10));")]
             /// ```
             /// Trailing space returns error:
             /// ```
-            /// # #![feature(int_from_ascii)]
-            /// #
             #[doc = concat!("assert!(", stringify!($int_ty), "::from_ascii_bytes_radix(b\"1 \", 10).is_err());")]
             /// ```
-            #[unstable(feature = "int_from_ascii", issue = "134821")]
+            #[stable(feature = "int_from_ascii", since = "CURRENT_RUSTC_VERSION")]
             #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
             #[inline]
             pub const fn from_ascii_bytes_radix<T>(src: T, radix: u32) -> Result<$int_ty, ParseIntError>

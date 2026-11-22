@@ -2465,12 +2465,26 @@ specific version of rustfmt is used in your CI, use this option.
 
 - **Default value**: `CARGO_PKG_VERSION`
 - **Possible values**: `semver` compliant values, such as defined on [semver.org](https://semver.org/).
+  A value with no comparator, such as `"1.0.0"`, defaults to a caret (`^`)
+  requirement, matching how Cargo treats dependency version requirements.
 - **Stable**: No (tracking issue: [#3386](https://github.com/rust-lang/rustfmt/issues/3386))
+
+#### New minor or patch versions (default behavior):
+
+```toml
+required_version="^1.0.0"
+```
+
+This is the default behavior, so that is equivalent to:
+
+```toml
+required_version="1.0.0"
+```
 
 #### Match on exact version:
 
 ```toml
-required_version="1.0.0"
+required_version="=1.0.0"
 ```
 
 #### Higher or equal to:
@@ -3287,6 +3301,7 @@ Break comments to fit on the line
 Note that no wrapping will happen if:
 1. The comment is the start of a markdown header doc comment
 2. A URL was found in the comment
+3. An inline link like fragment was found in the comment
 
 - **Default value**: `false`
 - **Possible values**: `true`, `false`

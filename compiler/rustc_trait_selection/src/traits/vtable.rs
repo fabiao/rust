@@ -16,7 +16,9 @@ use crate::traits::is_vtable_safe_method;
 
 #[derive(Clone, Debug)]
 pub enum VtblSegment<'tcx> {
+    /// The segment containing Drop, Size and Align.
     MetadataDSA,
+    /// A segment with the methods of a particular trait.
     TraitOwnEntries { trait_ref: ty::TraitRef<'tcx>, emit_vptr: bool },
 }
 
@@ -309,9 +311,14 @@ fn vtable_entries<'tcx>(
 
 // Given a `dyn Subtrait: Supertrait` trait ref, find corresponding first slot
 // for `Supertrait`'s methods in the vtable of `Subtrait`.
-pub(crate) fn first_method_vtable_slot<'tcx>(tcx: TyCtxt<'tcx>, key: ty::TraitRef<'tcx>) -> usize {
+//
+// Returns `None` if and only if an error was already reported elsewhere.
+pub(crate) fn first_method_vtable_slot<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    key: ty::TraitRef<'tcx>,
+) -> Option<usize> {
     debug_assert!(!key.has_non_region_infer() && !key.has_non_region_param());
-    tcx.debug_assert_fully_normalized(ty::TypingEnv::fully_monomorphized(), key);
+    tcx.assert_fully_normalized(ty::TypingEnv::fully_monomorphized(), key);
 
     let ty::Dynamic(source, _) = *key.self_ty().kind() else {
         bug!();
@@ -324,7 +331,7 @@ pub(crate) fn first_method_vtable_slot<'tcx>(tcx: TyCtxt<'tcx>, key: ty::TraitRe
     if tcx
         .instantiate_and_check_impossible_clauses((source_principal.def_id, source_principal.args))
     {
-        return 0;
+        return Some(0);
     }
 
     let target_principal = ty::ExistentialTraitRef::erase_self_ty(tcx, key);
@@ -355,7 +362,19 @@ pub(crate) fn first_method_vtable_slot<'tcx>(tcx: TyCtxt<'tcx>, key: ty::TraitRe
         }
     };
 
-    prepare_vtable_segments(tcx, source_principal, vtable_segment_callback).unwrap()
+    let index = prepare_vtable_segments(tcx, source_principal, vtable_segment_callback);
+
+    if index.is_none() {
+        // This can happen if the trait hierarchy is malformed (e.g., due to
+        // missing generics on a supertrait bound). There should already be an error
+        // emitted for this, so we just delay the ICE.
+        tcx.dcx().delayed_bug(format!(
+            "could not find the supertrait vtable slot for `{}` -> `{}`",
+            source, target_principal
+        ));
+    }
+
+    index
 }
 
 /// Given a `dyn Subtrait` and `dyn Supertrait` trait object, find the slot of
@@ -434,6 +453,39 @@ pub(crate) fn supertrait_vtable_slot<'tcx>(
         ));
         None
     })
+}
+
+/// Returns the traits that are prefixes of this vtable, such that upcasting to these traits
+/// reuses the vtable pointer unchanged.
+///
+/// For a `trait Foo: A + B`, the methods for A are stored as a prefix to the vtable for Foo.
+/// If B has no methods, it is also part of this prefix (although it takes up no space).
+///
+/// This function returns the full set of these traits (A might have its own supertrait, etc.).
+/// The input trait is the last element of the output vector.
+pub fn vtable_prefix_traits<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    key: ty::TraitRef<'tcx>,
+) -> Vec<ty::ExistentialTraitRef<'tcx>> {
+    debug_assert!(!key.has_non_region_infer() && !key.has_non_region_param());
+
+    let mut entries = vec![];
+
+    let vtable_segment_callback = |segment| -> ControlFlow<()> {
+        // When `emit_vptr: false`, this trait's vtable is a prefix of `key`'s vtable.
+        if let VtblSegment::TraitOwnEntries { trait_ref, emit_vptr: false } = segment {
+            entries.push(ty::ExistentialTraitRef::erase_self_ty(tcx, trait_ref));
+        }
+
+        ControlFlow::Continue(())
+    };
+
+    let _ = prepare_vtable_segments(tcx, key, vtable_segment_callback);
+
+    // The input trait is the last element in the output vector.
+    debug_assert_eq!(entries.last(), Some(&ty::ExistentialTraitRef::erase_self_ty(tcx, key)));
+
+    entries
 }
 
 pub(super) fn provide(providers: &mut Providers) {

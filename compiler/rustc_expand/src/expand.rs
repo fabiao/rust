@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::{iter, mem, slice};
+use std::{iter, mem};
 
 use rustc_ast::mut_visit::*;
 use rustc_ast::tokenstream::TokenStream;
@@ -13,7 +13,7 @@ use rustc_ast::{
     PatKind, StmtKind, SyntheticAttr, TyKind, token,
 };
 use rustc_ast_pretty::pprust;
-use rustc_attr_ir::target::Target;
+use rustc_attr_ir::target::{AstTarget, Target};
 use rustc_attr_parsing::parser::AllowExprMetavar;
 use rustc_attr_parsing::{
     AttributeParser, AttributeSafety, CFG_TEMPLATE, EvalConfigResult, ShouldEmit,
@@ -23,7 +23,6 @@ use rustc_data_structures::flat_map_in_place::FlatMapInPlace;
 use rustc_errors::PResult;
 use rustc_feature::Features;
 use rustc_hir::def::MacroKinds;
-use rustc_lint_defs::builtin::{UNUSED_ATTRIBUTES, UNUSED_DOC_COMMENTS};
 use rustc_parse::parser::{
     AllowConstBlockItems, AttemptLocalParseRecovery, CommaRecoveryMode, ForceCollect, Parser,
     RecoverColon, RecoverComma, Recovery, token_descr,
@@ -37,11 +36,10 @@ use smallvec::SmallVec;
 use crate::base::*;
 use crate::config::StripUnconfigured;
 use crate::diagnostics::{
-    EmptyDelegationMac, GlobDelegationOutsideImpls, GlobDelegationTraitlessQpath, IncompleteParse,
-    RecursionLimitReached, RemoveExprNotSupported, RemoveNodeNotSupported, UnsupportedKeyValue,
-    WrongFragmentKind,
+    CfgNotSupportedInPosition, EmptyDelegationMac, GlobDelegationOutsideImpls,
+    GlobDelegationTraitlessQpath, IncompleteParse, RecursionLimitReached, RemoveExprNotSupported,
+    UnsupportedKeyValue, WrongFragmentKind,
 };
-use crate::mbe::diagnostics::annotate_err_with_kind;
 use crate::module::{
     DirOwnership, ParsedExternalMod, mod_dir_path, mod_file_path_from_attr, parse_external_mod,
 };
@@ -742,7 +740,7 @@ impl<'a, 'b> MacroExpander<'a, 'b> {
                         }
                         Err(guar) => return ExpandResult::Ready(fragment_kind.dummy(span, guar)),
                     }
-                } else if let Some(expander) = ext.as_legacy_bang() {
+                } else if let Some(expander) = ext.as_ast_bang() {
                     let tok_result = match expander.expand(self.cx, span, mac.args.tokens.clone()) {
                         ExpandResult::Ready(tok_result) => tok_result,
                         ExpandResult::Retry(_) => {
@@ -856,7 +854,7 @@ impl<'a, 'b> MacroExpander<'a, 'b> {
                         }
                         Err(guar) => return ExpandResult::Ready(fragment_kind.dummy(span, guar)),
                     }
-                } else if let SyntaxExtensionKind::LegacyAttr(expander) = ext {
+                } else if let SyntaxExtensionKind::AstAttr(expander) = ext {
                     self.gate_proc_macro_attr_item(span, &item);
                     // `LegacyAttr` is only used for builtin attribute macros, which have their
                     // safety checked by `check_builtin_meta_item`, so we don't need to check
@@ -913,7 +911,7 @@ impl<'a, 'b> MacroExpander<'a, 'b> {
             }
             InvocationKind::Derive { path, item, is_const } => match ext {
                 SyntaxExtensionKind::Derive(expander)
-                | SyntaxExtensionKind::LegacyDerive(expander) => {
+                | SyntaxExtensionKind::AstDerive(expander) => {
                     // The `MetaItem` representing the trait to derive can't
                     // have an unsafe around it (as of now).
                     let meta = ast::MetaItem {
@@ -1067,7 +1065,6 @@ impl<'a, 'b> MacroExpander<'a, 'b> {
                 if err.span.is_dummy() {
                     err.span(span);
                 }
-                annotate_err_with_kind(&mut err, kind, span);
                 let guar = err.emit_err();
                 self.cx.macro_error_and_trace_macros_diag();
                 kind.dummy(span, guar)
@@ -1235,9 +1232,6 @@ trait InvocationCollectorNode: HasAttrs + HasNodeId + Sized + DeclaredIdents {
     const KIND: AstFragmentKind;
     fn to_annotatable(self) -> Annotatable;
     fn fragment_to_output(fragment: AstFragment) -> Self::OutputTy;
-    fn descr() -> &'static str {
-        unreachable!()
-    }
     fn walk_flat_map(self, _collector: &mut InvocationCollector<'_, '_>) -> Self::OutputTy {
         unreachable!()
     }
@@ -1274,11 +1268,11 @@ trait InvocationCollectorNode: HasAttrs + HasNodeId + Sized + DeclaredIdents {
     }
     fn expand_cfg_false(
         &mut self,
-        collector: &mut InvocationCollector<'_, '_>,
+        _collector: &mut InvocationCollector<'_, '_>,
         _pos: usize,
-        span: Span,
+        _span: Span,
     ) {
-        collector.cx.dcx().emit_err(RemoveNodeNotSupported { span, descr: Self::descr() });
+        unreachable!("only crate nodes support this operation");
     }
 
     fn as_target(&self) -> Target;
@@ -1949,9 +1943,6 @@ impl InvocationCollectorNode for ast::Expr {
     fn fragment_to_output(fragment: AstFragment) -> Self::OutputTy {
         fragment.make_expr()
     }
-    fn descr() -> &'static str {
-        "an expression"
-    }
     fn walk(&mut self, collector: &mut InvocationCollector<'_, '_>) {
         walk_expr(collector, self)
     }
@@ -2008,9 +1999,6 @@ struct MethodReceiverTag;
 impl InvocationCollectorNode for AstNodeWrapper<ast::Expr, MethodReceiverTag> {
     type OutputTy = AstNodeWrapper<Box<ast::Expr>, MethodReceiverTag>;
     const KIND: AstFragmentKind = AstFragmentKind::MethodReceiverExpr;
-    fn descr() -> &'static str {
-        "an expression"
-    }
     fn to_annotatable(self) -> Annotatable {
         Annotatable::Expr(Box::new(self.wrapped))
     }
@@ -2240,67 +2228,17 @@ impl<'a, 'b> InvocationCollector<'a, 'b> {
     // Run attributes through the attribute parser
     // since they will not be detected after macro expansion.
     fn check_attributes(&self, attrs: &[ast::Attribute], call: &ast::MacCall) {
-        use SyntheticAttr::*;
-        let mut attrs = attrs.iter().peekable();
-        let mut span: Option<Span> = None;
-        while let Some(attr) = attrs.next() {
-            validate_attr::check_attr(&self.cx.sess.psess, attr);
-            AttributeParser::parse_limited_all(
-                self.cx.sess,
-                slice::from_ref(attr),
-                None,
-                Target::MacroCall,
-                call.span(),
-                self.cx.current_expansion.lint_node_id,
-                Some(self.cx.ecfg.features),
-                ShouldEmit::ErrorsAndLints { recovery: Recovery::Allowed },
-                Some(self.cx.resolver.registered_attr_tools()),
-            );
-
-            let current_span = if let Some(sp) = span { sp.to(attr.span) } else { attr.span };
-            span = Some(current_span);
-
-            if attrs.peek().is_some_and(|next_attr| next_attr.doc_str().is_some()) {
-                continue;
-            }
-
-            if match &attr.kind {
-                AttrKind::Normal(normal) => normal.item.name() == Some(sym::doc),
-                AttrKind::DocComment(..) => true,
-                _ => false,
-            } {
-                self.cx.sess.psess.buffer_lint(
-                    UNUSED_DOC_COMMENTS,
-                    current_span,
-                    self.cx.current_expansion.lint_node_id,
-                    crate::diagnostics::MacroCallUnusedDocComment { span: attr.span },
-                );
-                continue;
-            }
-
-            match &attr.kind {
-                AttrKind::Normal(normal)
-                    if rustc_attr_parsing::is_builtin_attr(&normal.item)
-                        && !AttributeParser::is_parsed_attribute(&attr.path()) =>
-                {
-                    let attr_name = attr.name().unwrap();
-                    self.cx.sess.psess.buffer_lint(
-                        UNUSED_ATTRIBUTES,
-                        attr.span,
-                        self.cx.current_expansion.lint_node_id,
-                        crate::diagnostics::UnusedBuiltinAttribute {
-                            attr_name,
-                            macro_name: pprust::path_to_string(&call.path),
-                            invoc_span: call.path.span,
-                            attr_span: attr.span,
-                        },
-                    );
-                }
-                AttrKind::Normal(_) => {}
-                AttrKind::Synthetic(CfgTrace(_) | CfgAttrTrace(_)) => {}
-                AttrKind::DocComment(..) => unreachable!(), // handled above
-            }
-        }
+        AttributeParser::parse_limited_all(
+            self.cx.sess,
+            attrs,
+            None,
+            AstTarget::MacroCall,
+            call.span(),
+            self.cx.current_expansion.lint_node_id,
+            Some(self.cx.ecfg.features),
+            ShouldEmit::ErrorsAndLints { recovery: Recovery::Allowed },
+            Some(self.cx.resolver.registered_attr_tools()),
+        );
     }
 
     fn expand_cfg_true(
@@ -2314,7 +2252,7 @@ impl<'a, 'b> InvocationCollector<'a, 'b> {
             &attr,
             attr.span,
             self.cfg().lint_node_id,
-            node.as_target(),
+            AstTarget::None(node.as_target()),
             self.cfg().features,
             ShouldEmit::ErrorsAndLints { recovery: Recovery::Allowed },
             parse_cfg,
@@ -2453,11 +2391,18 @@ impl<'a, 'b> InvocationCollector<'a, 'b> {
                 Some((attr, pos, derives)) => match attr.name() {
                     Some(sym::cfg) => {
                         let span = attr.span;
-                        if self.expand_cfg_true(node, attr, pos).as_bool() {
-                            continue;
-                        }
 
-                        node.expand_cfg_false(self, pos, span);
+                        match Node::KIND {
+                            AstFragmentKind::Expr | AstFragmentKind::MethodReceiverExpr => {
+                                self.cx.dcx().emit_err(CfgNotSupportedInPosition { span });
+                            }
+                            AstFragmentKind::Crate => {
+                                if !self.expand_cfg_true(node, attr, pos).as_bool() {
+                                    node.expand_cfg_false(self, pos, span);
+                                }
+                            }
+                            _ => unreachable!(),
+                        }
                         continue;
                     }
                     Some(sym::cfg_attr) => {

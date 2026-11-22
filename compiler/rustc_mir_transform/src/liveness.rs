@@ -97,7 +97,7 @@ pub(crate) fn check_liveness<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> Den
 
         let (capture_kind, args) = match self_ty.kind() {
             ty::Closure(_, args) => {
-                (CaptureKind::Closure(args.as_closure().kind()), ty::UpvarArgs::Closure(args))
+                (CaptureKind::Closure(args.as_closure().kind()), ty::UpvarArgs::Closure(*args))
             }
             &ty::Coroutine(_, args) => (CaptureKind::Coroutine, ty::UpvarArgs::Coroutine(args)),
             &ty::CoroutineClosure(_, args) => {
@@ -120,7 +120,7 @@ pub(crate) fn check_liveness<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> Den
                 if let TerminatorKind::Return | TerminatorKind::UnwindResume =
                     bbdata.terminator().kind
                 {
-                    bbdata.terminator_mut().kind = TerminatorKind::Goto { target: START_BLOCK };
+                    bbdata.terminator_mut().kind = TerminatorKind::goto(START_BLOCK);
                 }
             }
             body = &body_mem;
@@ -434,7 +434,7 @@ fn find_self_assignments<'tcx>(
                             statement_index: bb_data.statements.len(),
                         });
                         // Target block
-                        self_assign.insert(Location { block: *target, statement_index: 0 });
+                        self_assign.insert(target.start_location());
                     }
                 }
                 // Straight self-assignment.
@@ -1030,7 +1030,7 @@ impl<'a, 'tcx> AssignmentResult<'a, 'tcx> {
             // #117284, when `ident_span` and `def_span` have different contexts
             // we can't provide a good suggestion, instead we pointed out the spans from macro
             let from_macro = def_span.from_expansion()
-                && introductions.iter().any(|intro| intro.span.eq_ctxt(def_span));
+                && introductions.iter().any(|intro| intro.span.ctxt() == def_span.ctxt());
 
             let maybe_suggest_typo = || {
                 if let LocalKind::Arg = self.body.local_kind(local) {
@@ -1418,7 +1418,7 @@ impl<'tcx> Visitor<'tcx> for TransferFunction<'_, 'tcx> {
         match terminator.kind {
             TerminatorKind::Return
             | TerminatorKind::Yield { .. }
-            | TerminatorKind::Goto { target: START_BLOCK } // Inserted for the `FnMut` case.
+            | TerminatorKind::Goto { target: START_BLOCK, .. } // Inserted for the `FnMut` case.
             | TerminatorKind::Call { target: None, .. } // unwinding could be caught
                 if self.capture_kind != CaptureKind::None =>
             {

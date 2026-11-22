@@ -3,6 +3,7 @@ use rustc_session::config::Lto;
 use rustc_span::bug;
 use rustc_symbol_mangling::typeid_for_trait_ref;
 use rustc_target::callconv::FnAbi;
+use rustc_trait_selection::traits::vtable;
 use tracing::{debug, instrument};
 
 use crate::traits::*;
@@ -13,6 +14,31 @@ pub(crate) struct VirtualIndex(u64);
 impl<'a, 'tcx> VirtualIndex {
     pub(crate) fn from_index(index: usize) -> Self {
         VirtualIndex(index as u64)
+    }
+
+    /// Load this index from the vtable.
+    fn load_field<Bx: BuilderMethods<'a, 'tcx>>(
+        self,
+        bx: &mut Bx,
+        llvtable: Bx::Value,
+        llty: Bx::Type,
+        nonnull: bool,
+    ) -> Bx::Value {
+        let ptr_size = bx.data_layout().pointer_size();
+        let vtable_byte_offset = self.0 * ptr_size.bytes();
+
+        let gep = bx.inbounds_ptradd(llvtable, bx.const_usize(vtable_byte_offset));
+        let ptr_align = bx.data_layout().pointer_align();
+        let ptr = bx.load(llty, gep, ptr_align);
+
+        // VTable loads are invariant.
+        bx.set_invariant_load(ptr);
+
+        if nonnull {
+            bx.nonnull_metadata(ptr);
+        }
+
+        ptr
     }
 
     fn get_fn_inner<Bx: BuilderMethods<'a, 'tcx>>(
@@ -30,7 +56,19 @@ impl<'a, 'tcx> VirtualIndex {
         let ptr_size = bx.data_layout().pointer_size();
         let vtable_byte_offset = self.0 * ptr_size.bytes();
 
-        load_vtable(bx, llvtable, llty, vtable_byte_offset, ty, nonnull)
+        if bx.cx().sess().opts.unstable_opts.virtual_function_elimination
+            && bx.cx().sess().lto() == Lto::Fat
+        {
+            if let Some(trait_ref) = dyn_trait_in_self(bx.tcx(), ty) {
+                let typeid = typeid_for_trait_ref(bx.tcx(), trait_ref);
+                let func = bx.type_checked_load(llvtable, vtable_byte_offset, typeid.as_bytes());
+                return func;
+            } else if nonnull {
+                bug!("load nonnull value from a vtable without a principal trait")
+            }
+        }
+
+        self.load_field(bx, llvtable, llty, nonnull)
     }
 
     pub(crate) fn get_optional_fn<Bx: BuilderMethods<'a, 'tcx>>(
@@ -53,20 +91,24 @@ impl<'a, 'tcx> VirtualIndex {
         self.get_fn_inner(bx, llvtable, ty, fn_abi, true)
     }
 
+    /// Read a data pointer. For function pointers, use [`VirtualIndex::get_fn`].
+    pub(crate) fn get_data_ptr<Bx: BuilderMethods<'a, 'tcx>>(
+        self,
+        bx: &mut Bx,
+        llvtable: Bx::Value,
+        nonnull: bool,
+    ) -> Bx::Value {
+        debug!("get_data_ptr({:?}, {:?})", llvtable, self);
+        self.load_field(bx, llvtable, bx.type_ptr(), nonnull)
+    }
+
     pub(crate) fn get_usize<Bx: BuilderMethods<'a, 'tcx>>(
         self,
         bx: &mut Bx,
         llvtable: Bx::Value,
-        ty: Ty<'tcx>,
     ) -> Bx::Value {
-        // Load the data pointer from the object.
-        debug!("get_int({:?}, {:?})", llvtable, self);
-
-        let llty = bx.type_isize();
-        let ptr_size = bx.data_layout().pointer_size();
-        let vtable_byte_offset = self.0 * ptr_size.bytes();
-
-        load_vtable(bx, llvtable, llty, vtable_byte_offset, ty, false)
+        debug!("get_usize({:?}, {:?})", llvtable, self);
+        self.load_field(bx, llvtable, bx.type_isize(), false)
     }
 }
 
@@ -102,55 +144,32 @@ fn dyn_trait_in_self<'tcx>(
 #[instrument(level = "debug", skip(cx))]
 pub(crate) fn get_vtable<'tcx, Cx: CodegenMethods<'tcx>>(
     cx: &Cx,
-    ty: Ty<'tcx>,
+    self_ty: Ty<'tcx>,
     trait_ref: Option<ty::ExistentialTraitRef<'tcx>>,
 ) -> Cx::Value {
     let tcx = cx.tcx();
 
     // Check the cache.
-    if let Some(&val) = cx.vtables().borrow().get(&(ty, trait_ref)) {
+    if let Some(&val) = cx.vtables().borrow().get(&(self_ty, trait_ref)) {
         return val;
     }
 
-    let vtable_alloc_id = tcx.vtable_allocation((ty, trait_ref));
+    let vtable_alloc_id = tcx.vtable_allocation((self_ty, trait_ref));
     let vtable_allocation = tcx.global_alloc(vtable_alloc_id).unwrap_memory();
     let vtable = cx.static_addr_of(vtable_allocation, Some("vtable"));
 
-    cx.apply_vcall_visibility_metadata(ty, trait_ref, vtable);
-    cx.create_vtable_debuginfo(ty, trait_ref, vtable);
-    cx.vtables().borrow_mut().insert((ty, trait_ref), vtable);
-    vtable
-}
-
-/// Call this function whenever you need to load a vtable.
-pub(crate) fn load_vtable<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
-    bx: &mut Bx,
-    llvtable: Bx::Value,
-    llty: Bx::Type,
-    vtable_byte_offset: u64,
-    ty: Ty<'tcx>,
-    nonnull: bool,
-) -> Bx::Value {
-    let ptr_align = bx.data_layout().pointer_align().abi;
-
-    if bx.cx().sess().opts.unstable_opts.virtual_function_elimination
-        && bx.cx().sess().lto() == Lto::Fat
+    if let Some(trait_ref) = trait_ref
+        && cx.sess().opts.unstable_opts.virtual_function_elimination
+        && cx.sess().lto() == Lto::Fat
     {
-        if let Some(trait_ref) = dyn_trait_in_self(bx.tcx(), ty) {
-            let typeid = typeid_for_trait_ref(bx.tcx(), trait_ref);
-            let func = bx.type_checked_load(llvtable, vtable_byte_offset, typeid.as_bytes());
-            return func;
-        } else if nonnull {
-            bug!("load nonnull value from a vtable without a principal trait")
-        }
+        let key = trait_ref.with_self_ty(tcx, self_ty);
+        let trait_hierarchy = vtable::vtable_prefix_traits(tcx, key);
+
+        cx.apply_vcall_visibility_metadata(&trait_hierarchy, vtable);
     }
 
-    let gep = bx.inbounds_ptradd(llvtable, bx.const_usize(vtable_byte_offset));
-    let ptr = bx.load(llty, gep, ptr_align);
-    // VTable loads are invariant.
-    bx.set_invariant_load(ptr);
-    if nonnull {
-        bx.nonnull_metadata(ptr);
-    }
-    ptr
+    cx.create_vtable_debuginfo(self_ty, trait_ref, vtable);
+    cx.vtables().borrow_mut().insert((self_ty, trait_ref), vtable);
+
+    vtable
 }

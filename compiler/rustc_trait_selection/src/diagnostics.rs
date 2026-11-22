@@ -141,6 +141,19 @@ pub(crate) struct ClosureKindMismatch {
     pub fn_mut_label: Option<ClosureFnMutLabel>,
 }
 
+#[derive(Diagnostic)]
+#[diag("expected `{$trait_prefix}FnOnce`, found reference", code = E0525)]
+#[note("`{$trait_prefix}FnOnce` isn't implemented for references")]
+pub(crate) struct RefToFnOnce {
+    #[primary_span]
+    #[label("closure passed by reference here")]
+    pub cause_span: Span,
+    pub trait_prefix: &'static str,
+
+    #[subdiagnostic]
+    pub fn_once_label: Option<ClosureFnOnceLabel>,
+}
+
 #[derive(Subdiagnostic)]
 #[label(
     "closure is `{$trait_prefix}FnOnce` because it moves the variable `{$place}` out of its environment"
@@ -1917,6 +1930,39 @@ impl Subdiagnostic for AddPreciseCapturingAndParams {
         diag.span_note(
             self.apit_spans,
             msg!("you could use a `use<...>` bound to explicitly capture `{$new_lifetime}`, but argument-position `impl Trait`s are not nameable"),
+        );
+    }
+}
+
+pub(crate) struct AddPreciseCapturingNameLifetimesAndParams {
+    pub suggs: Vec<(Span, String)>,
+    pub apit_spans: Vec<Span>,
+}
+
+impl Subdiagnostic for AddPreciseCapturingNameLifetimesAndParams {
+    fn add_to_diag(self, diag: &mut Diag<'_>) {
+        diag.multipart_suggestion(
+            msg!("add a `use<...>` bound and name the elided lifetimes after turning all argument-position `impl Trait` into type parameters, noting that this possibly affects the API of this crate"),
+            self.suggs,
+            Applicability::MaybeIncorrect,
+        );
+        diag.span_note(
+            self.apit_spans,
+            msg!("argument-position `impl Trait` cannot be named in a `use<...>` bound and must be turned into type parameters"),
+        );
+    }
+}
+
+pub(crate) struct AddPreciseCapturingAndNameLifetimes {
+    pub suggs: Vec<(Span, String)>,
+}
+
+impl Subdiagnostic for AddPreciseCapturingAndNameLifetimes {
+    fn add_to_diag(self, diag: &mut Diag<'_>) {
+        diag.multipart_suggestion(
+            msg!("add `use<...>` bound and name the elided lifetimes to explicitly capture them"),
+            self.suggs,
+            Applicability::MachineApplicable,
         );
     }
 }

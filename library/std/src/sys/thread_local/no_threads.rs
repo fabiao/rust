@@ -5,10 +5,17 @@ use crate::cell::{Cell, UnsafeCell};
 use crate::mem::MaybeUninit;
 use crate::ptr;
 
-// ask: single-threaded processes (no thread-spawn syscall) but not a
-// `singlethread` target - core-level atomics must stay real for its
-// cross-process shared-memory rings (ask docs/10-rust-toolchain.md).
-#[cfg(all(target_has_threads, not(target_os = "ask")))]
+#[cfg(all(
+    target_has_threads,
+    // VEXos is only "target_has_threads" because it allows user interrupt handlers which preempt
+    // the main thread, but they are forbidden from accessing TLS (like UNIX signal handlers).
+    // Since there is only one context that's allowed to access thread locals, it's sound to use the
+    // no_threads implementation.
+    not(target_os = "vexos"),
+    // Trusty is "target_has_threads" because it needs atomics for shared-memory IPC, but processes
+    // can't spawn threads.
+    not(target_os = "trusty"),
+))]
 compile_error!("Using no_threads implementation on a target with threads");
 
 #[doc(hidden)]

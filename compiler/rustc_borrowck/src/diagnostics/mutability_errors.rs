@@ -888,7 +888,7 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
                 suggested: false,
                 infcx: self.infcx,
             };
-            v.visit_body(&body);
+            v.visit_body(body);
             if !v.suggested {
                 err.help(format!(
                     "to modify a `{ty}`, use `.get_mut()`, `.insert()` or the entry API",
@@ -965,7 +965,7 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
         let def_id = self.body.source.def_id();
         if let Some(local_def_id) = def_id.as_local()
             && let Some(body) = self.infcx.tcx.hir_maybe_body_owned_by(local_def_id)
-            && let Some(hir_id) = (BindingFinder { span: pat_span }).visit_body(&body).break_value()
+            && let Some(hir_id) = (BindingFinder { span: pat_span }).visit_body(body).break_value()
             && let node = self.infcx.tcx.hir_node(hir_id)
             && let hir::Node::LetStmt(hir::LetStmt {
                 pat: hir::Pat { kind: hir::PatKind::Ref(_, _, _), .. },
@@ -1175,7 +1175,7 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
         access_place: Place<'tcx>,
     ) {
         let place = access_place.as_ref();
-        for (index, elem) in place.projection.into_iter().enumerate() {
+        for (index, elem) in place.projection.iter().enumerate() {
             if let ProjectionElem::Deref = elem {
                 if index == 0 {
                     if self.body.local_decls[local].is_ref_for_guard() {
@@ -1225,7 +1225,7 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
 
         err.span_label(closure_span, "in this closure");
         let closure_arg_has_fn_trait_bound =
-            |callee_def_id, input_index, generic_args: ty::GenericArgsRef<'tcx>| {
+            |callee_def_id, input_index, generic_args: ty::GenericArgs<'tcx>| {
                 let sig = tcx.fn_sig(callee_def_id).instantiate(tcx, generic_args).skip_binder();
                 let Some(input_ty): Option<Ty<'tcx>> = sig.inputs().get(input_index).copied()
                 else {
@@ -1247,40 +1247,39 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
 
         // If the HIR node is a function or method call, get the DefId
         // of the callee function or method, the span, and argument info for the call expr.
-        let get_call_details =
-            || -> Option<(DefId, Span, usize, usize, ty::GenericArgsRef<'tcx>)> {
-                let hir::Node::Expr(hir::Expr { hir_id, kind, .. }) = node else {
-                    return None;
-                };
-
-                let typeck_results = tcx.typeck(def_id);
-
-                match kind {
-                    hir::ExprKind::Call(expr, args) => {
-                        if let Some(ty::FnDef(def_id, generic_args)) =
-                            typeck_results.node_type_opt(expr.hir_id).as_ref().map(|ty| ty.kind())
-                        {
-                            let arg_pos = args.iter().position(|arg| arg.hir_id == closure_id)?;
-                            Some((
-                                *def_id,
-                                expr.span,
-                                arg_pos,
-                                arg_pos,
-                                generic_args.no_bound_vars().unwrap(),
-                            ))
-                        } else {
-                            None
-                        }
-                    }
-                    hir::ExprKind::MethodCall(_, _, args, span) => {
-                        let arg_pos = args.iter().position(|arg| arg.hir_id == closure_id)?;
-                        let def_id = typeck_results.type_dependent_def_id(*hir_id)?;
-                        let generic_args = typeck_results.node_args_opt(*hir_id)?;
-                        Some((def_id, *span, arg_pos, arg_pos + 1, generic_args))
-                    }
-                    _ => None,
-                }
+        let get_call_details = || -> Option<(DefId, Span, usize, usize, ty::GenericArgs<'tcx>)> {
+            let hir::Node::Expr(hir::Expr { hir_id, kind, .. }) = node else {
+                return None;
             };
+
+            let typeck_results = tcx.typeck(def_id);
+
+            match kind {
+                hir::ExprKind::Call(expr, args) => {
+                    if let Some(ty::FnDef(def_id, generic_args)) =
+                        typeck_results.node_type_opt(expr.hir_id).as_ref().map(|ty| ty.kind())
+                    {
+                        let arg_pos = args.iter().position(|arg| arg.hir_id == closure_id)?;
+                        Some((
+                            *def_id,
+                            expr.span,
+                            arg_pos,
+                            arg_pos,
+                            generic_args.no_bound_vars().unwrap(),
+                        ))
+                    } else {
+                        None
+                    }
+                }
+                hir::ExprKind::MethodCall(_, _, args, span) => {
+                    let arg_pos = args.iter().position(|arg| arg.hir_id == closure_id)?;
+                    let def_id = typeck_results.type_dependent_def_id(*hir_id)?;
+                    let generic_args = typeck_results.node_args_opt(*hir_id)?;
+                    Some((def_id, *span, arg_pos, arg_pos + 1, generic_args))
+                }
+                _ => None,
+            }
+        };
 
         // If we can detect the expression to be a function or method call where the closure was
         // an argument, we point at the function or method definition argument...
@@ -1434,7 +1433,7 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
                 ..
             })) => {
                 // Check if the RHS is from desugaring.
-                let first_assignment = find_assignments(&self.body, local).first().copied();
+                let first_assignment = find_assignments(self.body, local).first().copied();
                 let first_assignment_stmt = first_assignment
                     .and_then(|loc| self.body[loc.block].statements.get(loc.statement_index));
                 trace!(?first_assignment_stmt);
@@ -1614,7 +1613,7 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
         let hir_id = if let Some(local_def_id) = def_id.as_local()
             && let Some(body) = self.infcx.tcx.hir_maybe_body_owned_by(local_def_id)
         {
-            BindingFinder { span: sugg_span }.visit_body(&body).break_value()
+            BindingFinder { span: sugg_span }.visit_body(body).break_value()
         } else {
             None
         };
@@ -1915,7 +1914,7 @@ fn suggest_ampmut<'tcx>(
         if let Rvalue::Ref(_, BorrowKind::Shared, place) = rvalue
             && place.projection.len() == 1
             && place.projection[0] == ProjectionElem::Deref
-            && let Some(assign) = find_assignments(&body, place.local).first()
+            && let Some(assign) = find_assignments(body, place.local).first()
         {
             // If this is a usertype ascription (`let _x: &T = _y`) then pierce through it as either we want
             // to suggest `&mut` on the expression (handled here) or we return `None` and let the caller

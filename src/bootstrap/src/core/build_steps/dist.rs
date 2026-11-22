@@ -355,12 +355,13 @@ fn make_win_llvm_dist(plat_root: &Path, target: TargetSelection, builder: &Build
         "libmingwex.a",
         "libmsvcrt.a",
         // Windows import libs, remove them once std transitions to raw-dylib
+        "libdbghelp.a",
         "libkernel32.a",
-        "libuser32.a",
         "libntdll.a",
+        "libsynchronization.a",
+        "libuser32.a",
         "libuserenv.a",
         "libws2_32.a",
-        "libdbghelp.a",
     ];
 
     //Find mingw artifacts we want to bundle
@@ -856,7 +857,8 @@ fn copy_target_libs(
                 &self_contained_dst.join(path.file_name().unwrap()),
                 FileType::NativeLibrary,
             );
-        } else if dependency_type == DependencyType::Target || builder.config.is_host_target(target)
+        } else if matches!(dependency_type, DependencyType::Target { .. })
+            || builder.config.is_host_target(target)
         {
             builder.copy_link(&path, &dst.join(path.file_name().unwrap()), FileType::NativeLibrary);
         }

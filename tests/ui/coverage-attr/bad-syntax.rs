@@ -1,17 +1,15 @@
 #![feature(coverage_attribute)]
 //@ edition: 2021
-//@ reference: attributes.coverage.syntax
-//@ reference: attributes.coverage.duplicates
 
 // Tests the error messages produced (or not produced) by various unusual
 // uses of the `#[coverage(..)]` attribute.
 
 #[coverage(off)]
-#[coverage(off)] //~ ERROR multiple `coverage` attributes
+#[coverage(off)] //~ ERROR duplicate `coverage` attributes
 fn multiple_consistent() {}
 
 #[coverage(off)]
-#[coverage(on)] //~ ERROR multiple `coverage` attributes
+#[coverage(on)] //~ ERROR duplicate `coverage` attributes
 fn multiple_inconsistent() {}
 
 #[coverage] //~ ERROR malformed `coverage` attribute input

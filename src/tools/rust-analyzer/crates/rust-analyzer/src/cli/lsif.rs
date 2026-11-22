@@ -293,8 +293,8 @@ impl flags::Lsif {
         let load_cargo_config = LoadCargoConfig {
             load_out_dirs_from_check: true,
             with_proc_macro_server: ProcMacroServerChoice::Sysroot,
-            prefill_caches: false,
-            num_worker_threads: 1,
+            prefill_caches: true,
+            num_worker_threads: self.num_threads.unwrap_or_else(num_cpus::get_physical),
             proc_macro_processes: 1,
         };
         let path = AbsPathBuf::assert_utf8(env::current_dir()?.join(self.path));
@@ -317,7 +317,7 @@ impl flags::Lsif {
             VendoredLibrariesConfig::Included { workspace_root: &path.clone().into() }
         };
 
-        let si = StaticIndex::compute(&analysis, vendored_libs_config);
+        let si = StaticIndex::compute(&analysis, vendored_libs_config, true);
 
         let mut lsif = LsifManager::new(&analysis, db, &vfs, out);
         lsif.add_vertex(lsif::Vertex::MetaData(lsif::MetaData {

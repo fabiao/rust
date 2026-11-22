@@ -29,8 +29,9 @@ impl Linker {
     pub fn codegen_and_build_linker(
         tcx: TyCtxt<'_>,
         codegen_backend: &dyn CodegenBackend,
+        metadata: EncodedMetadata,
     ) -> Linker {
-        let (ongoing_codegen, crate_info, metadata) = passes::start_codegen(codegen_backend, tcx);
+        let (ongoing_codegen, crate_info) = passes::start_codegen(codegen_backend, tcx);
 
         Linker {
             dep_graph: tcx.dep_graph.clone(),
@@ -67,28 +68,9 @@ impl Linker {
             }
         });
 
-        if sess.codegen_units().as_usize() == 1 && sess.opts.unstable_opts.time_llvm_passes {
-            codegen_backend.print_pass_timings()
-        }
-
-        if sess.print_llvm_stats() {
-            codegen_backend.print_statistics()
-        }
-
-        if let Some(out_path) = sess.print_llvm_stats_json() {
-            let llvm_stats_json = codegen_backend.print_statistics_json();
-
-            if !llvm_stats_json.is_empty() {
-                if let Err(e) = std::fs::write(&out_path, llvm_stats_json) {
-                    sess.dcx().err(format!("failed to write stats to {}: {}", out_path, e));
-                }
-            } else {
-                sess.dcx().warn(format!(
-                    "requested to print LLVM statistics to JSON file {}, but the codegen backend \
-                    did not provide any statistics",
-                    out_path,
-                ));
-            }
+        // Backends could raise an error, do not continue if that's the case.
+        if let Some(guar) = sess.dcx().has_errors_or_delayed_bugs() {
+            guar.raise_fatal();
         }
 
         sess.timings.end_section(sess.dcx(), TimingSection::Codegen);
@@ -103,10 +85,6 @@ impl Linker {
                 &[(OutputType::Metadata.extension(), path)],
             );
             work_products.insert(id, product);
-        }
-
-        if let Some(guar) = sess.dcx().has_errors_or_delayed_bugs() {
-            guar.raise_fatal();
         }
 
         let _timer = sess.timer("link");
@@ -139,12 +117,7 @@ impl Linker {
             return;
         }
 
-        if !sess
-            .opts
-            .output_types
-            .keys()
-            .any(|&i| i == OutputType::Exe || i == OutputType::Metadata)
-        {
+        if !sess.opts.output_types.keys().any(|&i| i == OutputType::Exe) {
             return;
         }
 

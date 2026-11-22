@@ -240,7 +240,7 @@ use crate::ops::ControlFlow;
 ///
 /// [`eq`]: PartialEq::eq
 /// [`ne`]: PartialEq::ne
-#[lang = "eq"]
+#[lang = "partial_eq"]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[doc(alias = "==")]
 #[doc(alias = "!=")]
@@ -348,6 +348,7 @@ pub macro PartialEq($item:item) {
 #[doc(alias = "==")]
 #[doc(alias = "!=")]
 #[stable(feature = "rust1", since = "1.0.0")]
+#[lang = "eq"]
 #[rustc_diagnostic_item = "Eq"]
 #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
 pub const trait Eq: [const] PartialEq<Self> + PointeeSized {
@@ -1557,8 +1558,10 @@ pub const trait PartialOrd<Rhs: PointeeSized = Self>:
         self.partial_cmp(other).is_some_and(Ordering::is_ge)
     }
 
-    /// If `self == other`, returns `ControlFlow::Continue(())`.
-    /// Otherwise, returns `ControlFlow::Break(self < other)`.
+    /// If `self == other`, returns `Continue(())`.
+    /// Otherwise, returns `Break(self < other)`, or equivalently `Break(self <= other)`.
+    /// The only difference when chaining `<` and `<=` is how an equality result is
+    /// interpreted at the end of the chain.
     ///
     /// This is useful for chaining together calls when implementing a lexical
     /// `PartialOrd::lt`, as it allows types (like primitives) which can cheaply
@@ -1568,32 +1571,16 @@ pub const trait PartialOrd<Rhs: PointeeSized = Self>:
     // Added to improve the behaviour of tuples; not necessarily stabilization-track.
     #[unstable(feature = "partial_ord_chaining_methods", issue = "none")]
     #[doc(hidden)]
-    fn __chaining_lt(&self, other: &Rhs) -> ControlFlow<bool> {
+    fn __chaining_less(&self, other: &Rhs) -> ControlFlow<bool> {
         default_chaining_impl(self, other, Ordering::is_lt)
     }
 
-    /// Same as `__chaining_lt`, but for `<=` instead of `<`.
+    /// Same as `__chaining_less`, but for `>`/`>=` instead of `<`/`<=`.
     #[inline]
     #[unstable(feature = "partial_ord_chaining_methods", issue = "none")]
     #[doc(hidden)]
-    fn __chaining_le(&self, other: &Rhs) -> ControlFlow<bool> {
-        default_chaining_impl(self, other, Ordering::is_le)
-    }
-
-    /// Same as `__chaining_lt`, but for `>` instead of `<`.
-    #[inline]
-    #[unstable(feature = "partial_ord_chaining_methods", issue = "none")]
-    #[doc(hidden)]
-    fn __chaining_gt(&self, other: &Rhs) -> ControlFlow<bool> {
+    fn __chaining_greater(&self, other: &Rhs) -> ControlFlow<bool> {
         default_chaining_impl(self, other, Ordering::is_gt)
-    }
-
-    /// Same as `__chaining_lt`, but for `>=` instead of `<`.
-    #[inline]
-    #[unstable(feature = "partial_ord_chaining_methods", issue = "none")]
-    #[doc(hidden)]
-    fn __chaining_ge(&self, other: &Rhs) -> ControlFlow<bool> {
-        default_chaining_impl(self, other, Ordering::is_ge)
     }
 }
 
@@ -2225,24 +2212,16 @@ mod impls {
             // the `Break` case and the comparison will correctly return `false`.
 
             #[inline]
-            fn __chaining_lt(&self, other: &Self) -> ControlFlow<bool> {
+            fn __chaining_less(&self, other: &Self) -> ControlFlow<bool> {
                 let (lhs, rhs) = (*self, *other);
+                // We arbitrarily pick `<` here. Using `<=` gives the same result.
                 if lhs == rhs { Continue(()) } else { Break(lhs < rhs) }
             }
             #[inline]
-            fn __chaining_le(&self, other: &Self) -> ControlFlow<bool> {
+            fn __chaining_greater(&self, other: &Self) -> ControlFlow<bool> {
                 let (lhs, rhs) = (*self, *other);
-                if lhs == rhs { Continue(()) } else { Break(lhs <= rhs) }
-            }
-            #[inline]
-            fn __chaining_gt(&self, other: &Self) -> ControlFlow<bool> {
-                let (lhs, rhs) = (*self, *other);
+                // We arbitrarily pick `>` here. Using `>=` gives the same result.
                 if lhs == rhs { Continue(()) } else { Break(lhs > rhs) }
-            }
-            #[inline]
-            fn __chaining_ge(&self, other: &Self) -> ControlFlow<bool> {
-                let (lhs, rhs) = (*self, *other);
-                if lhs == rhs { Continue(()) } else { Break(lhs >= rhs) }
             }
         };
     }
@@ -2484,20 +2463,12 @@ mod impls {
             PartialOrd::ge(*self, *other)
         }
         #[inline]
-        fn __chaining_lt(&self, other: &&B) -> ControlFlow<bool> {
-            PartialOrd::__chaining_lt(*self, *other)
+        fn __chaining_less(&self, other: &&B) -> ControlFlow<bool> {
+            PartialOrd::__chaining_less(*self, *other)
         }
         #[inline]
-        fn __chaining_le(&self, other: &&B) -> ControlFlow<bool> {
-            PartialOrd::__chaining_le(*self, *other)
-        }
-        #[inline]
-        fn __chaining_gt(&self, other: &&B) -> ControlFlow<bool> {
-            PartialOrd::__chaining_gt(*self, *other)
-        }
-        #[inline]
-        fn __chaining_ge(&self, other: &&B) -> ControlFlow<bool> {
-            PartialOrd::__chaining_ge(*self, *other)
+        fn __chaining_greater(&self, other: &&B) -> ControlFlow<bool> {
+            PartialOrd::__chaining_greater(*self, *other)
         }
     }
     #[stable(feature = "rust1", since = "1.0.0")]
@@ -2559,20 +2530,12 @@ mod impls {
             PartialOrd::ge(*self, *other)
         }
         #[inline]
-        fn __chaining_lt(&self, other: &&mut B) -> ControlFlow<bool> {
-            PartialOrd::__chaining_lt(*self, *other)
+        fn __chaining_less(&self, other: &&mut B) -> ControlFlow<bool> {
+            PartialOrd::__chaining_less(*self, *other)
         }
         #[inline]
-        fn __chaining_le(&self, other: &&mut B) -> ControlFlow<bool> {
-            PartialOrd::__chaining_le(*self, *other)
-        }
-        #[inline]
-        fn __chaining_gt(&self, other: &&mut B) -> ControlFlow<bool> {
-            PartialOrd::__chaining_gt(*self, *other)
-        }
-        #[inline]
-        fn __chaining_ge(&self, other: &&mut B) -> ControlFlow<bool> {
-            PartialOrd::__chaining_ge(*self, *other)
+        fn __chaining_greater(&self, other: &&mut B) -> ControlFlow<bool> {
+            PartialOrd::__chaining_greater(*self, *other)
         }
     }
     #[stable(feature = "rust1", since = "1.0.0")]

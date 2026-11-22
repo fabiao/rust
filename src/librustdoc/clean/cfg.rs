@@ -641,10 +641,10 @@ impl fmt::Display for Display<'_> {
                 }
             }
 
-            CfgEntry::Version(..) => {
-                // FIXME: Should we handle it?
-                Ok(())
+            CfgEntry::Version(Some(rust_version), _) => {
+                write!(fmt, "Rust version {rust_version} or later")
             }
+            CfgEntry::Version(None, _) => write!(fmt, "unknown Rust version"),
         }
     }
 }
@@ -688,9 +688,11 @@ fn human_readable_target_os(os: Symbol) -> Option<&'static str> {
         Psp => "Play Station Portable",
         Psx => "Play Station 1",
         Qnx => "QNX SDP 8.0+",
+        Qtee => "QTEE",
         Qurt => "QuRT",
         Redox => "Redox OS",
         Rtems => "RTEMS OS",
+        Serenity => "SerenityOS",
         Solaris => "Solaris",
         SolidAsp3 => "SOLID ASP3",
         TeeOs => "TEEOS",

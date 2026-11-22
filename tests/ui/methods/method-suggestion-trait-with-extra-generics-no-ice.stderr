@@ -4,10 +4,10 @@ error[E0599]: no method named `borrow` found for struct `Box<dyn Fn(bool) -> usi
 LL |     foo.borrow();
    |         ^^^^^^
    |
+note: the method is available on trait `Borrow` for `Box<dyn Fn(bool) -> usize>`
   --> $SRC_DIR/core/src/borrow.rs:LL:COL
    |
-   = note: the method is available for `Box<dyn Fn(bool) -> usize>` here
-   |
+   = note: the method is available here
    = help: items from traits can only be used if the trait is in scope
 help: use parentheses to call this trait object
    |
@@ -22,11 +22,11 @@ help: there is a method `borrow_mut` with a similar name
 LL |     foo.borrow_mut();
    |               ++++
 
-error[E0277]: expected an `Fn(bool)` closure, found `Bar`
+error[E0277]: expected `Fn(bool)` signature, found `Bar`
   --> $DIR/method-suggestion-trait-with-extra-generics-no-ice.rs:18:43
    |
 LL |     let foo: Box<dyn Fn(bool) -> usize> = Box::new(Bar);
-   |                                           ^^^^^^^^^^^^^ expected an `Fn(bool)` closure, found `Bar`
+   |                                           ^^^^^^^^^^^^^ expected `Fn(bool)` signature, found `Bar`
    |
 help: the trait `Fn(bool)` is not implemented for `Bar`
   --> $DIR/method-suggestion-trait-with-extra-generics-no-ice.rs:15:1

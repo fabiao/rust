@@ -6,7 +6,6 @@ use std::{debug_assert_matches, iter};
 use rustc_abi::{ExternAbi, FieldIdx};
 use rustc_attr_ir::lang_items::LangItem;
 use rustc_attr_ir::{InlineAttr, OptimizeAttr};
-use rustc_data_structures::thin_vec::ThinVec;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
 use rustc_index::Idx;
@@ -15,7 +14,8 @@ use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs;
 use rustc_middle::mir::visit::*;
 use rustc_middle::mir::*;
 use rustc_middle::ty::{
-    self, Instance, InstanceKind, ShimKind, Ty, TyCtxt, TypeFlags, TypeVisitableExt, Unnormalized,
+    self, Instance, InstanceKind, Intrinsic, ShimKind, Ty, TyCtxt, TypeFlags, TypeVisitableExt,
+    Unnormalized,
 };
 use rustc_session::config::{DebugInfo, OptLevel};
 use rustc_span::{Spanned, bug};
@@ -562,8 +562,17 @@ fn resolve_callsite<'tcx, I: Inliner<'tcx>>(
                 if intrinsic.must_be_overridden {
                     return None; // intrinsic without fallback body
                 }
-                if !tcx.sess.fallback_intrinsics.contains(&intrinsic.name) {
-                    return None; // intrinsic that the backend may want to overwrite
+                match intrinsic.name {
+                    // intrinsics that the backend may want to overwrite
+                    Intrinsic::Rustc(name)
+                        if !tcx.sess.fallback_rustc_intrinsics.contains(&name) =>
+                    {
+                        return None;
+                    }
+                    Intrinsic::Backend { .. } => {
+                        return None;
+                    }
+                    _ => {}
                 }
                 // The callee is the fallback body.
                 debug!("callsite is fallback body: {def_id:?}");
@@ -764,7 +773,7 @@ fn check_mir_is_available<'tcx, I: Inliner<'tcx>>(
         | InstanceKind::Shim(ShimKind::DropGlue(..))
         | InstanceKind::Shim(ShimKind::Clone(..))
         | InstanceKind::Shim(ShimKind::ThreadLocal(..))
-        | InstanceKind::Shim(ShimKind::FnPtrAsPtr(..))
+        | InstanceKind::Shim(ShimKind::FnAddrAsPtr(..))
         | InstanceKind::Shim(ShimKind::FnPtrFromPtr(..)) => return Ok(()),
     }
 
@@ -859,21 +868,20 @@ fn inline_call<'tcx, I: Inliner<'tcx>>(
     mut callee_body: Body<'tcx>,
 ) {
     let tcx = inliner.tcx();
-    let terminator = caller_body[callsite.block].terminator.take().unwrap();
-    let TerminatorKind::Call { func, args, destination, unwind, target, .. } = terminator.kind
+    let terminator = caller_body.basic_blocks.as_mut()[callsite.block].terminator.as_mut().unwrap();
+    let TerminatorKind::Call { ref func, ref mut args, destination, unwind, target, .. } =
+        terminator.kind
     else {
         bug!("unexpected terminator kind {:?}", terminator.kind);
     };
+    let args = std::mem::take(args);
+    let func_ty = func.ty(&caller_body.local_decls, tcx);
 
     let return_block = if let Some(block) = target {
         // Prepare a new block for code that should execute when call returns. We don't use
         // target block directly since it might have other predecessors.
         let data = BasicBlockData::new(
-            Some(Terminator {
-                source_info: terminator.source_info,
-                kind: TerminatorKind::Goto { target: block },
-                loop_hint_attrs: ThinVec::new(),
-            }),
+            Terminator { source_info: terminator.source_info, kind: TerminatorKind::goto(block) },
             caller_body[block].is_cleanup,
         );
         Some(caller_body.basic_blocks_mut().push(data))
@@ -999,8 +1007,7 @@ fn inline_call<'tcx, I: Inliner<'tcx>>(
 
     caller_body[callsite.block].terminator = Some(Terminator {
         source_info: callsite.source_info,
-        kind: TerminatorKind::Goto { target: integrator.map_block(START_BLOCK) },
-        loop_hint_attrs: ThinVec::new(),
+        kind: TerminatorKind::goto(integrator.map_block(START_BLOCK)),
     });
 
     // Copy required constants from the callee_body into the caller_body. Although we are only
@@ -1016,7 +1023,7 @@ fn inline_call<'tcx, I: Inliner<'tcx>>(
     // the actually used items. By doing this we can entirely avoid visiting the callee!
     // We need to reconstruct the `required_item` for the callee so that we can find and
     // remove it.
-    let callee_item = MentionedItem::Fn(func.ty(caller_body, tcx));
+    let callee_item = MentionedItem::Fn(func_ty);
     let caller_mentioned_items = caller_body.mentioned_items.as_mut().unwrap();
     if let Some(idx) = caller_mentioned_items.iter().position(|item| item.node == callee_item) {
         // We found the callee, so remove it and add its items instead.
@@ -1285,7 +1292,7 @@ impl<'tcx> MutVisitor<'tcx> for Integrator<'_, 'tcx> {
 
         match terminator.kind {
             TerminatorKind::CoroutineDrop | TerminatorKind::Yield { .. } => bug!(),
-            TerminatorKind::Goto { ref mut target } => {
+            TerminatorKind::Goto { ref mut target, .. } => {
                 *target = self.map_block(*target);
             }
             TerminatorKind::SwitchInt { ref mut targets, .. } => {
@@ -1313,14 +1320,14 @@ impl<'tcx> MutVisitor<'tcx> for Integrator<'_, 'tcx> {
             }
             TerminatorKind::Return => {
                 terminator.kind = if let Some(tgt) = self.return_block {
-                    TerminatorKind::Goto { target: tgt }
+                    TerminatorKind::goto(tgt)
                 } else {
                     TerminatorKind::Unreachable
                 }
             }
             TerminatorKind::UnwindResume => {
                 terminator.kind = match self.cleanup_block {
-                    UnwindAction::Cleanup(tgt) => TerminatorKind::Goto { target: tgt },
+                    UnwindAction::Cleanup(tgt) => TerminatorKind::goto(tgt),
                     UnwindAction::Continue => TerminatorKind::UnwindResume,
                     UnwindAction::Unreachable => TerminatorKind::Unreachable,
                     UnwindAction::Terminate(reason) => TerminatorKind::UnwindTerminate(reason),
@@ -1358,7 +1365,7 @@ fn try_instance_mir<'tcx>(
     {
         let fields = def.all_fields();
         for field in fields {
-            let field_ty = field.ty(tcx, args);
+            let field_ty = field.ty(tcx, *args);
             if field_ty.has_param() && field_ty.has_aliases() {
                 return Err("cannot build drop shim for polymorphic type");
             }

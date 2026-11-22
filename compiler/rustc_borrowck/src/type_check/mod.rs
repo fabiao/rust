@@ -18,16 +18,15 @@ use rustc_infer::infer::region_constraints::RegionConstraintData;
 use rustc_infer::infer::{
     BoundRegionConversionTime, InferCtxt, NllRegionVariableOrigin, RegionVariableOrigin,
 };
-use rustc_infer::traits::{Obligation, ObligationCause, PredicateObligations};
+use rustc_infer::traits::{Obligation, ObligationCause, PredicateObligations, ScrubbedTraitError};
 use rustc_middle::mir::visit::{NonMutatingUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::*;
 use rustc_middle::traits::query::NoSolution;
 use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::cast::CastTy;
-use rustc_middle::ty::consts::ConstExt;
 use rustc_middle::ty::{
-    self, CanonicalUserTypeAnnotation, CanonicalUserTypeAnnotations, GenericArgsRef, Ty, TyCtxt,
-    TypeVisitableExt, UserArgs, UserTypeAnnotationIndex, fold_regions,
+    self, CanonicalUserTypeAnnotation, CanonicalUserTypeAnnotations, GenericArgs, Intrinsic, Ty,
+    TyCtxt, TypeVisitableExt, UserArgs, UserTypeAnnotationIndex, fold_regions,
 };
 use rustc_mir_dataflow::move_paths::MoveData;
 use rustc_mir_dataflow::points::DenseLocationMap;
@@ -592,7 +591,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
         }
 
         for (block, block_data) in body.basic_blocks.iter_enumerated() {
-            let mut location = Location { block, statement_index: 0 };
+            let mut location = block.start_location();
             for stmt in &block_data.statements {
                 self.visit_statement(stmt, location);
                 location.statement_index += 1;
@@ -978,7 +977,6 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                     //
                     // Unbound parts of arguments were never required to be Sized
                     // - maybe we should make that a warning.
-                    return;
                 }
                 LocalKind::Temp => {
                     let span = local_decl.source_info.span;
@@ -1848,7 +1846,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
 
                 assert_eq!(tcx.trait_impl_of_assoc(def_id), None);
                 self.prove_clauses(
-                    args.terms().map(|t| ty::ClauseKind::WellFormed(t)),
+                    args.terms().map(ty::ClauseKind::WellFormed),
                     locations,
                     ConstraintCategory::Boring,
                 );
@@ -2034,8 +2032,9 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
             // Some of the SIMD intrinsics are special: they need a particular argument to be a
             // constant. (Eventually this should use const-generics, but those are not up for the
             // task yet: https://github.com/rust-lang/rust/issues/85229.)
-            if let Some(name @ (sym::simd_shuffle | sym::simd_insert | sym::simd_extract)) =
-                self.tcx().intrinsic(def_id).map(|i| i.name)
+            if let Some(Intrinsic::Rustc(
+                name @ (sym::simd_shuffle | sym::simd_insert | sym::simd_extract),
+            )) = self.tcx().intrinsic(def_id).map(|i| i.name)
             {
                 let idx = match name {
                     sym::simd_shuffle => 2,
@@ -2082,7 +2081,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
     fn check_iscleanup(&mut self, block_data: &BasicBlockData<'tcx>) {
         let is_cleanup = block_data.is_cleanup;
         match block_data.terminator().kind {
-            TerminatorKind::Goto { target } => {
+            TerminatorKind::Goto { target, .. } => {
                 self.assert_iscleanup(block_data, target, is_cleanup)
             }
             TerminatorKind::SwitchInt { ref targets, .. } => {
@@ -2510,7 +2509,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
         let src_ty = src_place.ty(self.body, tcx).ty;
 
         let ty::Adt(dst_adt, dst_args) = dst_ty.kind() else { bug!() };
-        let [dst_arg, ..] = ***dst_args else { bug!() };
+        let [dst_arg, ..] = *dst_args.as_slice() else { bug!() };
         let ty::GenericArgKind::Lifetime(dst_region) = dst_arg.kind() else { bug!() };
         constraints.liveness_constraints.add_location(dst_region.as_var(), location);
 
@@ -2597,8 +2596,8 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
                 };
                 // These field types can still contain projections from the source or target type
                 // and normalize them before handing them to `NllTypeRelating`
-                let dst_ty = self.normalize(dst_field.ty(tcx, dst_args), location.to_locations());
-                let src_ty = self.normalize(src_field.ty(tcx, src_args), location.to_locations());
+                let dst_ty = self.normalize(dst_field.ty(tcx, *dst_args), location.to_locations());
+                let src_ty = self.normalize(src_field.ty(tcx, *src_args), location.to_locations());
 
                 if let (
                     ty::Ref(src_region, _, Mutability::Mut),
@@ -2710,7 +2709,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
         &mut self,
         tcx: TyCtxt<'tcx>,
         def_id: LocalDefId,
-        args: GenericArgsRef<'tcx>,
+        args: GenericArgs<'tcx>,
         location: Location,
     ) -> ty::InstantiatedClauses<'tcx> {
         let root_def_id = self.infcx.root_def_id;
@@ -2729,16 +2728,15 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
                 // FIXME(async_closures): It may be useful to add a debug assert here
                 // to actually call `type_of` and check the `parent_args` are the same
                 // length as the `typeck_root_args`.
-                &args[..typeck_root_args.len()]
+                tcx.mk_args(&args.as_slice()[..typeck_root_args.len()])
             }
             DefKind::AnonConst
                 if tcx.anon_const_kind(def_id) == ty::AnonConstKind::NonTypeSystemInline =>
             {
-                args.as_inline_const().parent_args()
+                tcx.mk_args(args.as_inline_const().parent_args())
             }
             other => bug!("unexpected item {:?}", other),
         };
-        let parent_args = tcx.mk_args(parent_args);
 
         assert_eq!(typeck_root_args.len(), parent_args.len());
         if let Err(_) = self.eq_args(
@@ -2802,10 +2800,16 @@ impl<'tcx> TypeOp<'tcx> for InstantiateOpaqueType<'tcx> {
         span: Span,
     ) -> Result<TypeOpOutput<'tcx, Self>, ErrorGuaranteed> {
         let (mut output, region_constraints) =
-            scrape_region_constraints(infcx, root_def_id, "InstantiateOpaqueType", span, |ocx| {
-                ocx.register_obligations(self.obligations.clone());
-                Ok(())
-            })?;
+            scrape_region_constraints::<_, _, ScrubbedTraitError<'tcx>>(
+                infcx,
+                root_def_id,
+                "InstantiateOpaqueType",
+                span,
+                |ocx| {
+                    ocx.register_obligations(self.obligations.clone());
+                    Ok(())
+                },
+            )?;
         self.region_constraints = Some(region_constraints);
         output.error_info = Some(self);
         Ok(output)

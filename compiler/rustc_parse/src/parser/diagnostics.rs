@@ -59,6 +59,7 @@ pub(super) fn dummy_arg(ident: Ident, guar: ErrorGuaranteed) -> Param {
         span: ident.span,
         ty: Box::new(ty),
         is_placeholder: false,
+        has_const_keyword: false,
     }
 }
 
@@ -126,18 +127,15 @@ pub enum AttemptLocalParseRecovery {
 }
 
 impl AttemptLocalParseRecovery {
-    pub(super) fn yes(&self) -> bool {
+    pub(super) fn yes(&self, p: &Parser<'_>) -> bool {
         match self {
-            AttemptLocalParseRecovery::Yes => true,
+            AttemptLocalParseRecovery::Yes => p.may_recover(),
             AttemptLocalParseRecovery::No => false,
         }
     }
 
-    pub(super) fn no(&self) -> bool {
-        match self {
-            AttemptLocalParseRecovery::Yes => false,
-            AttemptLocalParseRecovery::No => true,
-        }
+    pub(super) fn no(&self, p: &Parser<'_>) -> bool {
+        !self.yes(p)
     }
 }
 
@@ -1143,6 +1141,13 @@ impl<'a> Parser<'a> {
         }
     }
 
+    pub(super) fn recover_missing_turbofish_for_lifetimes(&self, lt_span: Span) {
+        self.dcx().emit_err(crate::diagnostics::MissingTurbofishForLifetime {
+            span: lt_span,
+            suggest_turbofish: lt_span.shrink_to_lo(),
+        });
+    }
+
     /// When writing a turbofish with multiple type parameters missing the leading `::`, we will
     /// encounter a parse error when encountering the first `,`.
     pub(super) fn check_mistyped_turbofish_with_multiple_type_params(
@@ -2003,11 +2008,12 @@ impl<'a> Parser<'a> {
     ) -> Option<Ident> {
         // If we find a pattern followed by an identifier, it could be an (incorrect)
         // C-style parameter declaration.
-        if self.check_ident()
+        if let Some((ident, kind)) = self.token.ident()
+            && (ident.name == kw::SelfLower || !token::ident_of_kind_is_reserved(ident, kind))
             && self.look_ahead(1, |t| *t == token::Comma || *t == token::CloseParen)
         {
             // `fn foo(String s) {}`
-            let ident = self.parse_ident_common(true).unwrap();
+            self.bump(); // ident
             let span = pat.span.with_hi(ident.span.hi());
 
             err.span_suggestion_verbose(
@@ -2744,8 +2750,9 @@ impl<'a> Parser<'a> {
         // parentheses in what should have been a tuple pattern; return a
         // suggestion-enhanced error here rather than choking on the comma later.
         let comma_span = self.token.span;
+        let mut comma_spans = vec![comma_span];
         self.bump();
-        if let Err(err) = self.skip_pat_list() {
+        if let Err(err) = self.skip_pat_list(&mut comma_spans) {
             // We didn't expect this to work anyway; we just wanted to advance to the
             // end of the comma-sequence so we know the span to suggest parenthesizing.
             err.cancel();
@@ -2764,10 +2771,9 @@ impl<'a> Parser<'a> {
             Applicability::MachineApplicable,
         );
         if let CommaRecoveryMode::EitherTupleOrPipe = rt {
-            err.span_suggestion_verbose(
-                comma_span,
+            err.multipart_suggestion(
                 "...or a vertical bar to match on alternatives",
-                " |",
+                comma_spans.into_iter().map(|span| (span, " |".to_string())).collect(),
                 Applicability::MachineApplicable,
             );
         }
@@ -2950,12 +2956,13 @@ impl<'a> Parser<'a> {
 
     /// Parse and throw away a parenthesized comma separated
     /// sequence of patterns until `)` is reached.
-    fn skip_pat_list(&mut self) -> PResult<'a, ()> {
+    fn skip_pat_list(&mut self, comma_spans: &mut Vec<Span>) -> PResult<'a, ()> {
         while !self.check(exp!(CloseParen)) {
             self.parse_pat_no_top_alt(None, None)?;
             if !self.eat(exp!(Comma)) {
                 return Ok(());
             }
+            comma_spans.push(self.prev_token.span);
         }
         Ok(())
     }

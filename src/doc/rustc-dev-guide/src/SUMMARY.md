@@ -37,7 +37,7 @@
     - [Performance testing](./tests/perf.md)
     - [Autodiff CI job](./tests/autodiff-ci-job.md)
     - [Pre-stabilization CI job for the next solver and polonius alpha](./tests/x86_64-gnu-next-trait-solver-polonius-ci-job.md)
-    - [Parallel frontend CI job](./tests/optional-x86_64-gnu-parallel-frontend.md)
+    - [Parallel frontend CI job](./tests/x86_64-gnu-parallel-frontend.md)
     - [Standard library semver breakage test](./tests/stdlib-semver-check.md)
     - [Misc info](./tests/misc.md)
 - [Debugging the compiler](./compiler-debugging.md)
@@ -123,6 +123,9 @@
     - [How to debug](./autodiff/debugging.md)
     - [Autodiff flags](./autodiff/flags.md)
     - [Type Trees](./autodiff/type-trees.md)
+- [TPDE internals](./tpde/internals.md)
+    - [Installation](./tpde/installation.md)
+    - [How to debug](./tpde/debugging.md)
 
 # Source code representation
 
@@ -171,6 +174,7 @@
     - [`EarlyBinder` and instantiating parameters](./ty-module/early-binder.md)
 - [Binders and Higher ranked regions](./ty-module/binders.md)
     - [Instantiating binders](./ty-module/instantiating-binders.md)
+    - [Assumptions on binders test DSL](./ty-module/binder-test-dsl.md)
 - [Early vs Late bound parameters](./early-late-parameters.md)
 - [The `ty` module: representing types](./ty.md)
     - [ADTs and Generic Arguments](./ty-module/generic-arguments.md)
@@ -274,10 +278,12 @@
 
 [Appendix C: Code Index](./appendix/code-index.md)
 
-[Appendix D: Compiler Lecture Series](./appendix/compiler-lecture.md)
+[Appendix D: Additional Resources](./appendix/additional-resources.md)
 
-[Appendix E: Bibliography](./appendix/bibliography.md)
+[Appendix E: Compiler Lecture Series](./appendix/compiler-lecture.md)
 
-[Appendix F: Reading club sessions](./appendix/reading-club.md)
+[Appendix F: Bibliography](./appendix/bibliography.md)
+
+[Appendix G: Reading club sessions](./appendix/reading-club.md)
 
 [Appendix Z: HumorRust](./appendix/humorust.md)

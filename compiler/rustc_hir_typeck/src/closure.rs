@@ -61,6 +61,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         let (expected_sig, expected_kind) = match expected.to_option(self) {
             Some(ty) => self.deduce_closure_signature(
                 self.deeply_resolve_ignoring_regions_with_obligations(ty),
+                closure.def_id,
                 closure.kind,
             ),
             None => (None, None),
@@ -101,7 +102,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 let closure_args = ty::ClosureArgs::new(
                     tcx,
                     ty::ClosureArgsParts {
-                        parent_args,
+                        parent_args: parent_args.as_slice(),
                         closure_kind_ty,
                         closure_sig_as_fn_ptr_ty: Ty::new_fn_ptr(tcx, sig),
                         tupled_upvars_ty,
@@ -167,7 +168,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 let coroutine_args = ty::CoroutineArgs::new(
                     tcx,
                     ty::CoroutineArgsParts {
-                        parent_args,
+                        parent_args: parent_args.as_slice(),
                         kind_ty,
                         resume_ty,
                         yield_ty,
@@ -212,7 +213,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 let closure_args = ty::CoroutineClosureArgs::new(
                     tcx,
                     ty::CoroutineClosureArgsParts {
-                        parent_args,
+                        parent_args: parent_args.as_slice(),
                         closure_kind_ty,
                         signature_parts_ty: Ty::new_fn_ptr(
                             tcx,
@@ -253,7 +254,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     closure_args.coroutine_closure_sig().map_bound(|sig| {
                         sig.to_coroutine(
                             tcx,
-                            parent_args,
+                            parent_args.as_slice(),
                             coroutine_kind_ty,
                             tcx.coroutine_for_closure(expr_def_id),
                             coroutine_upvars_ty,
@@ -290,9 +291,28 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     fn deduce_closure_signature(
         &self,
         expected_ty: Ty<'tcx>,
+        closure_def_id: LocalDefId,
         closure_kind: hir::ClosureKind,
     ) -> (Option<ExpectedSig<'tcx>>, Option<ty::ClosureKind>) {
         match *expected_ty.kind() {
+            ty::Coroutine(def_id, args)
+                if def_id == closure_def_id.to_def_id()
+                    && matches!(
+                        closure_kind,
+                        hir::ClosureKind::Coroutine(hir::CoroutineKind::Desugared(
+                            hir::CoroutineDesugaring::Async,
+                            hir::CoroutineSource::Closure,
+                        ))
+                    ) =>
+            {
+                // An async closure's body is itself a coroutine. Propagate the signature
+                // inferred for that coroutine into its body.
+                let args = args.as_coroutine();
+                let sig = ty::Binder::dummy(
+                    self.tcx.mk_fn_sig_safe_rust_abi([args.resume_ty()], args.return_ty()),
+                );
+                (Some(ExpectedSig { cause_span: None, sig }), None)
+            }
             ty::Alias(_, ty::AliasTy { kind: ty::Opaque { def_id }, args, .. }) => self
                 .deduce_closure_signature_from_predicates(
                     expected_ty,
@@ -481,8 +501,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         cause_span: Option<Span>,
         projection: ty::PolyProjectionClause<'tcx>,
     ) -> Option<ExpectedSig<'tcx>> {
+        // FIXME(non_lifetime_binders): provide better diagnostics. Should non-lifetime binders
+        // in opaques with fn traits bound be rejected?
+        if projection.has_non_region_bound_vars() {
+            return None;
+        }
         let projection = self.deeply_resolve_ignoring_regions(projection);
-
         let arg_param_ty = projection.skip_binder().projection_term.args.type_at(1);
         debug!(?arg_param_ty);
 
@@ -526,6 +550,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         cause_span: Option<Span>,
         projection: ty::PolyProjectionClause<'tcx>,
     ) -> Option<ExpectedSig<'tcx>> {
+        // FIXME(non_lifetime_binders): provide better diagnostics. Should non-lifetime binders
+        // in opaques with fn traits bound be rejected?
+        if projection.has_non_region_bound_vars() {
+            return None;
+        }
         let projection = self.deeply_resolve_ignoring_regions(projection);
 
         let arg_param_ty = projection.skip_binder().projection_term.args.type_at(1);
@@ -665,7 +694,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // Watch out for some surprises and just ignore the
         // expectation if things don't see to match up with what we
         // expect.
-        if expected_sig.sig.c_variadic() != decl.c_variadic() {
+
+        // FIXME(non_lifetime_binders): provide better diagnostics. Should non-lifetime binders
+        // in opaques with fn traits bound be rejected?
+        if expected_sig.sig.c_variadic() != decl.c_variadic()
+            || expected_sig.sig.has_non_region_bound_vars()
+        {
             return self.sig_of_closure_no_expectation(expr_def_id, decl, closure_kind);
         } else if expected_sig.sig.skip_binder().inputs_and_output.len() != decl.inputs.len() + 1 {
             return self.sig_of_closure_with_mismatched_number_of_arguments(

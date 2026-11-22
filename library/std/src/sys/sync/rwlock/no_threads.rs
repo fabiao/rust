@@ -1,9 +1,15 @@
 use crate::cell::Cell;
 
-// ask: single-threaded processes (no thread-spawn syscall) but not a
-// `singlethread` target - core-level atomics must stay real for its
-// cross-process shared-memory rings (ask docs/10-rust-toolchain.md).
-#[cfg(all(target_has_threads, not(target_os = "ask")))]
+#[cfg(all(
+    target_has_threads,
+    // VEXos is only "target_has_threads" because it allows user interrupt handlers which preempt
+    // the main thread, but they are forbidden from accessing sync primitives (the same as UNIX
+    // signal handlers).
+    not(target_os = "vexos"),
+    // Trusty is "target_has_threads" because it needs atomics for shared-memory IPC, but processes
+    // can't spawn threads.
+    not(target_os = "trusty"),
+))]
 compile_error!("Using no_threads implementation on a target with threads");
 
 pub struct RwLock {

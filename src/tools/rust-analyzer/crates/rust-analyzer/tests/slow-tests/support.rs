@@ -119,6 +119,7 @@ impl Project<'_> {
                 // FIXME: rewrite in terms of `#![feature(exact_length_collection)]`. See: #149266
                 path: tmp_dir_path.join(Itertools::exactly_one(self.roots.iter()).unwrap()).into(),
                 exclude_vendored_libraries: false,
+                num_threads: None,
             },
             &mut buf,
             None,
@@ -225,6 +226,9 @@ impl Project<'_> {
                             lsp_types::ResourceOperationKind::Rename,
                         ]),
                         ..Default::default()
+                    }),
+                    semantic_tokens: Some(lsp_types::SemanticTokensWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
                     }),
                     ..Default::default()
                 }),
@@ -378,7 +382,10 @@ impl Server {
                         {
                             continue;
                         }
-                    } else if req.method != "workspace/diagnostic/refresh" {
+                    } else if !matches!(
+                        req.method.as_str(),
+                        "workspace/diagnostic/refresh" | "workspace/semanticTokens/refresh"
+                    ) {
                         panic!("unexpected request: {req:?}")
                     }
                 }
@@ -454,6 +461,22 @@ impl Server {
                 if params.diagnostics.is_empty() {
                     return;
                 }
+            }
+        }
+    }
+
+    pub(crate) fn wait_for_semantic_tokens_refresh(&self) {
+        loop {
+            let msg = self
+                .recv()
+                .unwrap_or_else(|Timeout| {
+                    panic!("timeout while waiting for semantic tokens refresh")
+                })
+                .expect("connection closed while waiting for semantic tokens refresh");
+            if let Message::Request(req) = &msg
+                && req.method == "workspace/semanticTokens/refresh"
+            {
+                return;
             }
         }
     }

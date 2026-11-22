@@ -1,13 +1,15 @@
 #![allow(non_camel_case_types)]
 
+use rustc_abi::{CanonAbi, X86Call};
 use rustc_attr_ir::PeImportNameType;
 use rustc_attr_ir::lang_items::LangItem;
 use rustc_crate_store::{DllCallingConvention, DllImport, DllImportSymbolType};
 use rustc_middle::mir::interpret::{GlobalAlloc, PointerArithmetic, Scalar};
 use rustc_middle::ty::layout::TyAndLayout;
-use rustc_middle::ty::{self, Instance, ScalarInt, TyCtxt};
+use rustc_middle::ty::{self, Instance, ScalarInt, Ty, TyCtxt};
 use rustc_span::{Span, bug, span_bug};
-use rustc_target::spec::{CfgAbi, Env, Os, Target};
+use rustc_target::callconv::ArgAbi;
+use rustc_target::spec::{Arch, CfgAbi, Env, Os, Target};
 
 use crate::traits::*;
 
@@ -66,29 +68,6 @@ pub enum SynchronizationScope {
     CrossThread,
 }
 
-#[derive(Copy, Clone, PartialEq, Debug)]
-pub enum TypeKind {
-    Void,
-    Half,
-    Float,
-    Double,
-    X86_FP80,
-    FP128,
-    PPC_FP128,
-    Label,
-    Integer,
-    Function,
-    Struct,
-    Array,
-    Pointer,
-    Vector,
-    Metadata,
-    Token,
-    ScalableVector,
-    BFloat,
-    X86_AMX,
-}
-
 // FIXME(mw): Anything that is produced via DepGraph::with_task() must implement
 //            the StableHash trait. Normally DepGraph::with_task() calls are
 //            hidden behind queries, but CGU creation is a special case in two
@@ -130,23 +109,17 @@ pub(crate) fn shift_mask_val<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     mask_llty: Bx::Type,
     invert: bool,
 ) -> Bx::Value {
-    let kind = bx.type_kind(llty);
-    match kind {
-        TypeKind::Integer => {
-            // i8/u8 can shift by at most 7, i16/u16 by at most 15, etc.
-            let val = bx.int_width(llty) - 1;
-            if invert {
-                bx.const_int(mask_llty, !val as i64)
-            } else {
-                bx.const_uint(mask_llty, val)
-            }
-        }
-        TypeKind::Vector => {
-            let mask =
-                shift_mask_val(bx, bx.element_type(llty), bx.element_type(mask_llty), invert);
-            bx.vector_splat(bx.vector_length(mask_llty), mask)
-        }
-        _ => bug!("shift_mask_val: expected Integer or Vector, found {:?}", kind),
+    if let Some(val) = bx.int_width(llty) {
+        // i8/u8 can shift by at most 7, i16/u16 by at most 15, etc.
+        let val = val - 1;
+        if invert { bx.const_int(mask_llty, !val as i64) } else { bx.const_uint(mask_llty, val) }
+    } else if let Some(element) = bx.vector_element_type(llty) {
+        let (mask_elem, mask_len) =
+            bx.vector_element_type_and_length(llty).expect("mask was not a vector");
+        let mask = shift_mask_val(bx, element, mask_elem, invert);
+        bx.vector_splat(mask_len, mask)
+    } else {
+        bug!("shift_mask_val: expected Integer or Vector, found {llty:?}")
     }
 }
 
@@ -201,6 +174,55 @@ pub fn asm_const_ptr_clean<'tcx>(tcx: TyCtxt<'tcx>, scalar: Scalar) -> Scalar {
 
 pub fn is_using_dlltool(target: &Target) -> bool {
     target.os == Os::Windows && target.env == Env::Gnu && target.cfg_abi == CfgAbi::Unspecified
+}
+
+/// Computes the total argument size used for Windows calling-convention
+/// symbol decoration. Each argument is rounded up to the pointer width.
+fn windows_abi_argument_byte_sum<'tcx>(args: &[ArgAbi<'tcx, Ty<'tcx>>], target: &Target) -> u64 {
+    let pointer_bytes = target.pointer_width as u64 / 8;
+
+    args.iter().map(|arg| arg.layout.size.bytes().next_multiple_of(pointer_bytes)).sum()
+}
+
+/// Computes the linker-visible decorated symbol name for supported Windows
+/// calling conventions using the original `FnAbi` argument layouts.
+/// Vectorcall is also decorated on non-Windows targets.
+///
+/// The byte count is computed before backend-specific argument lowering,
+/// which may replace indirectly passed arguments with pointers.
+///
+/// For example, on 32-bit Windows, `extern "fastcall" fn foo(i32, i32)`
+/// is decorated as `@foo@8`. On 64-bit targets,
+/// `extern "vectorcall" fn foo(i32)` is decorated as `foo@@8`.
+///
+/// Returns `None` if no decoration is required or if the name begins with
+/// `\x01` or `?`, indicating that it must not be decorated further.
+///
+/// This function does not add LLVM's `\x01` escape prefix. Backend-specific
+/// handling of that marker is the responsibility of the caller.
+pub fn windows_calling_convention_name<'tcx>(
+    target: &Target,
+    conv: CanonAbi,
+    name: &str,
+    args: &[ArgAbi<'tcx, Ty<'tcx>>],
+) -> Option<String> {
+    if !target.is_like_windows && conv != CanonAbi::X86(X86Call::Vectorcall) {
+        return None;
+    }
+
+    if name.starts_with('\x01') || name.starts_with('?') {
+        return None;
+    }
+
+    let (prefix, suffix) = match (&target.arch, conv) {
+        (Arch::X86, CanonAbi::X86(X86Call::Fastcall)) => ("@", "@"),
+        (Arch::X86, CanonAbi::X86(X86Call::Stdcall)) => ("_", "@"),
+        (Arch::X86 | Arch::X86_64, CanonAbi::X86(X86Call::Vectorcall)) => ("", "@@"),
+        _ => return None,
+    };
+
+    let args_in_bytes = windows_abi_argument_byte_sum(args, target);
+    Some(format!("{prefix}{name}{suffix}{args_in_bytes}"))
 }
 
 pub fn i686_decorated_name(

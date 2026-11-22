@@ -12,15 +12,18 @@ use hir_def::{
 use itertools::Itertools;
 use la_arena::ArenaMap;
 use rustc_type_ir::{
-    AliasTyKind, TypeFoldable, TypeSuperVisitable, TypeVisitable, TypeVisitor, Upcast,
-    inherent::{GenericArgs as _, IntoKind},
+    AliasTyKind, BoundVar, BoundVarIndexKind, DebruijnIndex, INNERMOST, TypeFlags, TypeFoldable,
+    TypeFolder, TypeSuperFoldable, TypeSuperVisitable, TypeVisitable, TypeVisitableExt,
+    TypeVisitor, Upcast,
+    inherent::{GenericArgs as _, IntoKind, Ty as _},
 };
 
 use crate::{
     FieldType, GenericPredicates,
     db::HirDatabase,
     next_solver::{
-        AliasTy, Clause, Clauses, DbInterner, EarlyBinder, GenericArgs, ParamEnv,
+        AliasTy, Binder, BoundConst, BoundRegion, BoundTy, BoundVarKinds, Clause, Clauses, Const,
+        ConstKind, DbInterner, EarlyBinder, GenericArgs, ParamEnv, Region, RegionKind,
         StoredEarlyBinder, TraitRef, Ty, TyKind, Unnormalized, fold::fold_tys, generics::Generics,
     },
 };
@@ -157,6 +160,15 @@ pub fn impl_trait<'db>(
     }
 }
 
+#[inline]
+pub fn impl_super_outlives<'db>(
+    _interner: DbInterner<'db>,
+    _id: BuiltinDeriveImplId,
+) -> EarlyBinder<'db, &'db [Clause<'db>]> {
+    // Currently no builtin-derived traits have super outlive bounds.
+    EarlyBinder::bind(&[])
+}
+
 #[salsa::tracked(returns(ref))]
 pub fn predicates(db: &dyn HirDatabase, impl_: BuiltinDeriveImplId) -> GenericPredicates {
     let loc = impl_.loc(db);
@@ -179,12 +191,12 @@ pub fn predicates(db: &dyn HirDatabase, impl_: BuiltinDeriveImplId) -> GenericPr
             simple_trait_predicates(interner, loc, generic_params, adt_predicates, trait_id)
         }
         BuiltinDeriveImplTrait::Reborrow => {
-            explicit_own_predicates(interner, adt_predicates.own_explicit_predicates())
+            explicit_own_predicates(adt_predicates.own_explicit_predicates())
         }
         BuiltinDeriveImplTrait::Default => {
             if matches!(loc.adt, AdtId::EnumId(_)) {
                 // Enums don't have extra bounds.
-                explicit_own_predicates(interner, adt_predicates.own_explicit_predicates())
+                explicit_own_predicates(adt_predicates.own_explicit_predicates())
             } else {
                 simple_trait_predicates(interner, loc, generic_params, adt_predicates, trait_id)
             }
@@ -218,7 +230,6 @@ pub fn predicates(db: &dyn HirDatabase, impl_: BuiltinDeriveImplId) -> GenericPr
             });
             GenericPredicates::from_explicit_own_predicates(StoredEarlyBinder::bind(
                 Clauses::new_from_iter(
-                    interner,
                     adt_predicates
                         .explicit_predicates()
                         .iter_identity()
@@ -233,11 +244,10 @@ pub fn predicates(db: &dyn HirDatabase, impl_: BuiltinDeriveImplId) -> GenericPr
 }
 
 fn explicit_own_predicates<'db>(
-    interner: DbInterner<'db>,
     predicates: EarlyBinder<'db, impl Iterator<Item = Clause<'db>>>,
 ) -> GenericPredicates {
     GenericPredicates::from_explicit_own_predicates(StoredEarlyBinder::bind(
-        Clauses::new_from_iter(interner, predicates.skip_binder()).store(),
+        Clauses::new_from_iter(predicates.skip_binder()).store(),
     ))
 }
 
@@ -292,8 +302,8 @@ fn simple_trait_predicates<'db>(
                 parent: loc.adt.into(),
                 local_id: param_idx,
             });
-            let param_idx =
-                param_idx.into_raw().into_u32() + (generic_params.len_lifetimes() as u32);
+            let param_idx = param_idx.into_raw().into_u32()
+                + (generic_params.len_early_bound_lifetimes() as u32);
             let param_ty = Ty::new_param(interner, param_id, param_idx);
             let trait_args = trait_args(loc.trait_, param_ty);
             let trait_ref = TraitRef::new_from_args(interner, trait_id.into(), trait_args);
@@ -329,7 +339,6 @@ fn simple_trait_predicates<'db>(
     }
     GenericPredicates::from_explicit_own_predicates(StoredEarlyBinder::bind(
         Clauses::new_from_iter(
-            interner,
             adt_predicates
                 .explicit_predicates()
                 .iter_identity()
@@ -353,18 +362,39 @@ fn extend_assoc_type_bounds<'db>(
         assoc_type_bounds: &'a mut Vec<Clause<'db>>,
         trait_id: TraitId,
         trait_: BuiltinDeriveImplTrait,
+        bound_generic_params_stack: Vec<BoundVarKinds<'db>>,
     }
 
     impl<'db> TypeVisitor<DbInterner<'db>> for ProjectionFinder<'_, 'db> {
         type Result = ();
 
         fn visit_ty(&mut self, t: Ty<'db>) -> Self::Result {
-            if let TyKind::Alias(AliasTy { kind: AliasTyKind::Projection { .. }, .. }) = t.kind() {
+            if !t.has_type_flags(TypeFlags::HAS_TY_PROJECTION) {
+                return;
+            }
+            if let TyKind::Alias(alias @ AliasTy { kind: AliasTyKind::Projection { .. }, .. }) =
+                t.kind()
+                && let TyKind::Param(_) = alias.self_ty().kind()
+            {
+                // rustc flattens binders before lowering, so the corresponding rustc
+                // logic just has a flat vec already:
+                // https://github.com/rust-lang/rust/blob/cabb1ea4ced589dfee40c08aeffff3cac78af43b/compiler/rustc_builtin_macros/src/deriving/generic/mod.rs#L396
+                let t = t.fold_with(&mut FlattenBinders {
+                    interner: self.interner,
+                    enclosing_binders: &self.bound_generic_params_stack,
+                    nested_binder_depth: INNERMOST,
+                });
+                let bound_vars = BoundVarKinds::new_from_iter(
+                    self.bound_generic_params_stack.iter().flat_map(|it| it.iter()),
+                );
                 self.assoc_type_bounds.push(
-                    TraitRef::new_from_args(
-                        self.interner,
-                        self.trait_id.into(),
-                        trait_args(self.trait_, t),
+                    Binder::bind_with_vars(
+                        TraitRef::new_from_args(
+                            self.interner,
+                            self.trait_id.into(),
+                            trait_args(self.trait_, t),
+                        ),
+                        bound_vars,
                     )
                     .upcast(self.interner),
                 );
@@ -372,11 +402,110 @@ fn extend_assoc_type_bounds<'db>(
 
             t.super_visit_with(self)
         }
+
+        // Place bound generic params on a stack, to extract them when a type is encountered.
+        fn visit_binder<T: TypeVisitable<DbInterner<'db>>>(
+            &mut self,
+            binder: &Binder<'db, T>,
+        ) -> Self::Result {
+            let stack_len = self.bound_generic_params_stack.len();
+            // Given a field `x: for<'a> fn(T::SomeType<'a>)`, we want to account for `'a` so
+            // that we generate `where for<'a> T::SomeType<'a>: ::core::clone::Clone`. #122622
+            self.bound_generic_params_stack.push(binder.bound_vars());
+
+            binder.super_visit_with(self);
+
+            self.bound_generic_params_stack.truncate(stack_len);
+        }
     }
 
-    let mut visitor = ProjectionFinder { interner, assoc_type_bounds, trait_id, trait_ };
+    let mut visitor = ProjectionFinder {
+        interner,
+        assoc_type_bounds,
+        trait_id,
+        trait_,
+        bound_generic_params_stack: Vec::new(),
+    };
     for (_, field) in fields.iter() {
         field.ty().instantiate_identity().skip_norm_wip().visit_with(&mut visitor);
+    }
+}
+
+/// Transform a projection `for<'a> for<'b> F::Foo<'a, 'b, X>` into
+/// `for<'a, 'b> F::Foo<'a, 'b, X>`. Update de Bruijn indexes for
+/// enclosing binders, but preserve nested binders.
+struct FlattenBinders<'a, 'db> {
+    interner: DbInterner<'db>,
+    enclosing_binders: &'a [BoundVarKinds<'db>],
+    nested_binder_depth: DebruijnIndex,
+}
+
+impl FlattenBinders<'_, '_> {
+    fn flattened_var(&self, debruijn: DebruijnIndex, var: BoundVar) -> Option<BoundVar> {
+        let depth = debruijn.as_usize().checked_sub(self.nested_binder_depth.as_usize())?;
+        let binder = self.enclosing_binders.len().checked_sub(depth + 1)?;
+        let offset = self.enclosing_binders[..binder].iter().map(|it| it.len()).sum::<usize>();
+        Some(BoundVar::from_usize(offset + var.as_usize()))
+    }
+}
+
+impl<'db> TypeFolder<DbInterner<'db>> for FlattenBinders<'_, 'db> {
+    fn cx(&self) -> DbInterner<'db> {
+        self.interner
+    }
+
+    fn fold_binder<T: TypeFoldable<DbInterner<'db>>>(
+        &mut self,
+        binder: Binder<'db, T>,
+    ) -> Binder<'db, T> {
+        self.nested_binder_depth.shift_in(1);
+        let binder = binder.super_fold_with(self);
+        self.nested_binder_depth.shift_out(1);
+        binder
+    }
+
+    fn fold_ty(&mut self, ty: Ty<'db>) -> Ty<'db> {
+        if !ty.has_bound_vars() {
+            return ty;
+        }
+        if let TyKind::Bound(BoundVarIndexKind::Bound(debruijn), bound_ty) = ty.kind()
+            && let Some(var) = self.flattened_var(debruijn, bound_ty.var)
+        {
+            return Ty::new_bound(
+                self.interner,
+                self.nested_binder_depth,
+                BoundTy { var, kind: bound_ty.kind },
+            );
+        }
+        ty.super_fold_with(self)
+    }
+
+    fn fold_region(&mut self, region: Region<'db>) -> Region<'db> {
+        if !region.has_bound_vars() {
+            return region;
+        }
+        if let RegionKind::ReBound(BoundVarIndexKind::Bound(debruijn), bound_region) = region.kind()
+            && let Some(var) = self.flattened_var(debruijn, bound_region.var)
+        {
+            return Region::new_bound(
+                self.interner,
+                self.nested_binder_depth,
+                BoundRegion { var, kind: bound_region.kind },
+            );
+        }
+        region
+    }
+
+    fn fold_const(&mut self, konst: Const<'db>) -> Const<'db> {
+        if !konst.has_bound_vars() {
+            return konst;
+        }
+        if let ConstKind::Bound(BoundVarIndexKind::Bound(debruijn), bound_const) = konst.kind()
+            && let Some(var) = self.flattened_var(debruijn, bound_const.var)
+        {
+            return Const::new_bound(self.interner, self.nested_binder_depth, BoundConst::new(var));
+        }
+        konst.super_fold_with(self)
     }
 }
 
@@ -413,280 +542,9 @@ fn coerce_pointee_params<'db>(
         local_id: pointee_param,
     });
     let pointee_param_idx =
-        pointee_param.into_raw().into_u32() + (generic_params.len_lifetimes() as u32);
+        pointee_param.into_raw().into_u32() + (generic_params.len_early_bound_lifetimes() as u32);
     let new_param_idx = generic_params.len() as u32;
     let new_param_id = coerce_pointee_new_type_param(trait_id);
     let new_param_ty = Ty::new_param(interner, new_param_id, new_param_idx);
     Some((pointee_param_idx, pointee_param_id, new_param_ty))
-}
-
-#[cfg(test)]
-mod tests {
-    use expect_test::{Expect, expect};
-    use hir_def::nameres::crate_def_map;
-    use itertools::Itertools;
-    use stdx::format_to;
-    use test_fixture::WithFixture;
-
-    use crate::{builtin_derive::impl_trait, next_solver::DbInterner, test_db::TestDB};
-
-    fn check_trait_refs(#[rust_analyzer::rust_fixture] ra_fixture: &str, expectation: Expect) {
-        let db = TestDB::with_files(ra_fixture);
-        let def_map = crate_def_map(&db, db.test_crate());
-
-        let interner = DbInterner::new_with(&db, db.test_crate());
-        crate::attach_db(&db, || {
-            let mut trait_refs = Vec::new();
-            for (_, module) in def_map.modules() {
-                for derive in module.scope.builtin_derive_impls() {
-                    let trait_ref = impl_trait(interner, derive).skip_binder();
-                    trait_refs.push(format!("{trait_ref:?}"));
-                }
-            }
-
-            expectation.assert_eq(&trait_refs.join("\n"));
-        });
-    }
-
-    fn check_predicates(#[rust_analyzer::rust_fixture] ra_fixture: &str, expectation: Expect) {
-        let db = TestDB::with_files(ra_fixture);
-        let def_map = crate_def_map(&db, db.test_crate());
-
-        crate::attach_db(&db, || {
-            let mut predicates = String::new();
-            for (_, module) in def_map.modules() {
-                for derive in module.scope.builtin_derive_impls() {
-                    let preds = super::predicates(&db, derive).all_predicates().skip_binder();
-                    format_to!(
-                        predicates,
-                        "{}\n\n",
-                        preds.format_with("\n", |pred, formatter| formatter(&format_args!(
-                            "{pred:?}"
-                        ))),
-                    );
-                }
-            }
-
-            expectation.assert_eq(&predicates);
-        });
-    }
-
-    #[test]
-    fn simple_macros_trait_ref() {
-        check_trait_refs(
-            r#"
-//- minicore: derive, clone, copy, eq, ord, hash, fmt
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct Simple;
-
-trait Trait {}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct WithGenerics<'a, T: Trait, const N: usize>(&'a [T; N]);
-        "#,
-            expect![[r#"
-                Simple: Debug
-                Simple: Clone
-                Simple: Copy
-                Simple: PartialEq<[Simple]>
-                Simple: Eq
-                Simple: PartialOrd<[Simple]>
-                Simple: Ord
-                Simple: Hash
-                WithGenerics<#0, #1, #2>: Debug
-                WithGenerics<#0, #1, #2>: Clone
-                WithGenerics<#0, #1, #2>: Copy
-                WithGenerics<#0, #1, #2>: PartialEq<[WithGenerics<#0, #1, #2>]>
-                WithGenerics<#0, #1, #2>: Eq
-                WithGenerics<#0, #1, #2>: PartialOrd<[WithGenerics<#0, #1, #2>]>
-                WithGenerics<#0, #1, #2>: Ord
-                WithGenerics<#0, #1, #2>: Hash"#]],
-        );
-    }
-
-    #[test]
-    fn coerce_pointee_trait_ref() {
-        check_trait_refs(
-            r#"
-//- minicore: derive, coerce_pointee
-use core::marker::CoercePointee;
-
-#[derive(CoercePointee)]
-struct Simple<T: ?Sized>(*const T);
-
-#[derive(CoercePointee)]
-struct MultiGenericParams<'a, T, #[pointee] U: ?Sized, const N: usize>(*const U);
-        "#,
-            expect![[r#"
-                Simple<#0>: CoerceUnsized<[Simple<#1>]>
-                Simple<#0>: DispatchFromDyn<[Simple<#1>]>
-                MultiGenericParams<#0, #1, #2, #3>: CoerceUnsized<[MultiGenericParams<#0, #1, #4, #3>]>
-                MultiGenericParams<#0, #1, #2, #3>: DispatchFromDyn<[MultiGenericParams<#0, #1, #4, #3>]>"#]],
-        );
-    }
-
-    #[test]
-    fn reborrow_trait_ref() {
-        check_trait_refs(
-            r#"
-//- minicore: reborrow
-use core::marker::Reborrow;
-
-#[derive(Reborrow)]
-struct Marker<'a, T>(&'a mut T);
-        "#,
-            expect![[r#"
-                Marker<#0, #1>: Reborrow"#]],
-        );
-    }
-
-    #[test]
-    fn simple_macros_predicates() {
-        check_predicates(
-            r#"
-//- minicore: derive, clone, copy, eq, ord, hash, fmt
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct Simple;
-
-trait Trait {
-    type Assoc;
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct WithGenerics<'a, T: Trait, const N: usize>(&'a [T; N], T::Assoc);
-        "#,
-            expect![[r#"
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-                Clause(Binder { value: TraitPredicate(#1: Trait, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: ConstArgHasType(#2, usize), bound_vars: [] })
-                Clause(Binder { value: TraitPredicate(#1: Sized, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitPredicate(#1: Debug, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitPredicate(Alias(AliasTy { args: [#1], kind: Projection { def_id: TypeAliasId("Assoc") }, .. }): Debug, polarity:Positive), bound_vars: [] })
-
-                Clause(Binder { value: TraitPredicate(#1: Trait, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: ConstArgHasType(#2, usize), bound_vars: [] })
-                Clause(Binder { value: TraitPredicate(#1: Sized, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitPredicate(#1: Clone, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitPredicate(Alias(AliasTy { args: [#1], kind: Projection { def_id: TypeAliasId("Assoc") }, .. }): Clone, polarity:Positive), bound_vars: [] })
-
-                Clause(Binder { value: TraitPredicate(#1: Trait, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: ConstArgHasType(#2, usize), bound_vars: [] })
-                Clause(Binder { value: TraitPredicate(#1: Sized, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitPredicate(#1: Copy, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitPredicate(Alias(AliasTy { args: [#1], kind: Projection { def_id: TypeAliasId("Assoc") }, .. }): Copy, polarity:Positive), bound_vars: [] })
-
-                Clause(Binder { value: TraitPredicate(#1: Trait, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: ConstArgHasType(#2, usize), bound_vars: [] })
-                Clause(Binder { value: TraitPredicate(#1: Sized, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitPredicate(#1: PartialEq<[#1]>, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitPredicate(Alias(AliasTy { args: [#1], kind: Projection { def_id: TypeAliasId("Assoc") }, .. }): PartialEq<[Alias(AliasTy { args: [#1], kind: Projection { def_id: TypeAliasId("Assoc") }, .. })]>, polarity:Positive), bound_vars: [] })
-
-                Clause(Binder { value: TraitPredicate(#1: Trait, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: ConstArgHasType(#2, usize), bound_vars: [] })
-                Clause(Binder { value: TraitPredicate(#1: Sized, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitPredicate(#1: Eq, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitPredicate(Alias(AliasTy { args: [#1], kind: Projection { def_id: TypeAliasId("Assoc") }, .. }): Eq, polarity:Positive), bound_vars: [] })
-
-                Clause(Binder { value: TraitPredicate(#1: Trait, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: ConstArgHasType(#2, usize), bound_vars: [] })
-                Clause(Binder { value: TraitPredicate(#1: Sized, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitPredicate(#1: PartialOrd<[#1]>, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitPredicate(Alias(AliasTy { args: [#1], kind: Projection { def_id: TypeAliasId("Assoc") }, .. }): PartialOrd<[Alias(AliasTy { args: [#1], kind: Projection { def_id: TypeAliasId("Assoc") }, .. })]>, polarity:Positive), bound_vars: [] })
-
-                Clause(Binder { value: TraitPredicate(#1: Trait, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: ConstArgHasType(#2, usize), bound_vars: [] })
-                Clause(Binder { value: TraitPredicate(#1: Sized, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitPredicate(#1: Ord, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitPredicate(Alias(AliasTy { args: [#1], kind: Projection { def_id: TypeAliasId("Assoc") }, .. }): Ord, polarity:Positive), bound_vars: [] })
-
-                Clause(Binder { value: TraitPredicate(#1: Trait, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: ConstArgHasType(#2, usize), bound_vars: [] })
-                Clause(Binder { value: TraitPredicate(#1: Sized, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitPredicate(#1: Hash, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitPredicate(Alias(AliasTy { args: [#1], kind: Projection { def_id: TypeAliasId("Assoc") }, .. }): Hash, polarity:Positive), bound_vars: [] })
-
-            "#]],
-        );
-    }
-
-    #[test]
-    fn reborrow_predicates() {
-        check_predicates(
-            r#"
-//- minicore: reborrow
-use core::marker::Reborrow;
-
-trait Trait {}
-
-#[derive(Reborrow)]
-struct Marker<'a, T: Trait, const N: usize>(&'a mut [T; N]);
-        "#,
-            expect![[r#"
-                Clause(Binder { value: TraitPredicate(#1: Trait, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: ConstArgHasType(#2, usize), bound_vars: [] })
-                Clause(Binder { value: TraitPredicate(#1: Sized, polarity:Positive), bound_vars: [] })
-
-            "#]],
-        );
-    }
-
-    #[test]
-    fn coerce_pointee_predicates() {
-        check_predicates(
-            r#"
-//- minicore: derive, coerce_pointee
-use core::marker::CoercePointee;
-
-#[derive(CoercePointee)]
-struct Simple<T: ?Sized>(*const T);
-
-trait Trait<T> {}
-
-#[derive(CoercePointee)]
-struct MultiGenericParams<'a, T, #[pointee] U: ?Sized, const N: usize>(*const U)
-where
-    T: Trait<U>,
-    U: Trait<U>;
-        "#,
-            expect![[r#"
-                Clause(Binder { value: TraitPredicate(#0: Unsize<[#1]>, polarity:Positive), bound_vars: [] })
-
-                Clause(Binder { value: TraitPredicate(#0: Unsize<[#1]>, polarity:Positive), bound_vars: [] })
-
-                Clause(Binder { value: TraitPredicate(#1: Trait<[#2]>, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitPredicate(#2: Trait<[#2]>, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: ConstArgHasType(#3, usize), bound_vars: [] })
-                Clause(Binder { value: TraitPredicate(#1: Sized, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitPredicate(#1: Trait<[#4]>, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitPredicate(#4: Trait<[#4]>, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitPredicate(#2: Unsize<[#4]>, polarity:Positive), bound_vars: [] })
-
-                Clause(Binder { value: TraitPredicate(#1: Trait<[#2]>, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitPredicate(#2: Trait<[#2]>, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: ConstArgHasType(#3, usize), bound_vars: [] })
-                Clause(Binder { value: TraitPredicate(#1: Sized, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitPredicate(#1: Trait<[#4]>, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitPredicate(#4: Trait<[#4]>, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitPredicate(#2: Unsize<[#4]>, polarity:Positive), bound_vars: [] })
-
-            "#]],
-        );
-    }
 }

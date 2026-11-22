@@ -42,7 +42,7 @@ PathSegment =
 | TypeAnchor
 
 TypeAnchor =
-  '<' Type ('as' PathType)? '>'
+  '<' self_ty:Type ('as' trait:PathType)? '>'
 
 ReturnTypeSyntax =
   '(' '..' ')'
@@ -449,20 +449,24 @@ Expr =
 | LetExpr
 | UnderscoreExpr
 | IncludeBytesExpr
+| CfgPredExpr
 
 // We need a special expression for this because we don't have access to the file,
 // and emitting a specific array will have problems with the length.
 IncludeBytesExpr =
-  'builtin' '#' 'include_bytes'
+  'include_bytes'
+
+CfgPredExpr =
+  'cfg' '(' CfgPredicate ','? ')'
 
 OffsetOfExpr =
-  AnyAttr* 'builtin' '#' 'offset_of' '(' Type ',' fields:(NameRef ('.' NameRef)* ) ')'
+  AnyAttr* 'offset_of' '(' Type ',' fields:(NameRef ('.' NameRef)* ) ')'
 
 // asm := "asm!(" format_string *("," format_string) *("," operand) [","] ")"
 // global_asm := "global_asm!(" format_string *("," format_string) *("," operand) [","] ")"
 // format_string := STRING_LITERAL / RAW_STRING_LITERAL
 AsmExpr =
-  AnyAttr* 'builtin' '#' ( 'asm' | 'global_asm' | 'naked_asm' )
+  AnyAttr* ( 'asm' | 'global_asm' | 'naked_asm' )
   '(' template:(Expr (',' Expr)*) (AsmPiece (',' AsmPiece)*)? ','? ')'
 
 // operand_expr := expr / "_" / expr "=>" expr / expr "=>" "_"
@@ -488,7 +492,7 @@ AsmOperandNamed = AnyAttr* (Name '=')? AsmOperand
 AsmPiece = AsmOperandNamed | AsmClobberAbi | AsmOptions
 
 FormatArgsExpr =
-  AnyAttr* 'builtin' '#' 'format_args' '('
+  AnyAttr* 'format_args' '('
   template:Expr
   (',' args:(FormatArgsArg (',' FormatArgsArg)* ','?)? )?
   ')'
@@ -717,7 +721,7 @@ ForType =
   ForBinder Type
 
 PatternType =
-  'builtin' '#' 'pattern_type' '(' Type 'is' Pat ')'
+  'pattern_type' '(' Type 'is' Pat ')'
 
 ImplTraitType =
   'impl' TypeBoundList
@@ -763,12 +767,16 @@ Pat =
 | ConstBlockPat
 | DerefPat
 | NotNull
+| CfgPredPat
 
 NotNull =
     '!' 'null'
 
 DerefPat =
-    'builtin' '#' 'deref' '(' Pat ')'
+    'deref' '(' Pat ')'
+
+CfgPredPat =
+    'cfg' '(' CfgPredicate ','? ')'
 
 LiteralPat =
   '-'? Literal

@@ -89,10 +89,14 @@ impl Deref for Session {
 /// When building Rust various objects are handled differently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum DependencyType {
-    /// Libraries originating from proc-macros.
-    Host,
+    /// proc-macros compiled for the host.
+    HostProcMacro,
     /// Typical Rust libraries.
-    Target,
+    /// Can include cross-compiled proc-macros.
+    Target {
+        /// Is this dependency a proc macro?
+        proc_macro: bool,
+    },
     /// Non Rust libraries and objects shipped to ease usage of certain targets.
     TargetSelfContained,
 }
@@ -559,9 +563,7 @@ impl Session {
     #[cfg_attr(feature = "tracing", instrument(level = "debug", name = "Session::build", skip_all))]
     pub(crate) fn build(&mut self) {
         trace!("setting up job management");
-        unsafe {
-            crate::utils::job::setup(self);
-        }
+        crate::utils::job::setup(self);
 
         // Handle hard-coded subcommands.
         {
@@ -1197,7 +1199,7 @@ impl Session {
         }
 
         if target.starts_with("wasm") && target.contains("wasi") {
-            self.default_wasi_runner(target)
+            self.default_wasi_runner()
         } else {
             None
         }
@@ -1206,7 +1208,7 @@ impl Session {
     /// When a `runner` configuration is not provided and a WASI-looking target
     /// is being tested this is consulted to prove the environment to see if
     /// there's a runtime already lying around that seems reasonable to use.
-    fn default_wasi_runner(&self, target: TargetSelection) -> Option<String> {
+    fn default_wasi_runner(&self) -> Option<String> {
         let mut finder = crate::core::sanity::Finder::new();
 
         // Look for Wasmtime, and for its default options be sure to disable
@@ -1215,19 +1217,10 @@ impl Session {
         if let Some(path) = finder.maybe_have("wasmtime")
             && let Ok(mut path) = path.into_os_string().into_string()
         {
-            path.push_str(" run -Wexceptions -C cache=n --dir .");
-            // Make sure that tests have access to RUSTC_BOOTSTRAP. This (for example) is
-            // required for libtest to work on beta/stable channels.
-            //
-            // NB: with Wasmtime 20 this can change to `-S inherit-env` to
-            // inherit the entire environment rather than just this single
-            // environment variable.
-            path.push_str(" --env RUSTC_BOOTSTRAP");
-
-            if target.contains("wasip2") {
-                path.push_str(" --wasi inherit-network --wasi allow-ip-name-lookup");
-            }
-
+            path.push_str(
+                " run -C cache=n --dir . \
+                 --wasi inherit-env,inherit-network,allow-ip-name-lookup",
+            );
             return Some(path);
         }
 
@@ -1478,9 +1471,10 @@ impl Session {
                 continue;
             }
             let dependency_type = match part[0] as char {
-                'h' => DependencyType::Host,
+                'h' => DependencyType::HostProcMacro,
                 's' => DependencyType::TargetSelfContained,
-                't' => DependencyType::Target,
+                't' => DependencyType::Target { proc_macro: false },
+                'p' => DependencyType::Target { proc_macro: true },
                 _ => unreachable!(),
             };
             let path = PathBuf::from(t!(str::from_utf8(&part[1..])));

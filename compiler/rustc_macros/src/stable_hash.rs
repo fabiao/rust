@@ -1,5 +1,5 @@
 use proc_macro2::Ident;
-use quote::quote;
+use quote::{ToTokens, quote};
 
 struct Attributes {
     ignore: bool,
@@ -96,9 +96,51 @@ fn stable_hash_derive_with_mode(
 
 fn stable_hash_discriminant(s: &mut synstructure::Structure<'_>) -> proc_macro2::TokenStream {
     match s.ast().data {
-        syn::Data::Enum(_) => quote! {
-            ::std::mem::discriminant(self).stable_hash(__hcx, __hasher);
-        },
+        syn::Data::Enum(_) => {
+            // For stable hashing, use a fake discriminant based on the syntactic
+            // ordering of enum variants, not the actual runtime discriminant.
+            // This helps to keep stable hashes consistent between stage1 and stage2.
+            let n_variants = s.variants().len();
+
+            let mut match_arms = proc_macro2::TokenStream::new();
+
+            match n_variants {
+                0 => {}
+
+                // Use the smallest discriminant possible, as it's measurably faster than usize.
+                1..=256 => {
+                    for (discriminant, variant) in (0u8..).zip(s.variants()) {
+                        let pat = variant.pat();
+                        quote! { #pat => #discriminant.stable_hash(__hcx, __hasher), }
+                            .to_tokens(&mut match_arms);
+                    }
+                }
+                257..=65536 => {
+                    for (discriminant, variant) in (0u16..).zip(s.variants()) {
+                        let pat = variant.pat();
+                        quote! { #pat => #discriminant.stable_hash(__hcx, __hasher), }
+                            .to_tokens(&mut match_arms);
+                    }
+                }
+
+                65537.. => panic!(
+                    "deriving StableHash for an enum with more than 65536 variants is unsupported (was: {n_variants})"
+                ),
+            }
+
+            // If this enum has no variants (and is therefore uninhabited),
+            // matching on `self` will cause the compiler to realise that all
+            // subsequent code is unreachable, triggering unhelpful warnings.
+            if n_variants == 0 {
+                quote! {}
+            } else {
+                quote! {
+                    match *self {
+                        #match_arms
+                    }
+                }
+            }
+        }
         syn::Data::Struct(_) => quote! {},
         syn::Data::Union(_) => panic!("cannot derive on union"),
     }

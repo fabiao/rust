@@ -1,12 +1,11 @@
 use std::range::{RangeFrom, RangeToInclusive};
 
-use rustc_abi as abi;
 use rustc_abi::Integer::{I8, I32};
 use rustc_abi::Primitive::{self, Float, Int, Pointer};
 use rustc_abi::{
-    AddressSpace, BackendRepr, FIRST_VARIANT, FieldIdx, FieldsShape, HasDataLayout, Layout,
-    LayoutCalculatorError, LayoutData, Niche, NicheOptimizations, ReprOptions, Scalar, Size,
-    StructKind, TagEncoding, VariantIdx, Variants, WrappingRange,
+    self as abi, AddressSpace, BackendRepr, FIRST_VARIANT, FieldIdx, FieldsShape, HasDataLayout,
+    Layout, LayoutCalculatorError, LayoutData, Niche, NicheOptimizations, ReprOptions, Scalar,
+    Size, StructKind, TagEncoding, VariantIdx, Variants, WrappingRange,
 };
 use rustc_attr_ir::find_attr;
 use rustc_attr_ir::lang_items::LangItem;
@@ -26,6 +25,7 @@ use rustc_middle::ty::{
 use rustc_session::{DataTypeKind, FieldInfo, FieldKind, SizeKind, VariantInfo};
 use rustc_span::{Symbol, bug, sym};
 use rustc_structures::Limit;
+use rustc_target::spec::{Arch, HasTargetSpec};
 use tracing::{debug, instrument};
 
 use crate::diagnostics::NonPrimitiveSimdType;
@@ -41,20 +41,18 @@ fn layout_of<'tcx>(
     tcx: TyCtxt<'tcx>,
     query: ty::PseudoCanonicalInput<'tcx, Ty<'tcx>>,
 ) -> Result<TyAndLayout<'tcx>, &'tcx LayoutError<'tcx>> {
-    let PseudoCanonicalInput { typing_env: original_typing_env, value: original_ty } = query;
+    let PseudoCanonicalInput { typing_env, value: original_ty } = query;
     debug!(?original_ty);
 
     // Optimization: We convert to TypingMode::PostAnalysis and convert opaque types in
     // the where bounds to their hidden types. This reduces overall uncached invocations
     // of `layout_of` and is thus a small performance improvement.
-    let typing_env = original_typing_env.with_post_analysis_normalized(tcx);
+    //
     // Switching to `PostAnalysis` typing mode will reveal opaque types that's marked
     // as rigid in the original typing env.
-    let unnormalized_ty = if typing_env != original_typing_env {
-        ty::set_aliases_to_non_rigid(tcx, original_ty)
-    } else {
-        ty::Unnormalized::new_wip(original_ty)
-    };
+    let PseudoCanonicalInput { typing_env, value: unnormalized_ty } =
+        typing_env.with_post_analysis_normalized_invalidating_rigid_aliases(tcx, original_ty);
+    let unnormalized_ty = ty::Unnormalized::new_wip(unnormalized_ty);
 
     // FIXME: We might want to have two different versions of `layout_of`:
     // One that can be called after typecheck has completed and can use
@@ -87,7 +85,7 @@ fn layout_of<'tcx>(
         }
         ty::TypingMode::Coherence
         | ty::TypingMode::Typeck { .. }
-        | ty::TypingMode::PostTypeckUntilBorrowck { .. }
+        | ty::TypingMode::PostTypeckThroughBorrowck { .. }
         | ty::TypingMode::PostBorrowck { .. }
         | ty::TypingMode::Reflection
         | ty::TypingMode::ErasedNotCoherence(_)
@@ -434,7 +432,7 @@ fn layout_of_uncached<'tcx>(
         }
 
         // The never type.
-        ty::Never => tcx.mk_layout(LayoutData::never_type(cx)),
+        ty::Never => tcx.mk_layout(LayoutData::never_type()),
 
         // Potentially-wide pointers.
         ty::Ref(_, pointee, _) | ty::RawPtr(pointee, _) => {
@@ -545,7 +543,7 @@ fn layout_of_uncached<'tcx>(
         // Odd unit types.
         ty::FnDef(..) | ty::Dynamic(_, _) | ty::Foreign(..) => {
             let sized = matches!(ty.kind(), ty::FnDef(..));
-            tcx.mk_layout(LayoutData::unit(cx, sized))
+            tcx.mk_layout(LayoutData::unit(sized))
         }
 
         ty::Coroutine(def_id, args) => {
@@ -553,7 +551,7 @@ fn layout_of_uncached<'tcx>(
                 ty::TypingMode::Codegen => {}
                 ty::TypingMode::Coherence
                 | ty::TypingMode::Typeck { .. }
-                | ty::TypingMode::PostTypeckUntilBorrowck { .. }
+                | ty::TypingMode::PostTypeckThroughBorrowck { .. }
                 | ty::TypingMode::PostBorrowck { .. }
                 | ty::TypingMode::Reflection
                 | ty::TypingMode::ErasedNotCoherence(_)
@@ -652,16 +650,29 @@ fn layout_of_uncached<'tcx>(
             // * #[repr(simd)] struct S([T; 4])
             //
             // where T is a primitive scalar (integer/float/pointer).
-            let Some(ty::Array(e_ty, e_len)) = def
+            let field_ty = def
                 .is_struct()
                 .then(|| &def.variant(FIRST_VARIANT).fields)
                 .filter(|fields| fields.len() == 1)
-                .map(|fields| *fields[FieldIdx::ZERO].ty(tcx, args).skip_norm_wip().kind())
-            else {
+                .map(|fields| {
+                    // The fields type is not part of ty, so the normalization of ty in
+                    // layout_of has not covered it.
+                    let field_ty = fields[FieldIdx::ZERO].ty(tcx, args);
+                    tcx.try_normalize_erasing_regions(cx.typing_env, field_ty).map_err(|err| {
+                        let field_ty = field_ty.skip_normalization();
+                        error(cx, LayoutError::NormalizationFailure(field_ty, err))
+                    })
+                })
+                .transpose()?;
+            let Some(&ty::Array(e_ty, e_len)) = field_ty.map(|field_ty| field_ty.kind()) else {
                 // Invalid SIMD types should have been caught by typeck by now.
                 let guar = tcx.dcx().delayed_bug("#[repr(simd)] was applied to an invalid ADT");
                 return Err(error(cx, LayoutError::ReferencesError(guar)));
             };
+
+            if let Err(guar) = e_len.error_reported() {
+                return Err(error(cx, LayoutError::ReferencesError(guar)));
+            }
 
             let e_len = extract_const_value(cx, ty, e_len)?
                 .try_to_target_usize(tcx)
@@ -826,6 +837,37 @@ fn layout_of_uncached<'tcx>(
                 layout.backend_repr = BackendRepr::Scalar(bfloat);
             }
 
+            let arch = &tcx.target_spec().arch;
+
+            if tcx.is_lang_item(def.did(), LangItem::PpcF128) {
+                std::assert_matches!(arch, Arch::PowerPC | Arch::PowerPC64);
+
+                let ppcf128 = scalar_unit(Primitive::Float(abi::Float::PpcF128));
+                assert_eq!(layout.size, abi::Float::PpcF128.size());
+                layout.align = abi::Float::PpcF128.align(cx);
+                layout.backend_repr = BackendRepr::Scalar(ppcf128);
+            }
+
+            if tcx.is_lang_item(def.did(), LangItem::X87F80Raw) {
+                std::assert_matches!(arch, Arch::X86 | Arch::X86_64);
+
+                // The lang item has no fields: give it a scalar layout.
+                return Ok(scalar(Primitive::Float(abi::Float::X87F80)));
+            }
+
+            if tcx.is_lang_item(def.did(), LangItem::X87F80) {
+                std::assert_matches!(arch, Arch::X86 | Arch::X86_64);
+
+                // A wrapper around `x87_f80_raw` that adds the target-specific alignment.
+                // It is an ordinary aggregate with trailing padding.
+                assert_eq!(layout.size, abi::Float::X87F80.size());
+                layout.align = cx.data_layout().x87_f80_align;
+                layout.unadjusted_abi_align = layout.align;
+                layout.size = layout.size.align_to(layout.align);
+                layout.backend_repr = BackendRepr::Memory { sized: true };
+                layout.largest_niche = None;
+            }
+
             tcx.mk_layout(layout)
         }
 
@@ -864,6 +906,9 @@ fn layout_of_uncached<'tcx>(
             // `ty::Error` is handled at the top of this function.
             bug!("layout_of: unexpected type `{ty}`")
         }
+
+        // FIXME(scrabsha)
+        ty::View(..) => unimplemented!(),
     })
 }
 
@@ -881,7 +926,7 @@ fn record_layout_for_printing<'tcx>(cx: &LayoutCx<'tcx>, layout: TyAndLayout<'tc
         cx.tcx().sess.code_stats.record_type_size(
             kind,
             type_desc,
-            layout.align.abi,
+            layout.align,
             layout.size,
             packed,
             opt_discr_size,
@@ -991,7 +1036,7 @@ fn variant_info_for_coroutine<'tcx>(
     cx: &LayoutCx<'tcx>,
     layout: TyAndLayout<'tcx>,
     def_id: DefId,
-    args: ty::GenericArgsRef<'tcx>,
+    args: ty::GenericArgs<'tcx>,
 ) -> (Vec<VariantInfo>, Option<Size>) {
     use itertools::Itertools;
 

@@ -223,7 +223,7 @@ fn predicate_references_self<'tcx>(
     match predicate.kind().skip_binder() {
         ty::ClauseKind::Trait(ref data) => {
             // In the case of a trait predicate, we can skip the "self" type.
-            data.trait_ref.args[1..]
+            data.trait_ref.args.as_slice()[1..]
                 .iter()
                 .any(|&arg| {
                     contains_illegal_self_type_reference(
@@ -251,7 +251,7 @@ fn predicate_references_self<'tcx>(
             //
             // This is ALT2 in issue #56288, see that for discussion of the
             // possible alternatives.
-            data.projection_term.args[1..]
+            data.projection_term.args.as_slice()[1..]
                 .iter()
                 .any(|&arg| {
                     contains_illegal_self_type_reference(
@@ -276,6 +276,8 @@ fn predicate_references_self<'tcx>(
 
         // FIXME(generic_const_exprs): this can mention `Self`
         ty::ClauseKind::ConstEvaluatable(..) => None,
+
+        ty::ClauseKind::CompressedTrait(..) => unreachable!(),
     }
 }
 
@@ -339,6 +341,7 @@ fn generics_require_sized_self(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
         | ty::ClauseKind::ConstEvaluatable(_)
         | ty::ClauseKind::UnstableFeature(_)
         | ty::ClauseKind::HostEffect(..) => false,
+        ty::ClauseKind::CompressedTrait(_) => unreachable!(),
     })
 }
 
@@ -361,7 +364,10 @@ pub fn dyn_compatibility_violations_for_assoc_item(
     let span = || item.ident(tcx).span;
 
     match item.kind {
-        ty::AssocKind::Const { name } => {
+        ty::AssocKind::Const { data: ty::AssocConstData::Anonymous } => {
+            panic!("anonymous associated consts shouldn't end up here")
+        }
+        ty::AssocKind::Const { data: ty::AssocConstData::Named(name) } => {
             // We will permit type associated consts if they are explicitly mentioned in the
             // trait object type. We can't check this here, as here we only check if it is
             // guaranteed to not be possible.
@@ -535,14 +541,14 @@ fn virtual_call_violations_for_method<'tcx>(
                 // Get the `Span` for all of `self: Ty`, not just `Ty`.
                 match trait_fn {
                     hir::TraitFn::Required([Some(name), ..])
-                        if name.span.eq_ctxt(sig.decl.inputs[0].span) =>
+                        if name.span.ctxt() == sig.decl.inputs[0].span.ctxt() =>
                     {
                         Some(name.span.to(sig.decl.inputs[0].span))
                     }
                     hir::TraitFn::Provided(body_id)
                         if let body = tcx.hir_body(*body_id)
                             && let Some(p) = body.params.get(0)
-                            && p.span.eq_ctxt(p.ty_span) =>
+                            && p.span.ctxt() == p.ty_span.ctxt() =>
                     {
                         Some(p.span.to(p.ty_span))
                     }
@@ -749,13 +755,60 @@ fn receiver_is_dispatchable<'tcx>(
         let trait_predicate = ty::TraitRef::new_from_args(tcx, trait_def_id, args);
         clauses.push(trait_predicate.upcast(tcx));
 
-        // U satisfies `Trait`'s where-bounds.
+        // U satisfies Trait's trait bounds. Supertrait bounds are already included by the expansion
+        // of `U: Trait<...>` done by param-env normalization. However, normalizing aliases in the
+        // arguments of those supertrait bounds can generate trait obligations which may only be
+        // provable using other where-clauses from Trait (#161621).
         clauses.extend(
             tcx.clauses_of(trait_def_id)
                 .instantiate(tcx, args)
                 .clauses
                 .into_iter()
-                .map(Unnormalized::skip_norm_wip),
+                .map(Unnormalized::skip_norm_wip)
+                // For simplicity, add all trait clauses, though strictly this should only need to
+                // add non-supertrait clauses involving Self.
+                .filter(|clause| matches!(clause.kind().skip_binder(), ty::ClauseKind::Trait(_))),
+        );
+
+        // When Self appears in the arguments of a projection clause, we also need a corresponding
+        // projection for U. We don't want U in the targets of projections that doesn't also have
+        // U in the alias, since that can lead to ambiguity (#163550). For example, if we have
+        // `(): HasAssoc<Assoc = Self>` in Trait's clauses, `<() as HasAssoc>::Assoc` normalizes to
+        // Self during dispatchability checking, since we assume `method`'s clauses. This should be
+        // fine: if `dyn Trait<...>: Trait<...>` isn't satisfied, you can't call methods on such a
+        // trait object anyway.
+        //
+        // HACK: This relies on param-env normalization jank. We don't normalize the left-hand side
+        // of bounds like `<Self as HasAssoc1>::Assoc: HasAssoc2<Assoc = Self>` in the param-env we
+        // use to normalize our param-env. If it's someday possible for `<Self as HasAssoc1>::Assoc`
+        // to normalize there, we won't know whether Self is in the arguments of
+        // `<<Self as HasAssoc1>::Assoc as HasAssoc2>::Assoc == Self` or not. In that case, this may
+        // need first to normalize Trait's projection clauses or do additional hacks to avoid adding
+        // ambiguity.
+        clauses.extend(
+            tcx.clauses_of(trait_def_id)
+                .instantiate_identity(tcx)
+                .clauses
+                .into_iter()
+                .map(Unnormalized::skip_norm_wip)
+                .filter_map(|clause| -> Option<ty::Clause<'tcx>> {
+                    clause
+                        .as_projection_clause()
+                        // For each clause `Alias == ProjectionTarget` with Self in Alias, make a
+                        // copy of the clause with U in place of Self. Strictly, this should only
+                        // need to add clauses that didn't come from supertrait bounds.
+                        .filter(|proj| {
+                            proj.skip_binder().projection_term.args.iter().any(|arg| {
+                                arg.as_type().is_some_and(|arg| arg.contains(tcx.types.self_param))
+                            })
+                        })
+                        .map(|proj| {
+                            proj.map_bound(|proj| {
+                                EarlyBinder::bind(tcx, proj).instantiate(tcx, args).skip_norm_wip()
+                            })
+                            .upcast(tcx)
+                        })
+                }),
         );
 
         let meta_sized_predicate = {
@@ -766,7 +819,7 @@ fn receiver_is_dispatchable<'tcx>(
 
         normalize_param_env_or_error(
             tcx,
-            ty::ParamEnv::new(tcx, clauses),
+            clauses,
             ObligationCause::dummy_with_span(tcx.def_span(method.def_id)),
         )
     };
@@ -980,27 +1033,30 @@ fn contains_illegal_impl_trait_in_trait<'tcx>(
     fn_def_id: DefId,
     ty: ty::Binder<'tcx, Ty<'tcx>>,
 ) -> Option<MethodViolation> {
+    if !ty.has_aliases() {
+        // RPITIT is a projection, short-circuit if none exist.
+        return None;
+    }
+
     let ty = tcx.liberate_late_bound_regions(fn_def_id, ty);
 
     if tcx.asyncness(fn_def_id).is_async() {
         // Rendering the error as a separate `async-specific` message is better.
         Some(MethodViolation::AsyncFn)
     } else {
-        ty.visit_with(&mut IllegalRpititVisitor { tcx, allowed: None }).break_value()
+        ty.visit_with(&mut IllegalRpititVisitor { tcx }).break_value()
     }
 }
 
 struct IllegalRpititVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
-    allowed: Option<ty::AliasTy<'tcx>>,
 }
 
 impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for IllegalRpititVisitor<'tcx> {
     type Result = ControlFlow<MethodViolation>;
 
     fn visit_ty(&mut self, ty: Ty<'tcx>) -> Self::Result {
-        if let ty::Alias(_, proj @ ty::AliasTy { kind: ty::Projection { def_id }, .. }) = *ty.kind()
-            && Some(proj) != self.allowed
+        if let ty::Alias(_, ty::AliasTy { kind: ty::Projection { def_id }, .. }) = *ty.kind()
             && self.tcx.is_impl_trait_in_trait(def_id)
         {
             ControlFlow::Break(MethodViolation::ReferencesImplTraitInTrait(

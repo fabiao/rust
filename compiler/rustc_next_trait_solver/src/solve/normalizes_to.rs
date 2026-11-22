@@ -8,8 +8,8 @@ use rustc_type_ir::solve::{
     RerunNonErased, RerunReason, RerunResultExt,
 };
 use rustc_type_ir::{
-    self as ty, Const, FieldInfo, Interner, NormalizesTo, PredicateKind, Region, Unnormalized,
-    Upcast as _,
+    self as ty, CallerBoundsIterator, Const, FieldInfo, Interner, NormalizesTo, PredicateKind,
+    Region, Unnormalized, Upcast as _,
 };
 use tracing::instrument;
 
@@ -180,6 +180,18 @@ where
         self.trait_def_id(cx)
     }
 
+    fn non_fast_rejected_caller_bounds(
+        ecx: &mut EvalCtxt<'_, D>,
+        goal: Goal<I, Self>,
+    ) -> impl Iterator<Item = ty::Binder<I, ty::ClauseKind<I>>> {
+        goal.param_env.caller_bounds().non_trait_clauses().iter().filter_map(move |assumption| {
+            match Self::fast_reject_assumption(ecx, goal, assumption) {
+                Ok(()) => Some(assumption.kind()),
+                Err(NoSolution) => None,
+            }
+        })
+    }
+
     fn fast_reject_assumption(
         ecx: &mut EvalCtxt<'_, D>,
         goal: Goal<I, Self>,
@@ -206,11 +218,18 @@ where
     fn match_assumption(
         ecx: &mut EvalCtxt<'_, D>,
         goal: Goal<I, Self>,
-        assumption: I::Clause,
+        assumption: ty::Binder<I, ty::ClauseKind<I>>,
         then: impl FnOnce(&mut EvalCtxt<'_, D>) -> QueryResultOrRerunNonErased<I>,
     ) -> QueryResultOrRerunNonErased<I> {
         let cx = ecx.cx();
-        let projection_pred = assumption.as_projection_clause().unwrap();
+        let projection_pred = assumption
+            .map_bound(|i| match i {
+                ty::ClauseKind::Projection(p) => Some(p),
+                _ => None,
+            })
+            .transpose()
+            .unwrap();
+
         let assumption_projection_pred = ecx.instantiate_binder_with_infer(projection_pred);
         ecx.eq(goal.param_env, goal.predicate.alias, assumption_projection_pred.projection_term)?;
 
@@ -349,7 +368,7 @@ where
                             }
                             // Outside of coherence, we treat the associated item as rigid instead.
                             ty::TypingMode::Typeck { .. }
-                            | ty::TypingMode::PostTypeckUntilBorrowck { .. }
+                            | ty::TypingMode::PostTypeckThroughBorrowck { .. }
                             | ty::TypingMode::PostBorrowck { .. }
                             | ty::TypingMode::PostAnalysis
                             | ty::TypingMode::Reflection
@@ -458,7 +477,7 @@ where
                         },
                         target_args,
                     );
-                    return ecx.evaluate_const_and_instantiate_projection_term(
+                    return ecx.evaluate_const(
                         goal.param_env,
                         goal.predicate.alias,
                         goal.predicate.term,
@@ -528,6 +547,13 @@ where
         goal: Goal<I, Self>,
     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
         panic!("`FnPtr` does not have an associated type: {:?}", goal);
+    }
+
+    fn consider_builtin_fn_static_trait_candidate(
+        _ecx: &mut EvalCtxt<'_, D>,
+        goal: Goal<I, Self>,
+    ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
+        panic!("`FnStatic` does not have an associated type: {:?}", goal);
     }
 
     fn consider_builtin_fn_trait_candidates(
@@ -808,6 +834,9 @@ where
                 "unexpected self ty `{:?}` when normalizing `<T as Pointee>::Metadata`",
                 goal.predicate.self_ty()
             ),
+
+            // FIXME(scrabsha)
+            ty::View(..) => unimplemented!(),
         };
 
         ecx.probe_builtin_trait_candidate(BuiltinImplSource::Misc).enter(|ecx| {
@@ -1028,6 +1057,9 @@ where
                 "unexpected self ty `{:?}` when normalizing `<T as DiscriminantKind>::Discriminant`",
                 goal.predicate.self_ty()
             ),
+
+            // FIXME(scrabsha)
+            ty::View(..) => unimplemented!(),
         };
 
         ecx.probe_builtin_trait_candidate(BuiltinImplSource::Misc).enter(|ecx| {

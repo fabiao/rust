@@ -24,7 +24,6 @@ expression: test --skip=tests --skip=library --skip=tidyselftest
     - Set({compiler/rustc_ast_pretty})
     - Set({compiler/rustc_attr_ir})
     - Set({compiler/rustc_attr_parsing})
-    - Set({compiler/rustc_baked_icu_data})
     - Set({compiler/rustc_borrowck})
     - Set({compiler/rustc_builtin_macros})
     - Set({compiler/rustc_codegen_llvm})
@@ -128,6 +127,9 @@ expression: test --skip=tests --skip=library --skip=tidyselftest
 [Test] test::RustcBook
     targets: [x86_64-unknown-linux-gnu]
     - Set({src/doc/rustc})
+[Test] test::StdarchGenCheck
+    targets: [x86_64-unknown-linux-gnu]
+    - Set({stdarch-gen-check})
 [Test] test::RustdocTheme
     targets: [x86_64-unknown-linux-gnu]
     - Set({src/tools/rustdoc-themes})
@@ -138,8 +140,11 @@ expression: test --skip=tests --skip=library --skip=tidyselftest
     targets: [x86_64-unknown-linux-gnu]
     - Set({src/tools/rust-installer})
 [Test] test::TestFloatParse
-    targets: [x86_64-unknown-linux-gnu]
+    targets: [aarch64-unknown-linux-gnu]
     - Set({src/tools/test-float-parse})
+[Test] test::CompilerBuiltins
+    targets: [aarch64-unknown-linux-gnu]
+    - Set({compiler-builtins})
 [Test] test::IntrinsicTest
     targets: [x86_64-unknown-linux-gnu]
     - Set({intrinsic-test})

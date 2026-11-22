@@ -26,7 +26,7 @@ fn is_custom_comment(comment: &str) -> bool {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CommentStyle<'a> {
     DoubleSlash,
     TripleSlash,
@@ -94,7 +94,7 @@ impl<'a> CommentStyle<'a> {
         }
     }
 
-    pub(crate) fn line_start(&self) -> &'a str {
+    pub(crate) fn comment_prefix(&self) -> &'a str {
         match *self {
             CommentStyle::DoubleSlash => "// ",
             CommentStyle::TripleSlash => "/// ",
@@ -107,7 +107,7 @@ impl<'a> CommentStyle<'a> {
     }
 
     pub(crate) fn to_str_tuplet(&self) -> (&'a str, &'a str, &'a str) {
-        (self.opener(), self.closer(), self.line_start())
+        (self.opener(), self.closer(), self.comment_prefix())
     }
 }
 
@@ -249,7 +249,7 @@ pub(crate) fn rewrite_comment(
     shape: Shape,
     config: &Config,
 ) -> RewriteResult {
-    identify_comment(orig, block_style, shape, config, false)
+    identify_comment(orig.trim_start(), block_style, shape, config, false)
 }
 
 fn identify_comment(
@@ -306,7 +306,7 @@ fn identify_comment(
 
     let (has_bare_lines, first_group_ending) = match style {
         CommentStyle::DoubleSlash | CommentStyle::TripleSlash | CommentStyle::Doc => {
-            let line_start = style.line_start().trim_start();
+            let line_start = style.comment_prefix().trim_start();
             consume_same_line_comments(style, orig, line_start)
         }
         CommentStyle::Custom(opener) => {
@@ -583,7 +583,7 @@ struct CommentRewrite<'a> {
 
     opener: String,
     closer: String,
-    line_start: String,
+    comment_prefix: String,
     style: CommentStyle<'a>,
 }
 
@@ -633,7 +633,7 @@ impl<'a> CommentRewrite<'a> {
 
             opener: opener.to_owned(),
             closer: closer.to_owned(),
-            line_start: line_start.to_owned(),
+            comment_prefix: line_start.to_owned(),
             style,
         };
         cr.result.push_str(opener);
@@ -842,13 +842,16 @@ impl<'a> CommentRewrite<'a> {
         // 1) wrap_comments = true is configured
         // 2) The comment is not the start of a markdown header doc comment
         // 3) The comment width exceeds the shape's width
-        // 4) No URLS were found in the comment
+        // 4) No URLs were found in the comment
+        // 5) No inline links were found (the pattern is `](...)`)
+        // 6) The comment is not a table item
         // If this changes, the documentation in ../Configurations.md#wrap_comments
         // should be changed accordingly.
         let should_wrap_comment = self.fmt.config.wrap_comments()
             && !is_markdown_header_doc_comment
             && unicode_str_width(line) > self.fmt.shape.width
             && !has_url(line)
+            && !is_inline_link(line)
             && !is_table_item(line);
 
         if should_wrap_comment {
@@ -883,7 +886,8 @@ impl<'a> CommentRewrite<'a> {
             self.fmt.shape = if self.is_prev_line_multi_line {
                 // 1 = " "
                 let offset = 1 + last_line_width(&self.result, self.fmt.config.tab_spaces())
-                    - self.line_start.len();
+                    - self.comment_prefix.len()
+                    - self.fmt_indent.width();
                 Shape {
                     width: self.max_width.saturating_sub(offset),
                     indent: self.fmt_indent,
@@ -976,6 +980,16 @@ fn trim_custom_comment_prefix(s: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Returns `true` if the given string includes link-like fragments.
+/// The pattern is `](...)`
+fn is_inline_link(s: &str) -> bool {
+    if let Some(start) = s.find("](") {
+        let after = &s[start + 2..];
+        return after.contains(')');
+    }
+    false
 }
 
 /// Returns `true` if the given string MAY include URLs or alike.
@@ -1400,7 +1414,6 @@ where
                 match chr {
                     '"' => {
                         if sharps == 0 {
-                            char_kind = FullCodeCharKind::Normal;
                             CharClassesStatus::Normal
                         } else if is_raw_string_suffix(&mut self.base, sharps) {
                             CharClassesStatus::RawStringSuffix(sharps)
@@ -1897,6 +1910,20 @@ mod test {
         assert_eq!((FullCodeCharKind::InComment, '/'), iter.next().unwrap());
         assert_eq!((FullCodeCharKind::EndComment, '\n'), iter.next().unwrap());
         assert_eq!((FullCodeCharKind::Normal, '\n'), iter.next().unwrap());
+        assert_eq!(None, iter.next());
+    }
+
+    #[test]
+    fn char_classes_hashless_raw_string() {
+        let mut iter = CharClasses::new("r\"a\nb\",".chars());
+
+        assert_eq!((FullCodeCharKind::InString, 'r'), iter.next().unwrap());
+        assert_eq!((FullCodeCharKind::InString, '"'), iter.next().unwrap());
+        assert_eq!((FullCodeCharKind::InString, 'a'), iter.next().unwrap());
+        assert_eq!((FullCodeCharKind::InString, '\n'), iter.next().unwrap());
+        assert_eq!((FullCodeCharKind::InString, 'b'), iter.next().unwrap());
+        assert_eq!((FullCodeCharKind::InString, '"'), iter.next().unwrap());
+        assert_eq!((FullCodeCharKind::Normal, ','), iter.next().unwrap());
         assert_eq!(None, iter.next());
     }
 

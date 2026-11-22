@@ -298,7 +298,7 @@ fn from_str(s: &str) -> Result<bool, ()> {
     }
 }
 
-#[lang = "eq"]
+#[lang = "partial_eq"]
 pub const trait PartialEq<Rhs: PointeeSized = Self>: PointeeSized {
     fn eq(&self, other: &Rhs) -> bool;
     fn ne(&self, other: &Rhs) -> bool {
@@ -445,7 +445,6 @@ impl<T: MetaSized> Deref for Ref<'_, T> {
 }
 
 #[lang = "clone"]
-#[rustc_trivial_field_reads]
 pub const trait Clone: Sized {
     fn clone(&self) -> Self;
     fn clone_from(&mut self, source: &Self)

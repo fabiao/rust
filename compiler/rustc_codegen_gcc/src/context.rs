@@ -16,11 +16,11 @@ use rustc_middle::ty::layout::{
     FnAbiError, FnAbiOf, FnAbiOfHelpers, FnAbiRequest, HasTyCtxt, HasTypingEnv, LayoutError,
     LayoutOfHelpers, codegen_handle_fn_abi_err,
 };
-use rustc_middle::ty::{self, ExistentialTraitRef, Instance, Ty, TyCtxt};
+use rustc_middle::ty::{self, ExistentialTraitRef, Instance, Intrinsic, Ty, TyCtxt};
 #[cfg(feature = "master")]
 use rustc_session::config::DebugInfo;
 use rustc_session::{PointerAuthSchema, Session};
-use rustc_span::{DUMMY_SP, Span, Symbol};
+use rustc_span::{DUMMY_SP, Span};
 use rustc_target::spec::{HasTargetSpec, HasX86AbiOpt, Target, TlsModel, X86Abi};
 
 #[cfg(feature = "master")]
@@ -97,11 +97,17 @@ pub struct CodegenCx<'gcc, 'tcx> {
     /// Cache of the anonymous struct types.
     pub struct_types: RefCell<FxHashMap<StructTypeKey<'gcc>, Type<'gcc>>>,
 
-    /// Cache of the array types used for runs of constant bytes, keyed by element type and count.
+    /// Cache of the array types used for runs of constant bytes, keyed by length.
     ///
     /// libgccjit mints a fresh type on every `new_array_type`, and struct types are keyed on their
     /// field types, so without this two equal byte runs would yield two distinct anonymous structs.
-    pub byte_array_types: RefCell<FxHashMap<(Type<'gcc>, u64), Type<'gcc>>>,
+    pub byte_array_types: RefCell<FxHashMap<usize, Type<'gcc>>>,
+
+    /// Cache of the return types of the pairs returned in two registers, keyed by the types of the
+    /// two scalars.
+    pub two_register_pair_types: RefCell<FxHashMap<(Type<'gcc>, Type<'gcc>), Type<'gcc>>>,
+    /// The types of `two_register_pair_types`.
+    pub two_register_pair_type_set: RefCell<FxHashSet<Type<'gcc>>>,
 
     /// Cache instances of monomorphic and polymorphic items
     pub instances: RefCell<FxHashMap<Instance<'tcx>, LValue<'gcc>>>,
@@ -117,8 +123,11 @@ pub struct CodegenCx<'gcc, 'tcx> {
     /// Mapping from function to indexes of on stack parameters.
     pub on_stack_function_params: RefCell<FxHashMap<Function<'gcc>, FxHashSet<usize>>>,
 
-    /// Cache of emitted const globals (value -> global)
-    pub const_globals: RefCell<FxHashMap<RValue<'gcc>, RValue<'gcc>>>,
+    /// Local holding the return value of the defined functions returning it in memory.
+    pub functions_with_indirect_return: RefCell<FxHashMap<Function<'gcc>, LValue<'gcc>>>,
+
+    /// Cache of emitted const globals (value -> global and its alignment)
+    pub const_globals: RefCell<FxHashMap<RValue<'gcc>, (RValue<'gcc>, Align)>>,
 
     /// Map from the address of a global variable (rvalue) to the global variable itself (lvalue).
     /// FIXME(antoyo): remove when the rustc API is fixed.
@@ -138,7 +147,7 @@ pub struct CodegenCx<'gcc, 'tcx> {
 
     eh_personality: Cell<Option<Function<'gcc>>>,
     #[cfg(feature = "master")]
-    pub rust_try_fn: Cell<Option<(Type<'gcc>, Function<'gcc>)>>,
+    pub rust_try_fn: Cell<Option<Function<'gcc>>>,
 
     pub pointee_infos: RefCell<FxHashMap<(Ty<'tcx>, Size), Option<PointeeInfo>>>,
 
@@ -255,8 +264,7 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
             int128_align: tcx
                 .layout_of(ty::TypingEnv::fully_monomorphized().as_query_input(tcx.types.i128))
                 .expect("Can't get the layout of `i128`")
-                .align
-                .abi,
+                .align,
             const_cache: Default::default(),
             codegen_unit,
             context,
@@ -308,6 +316,7 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
             function_instances: Default::default(),
             intrinsic_instances: Default::default(),
             on_stack_function_params: Default::default(),
+            functions_with_indirect_return: Default::default(),
             vtables: Default::default(),
             const_globals: Default::default(),
             global_lvalues: Default::default(),
@@ -318,6 +327,8 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
             tcx,
             struct_types: Default::default(),
             byte_array_types: Default::default(),
+            two_register_pair_types: Default::default(),
+            two_register_pair_type_set: Default::default(),
             local_gen_sym_counter: Cell::new(0),
             global_gen_sym_counter: Cell::new(0),
             eh_personality: Cell::new(None),
@@ -360,17 +371,6 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
         }
 
         self.landing_pads.borrow_mut().clear();
-    }
-
-    pub fn rvalue_as_function(&self, value: RValue<'gcc>) -> Function<'gcc> {
-        let function: Function<'gcc> = unsafe { std::mem::transmute(value) };
-        debug_assert!(
-            self.functions.borrow().values().any(|value| *value == function),
-            "{:?} ({:?}) is not a function",
-            value,
-            value.get_type()
-        );
-        function
     }
 
     pub fn is_native_int_type(&self, typ: Type<'gcc>) -> bool {
@@ -506,7 +506,7 @@ impl<'gcc, 'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'gcc, 'tcx> {
                     tcx,
                     self.typing_env(),
                     def_id,
-                    ty::List::empty(),
+                    ty::GenericArgs::empty(),
                     DUMMY_SP,
                 );
 
@@ -516,10 +516,12 @@ impl<'gcc, 'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'gcc, 'tcx> {
                 self.declare_fn(symbol_name, fn_abi)
             }
             _ => {
+                let rust_name;
                 let name = if wants_msvc_seh(&self.sess().target) {
                     "__CxxFrameHandler3"
                 } else {
-                    "rust_eh_personality"
+                    rust_name = rustc_symbol_mangling::eh_personality_symbol(tcx);
+                    &rust_name
                 };
                 self.declare_func(name, self.type_i32(), &[], true)
             }
@@ -558,7 +560,7 @@ impl<'gcc, 'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'gcc, 'tcx> {
         }
     }
 
-    fn intrinsic_call_expects_place_always(&self, _name: Symbol) -> bool {
+    fn intrinsic_call_expects_place_always(&self, _name: Intrinsic) -> bool {
         true
     }
 }

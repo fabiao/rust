@@ -61,49 +61,49 @@ fn main() {
 ```
 
 ## Compile instructions
-It is important to use a clang compiler build on the same LLVM as rustc.
-Just calling clang without the full path will likely use your system clang, which probably will be incompatible.
-So either substitute clang/lld invocations below with absolute path, or set your `PATH` accordingly.
-
 The compilation runs three passes:
 1. `HostMetadata`: compile the host code, writing a manifest that lists the kernel
    instantiations (including generic ones) required by the host code.
-2. `Device`: compile the kernels for the GPU, reading the manifest so the recorded generic
-   instantiations are codegened.
+2. `Device`: compile the kernels for the GPU,
+   reading the manifest so the recorded generic instantiations are codegened.
 3. `Host`: generate the final host code, embedding the device artifact.
 
 <div class="warning">
 
-Replace the `target-cpu` (gfx90a) with the right code for your GPU.
-These are often referred to as "LLVM target names"[^list].
+The commands below target an AMD GPU.
+For your GPU, change:
+- `-Ctarget-cpu=gfx90a` to your GPU's target CPU (e.g. `sm_86` on NVIDIA)[^list]
+- on NVIDIA, `amdgcn-amd-amdhsa` to `nvptx64-nvidia-cuda` (in `--target` and in the `-Zoffload=Host` path), and `.elf` to `.ptx`
 
 </div>
 
 First we generate the manifest from the host code:
 ```
-RUSTFLAGS="--emit=llvm-bc,llvm-ir -Csave-temps -Zoffload=HostMetadata=/absolute/path/to/offload.manifest -Zunstable-options" cargo +offload build -r
+RUSTFLAGS="-Zoffload=HostMetadata=/absolute/path/to/offload.manifest -Zunstable-options" cargo +offload build -r
 ```
 This pass only writes the manifest.
 
 Now we generate the device (GPU) code, passing the manifest:
 ```
-RUSTFLAGS="-Ctarget-cpu=gfx90a --emit=llvm-bc,llvm-ir -Zoffload=Device=/absolute/path/to/offload.manifest -Csave-temps -Zunstable-options" cargo +offload build -Zunstable-options -r -v --target amdgcn-amd-amdhsa -Zbuild-std=core
+RUSTFLAGS="-Ctarget-cpu=gfx90a -Zoffload=Device=/absolute/path/to/offload.manifest -Zunstable-options" cargo +offload build -Zunstable-options -r -v --target amdgcn-amd-amdhsa -Zbuild-std=core
 ```
 
 Next we generate the host (CPU) code.
 ```
-RUSTFLAGS="--emit=llvm-bc,llvm-ir -Csave-temps -Zoffload=Host=$PWD/target/amdgcn-amd-amdhsa/release/deps/device.bin -Zunstable-options" cargo +offload build -r
+RUSTFLAGS="-C lto=fat -C embed-bitcode=yes -Zoffload=Host=$PWD/target/amdgcn-amd-amdhsa/release/<crate_name>.elf -Zunstable-options" cargo +offload build -r
 ```
 
 In the final step, you can now run your binary
 
 ```
-./target/x86_64-unknown-linux-gnu/release/binary-name
+./target/release/binary-name
 all checks passed!
 ```
 
-These three steps will soon be wrapped into a single command, once we had more time to test all steps.
+These three steps will soon be wrapped into a single command,
+once we had more time to test all steps.
 
-To receive more information about the memory transfer, you can enable info printing by adding `LIBOMPTARGET_INFO=-1` ahead of your binary call.
+To receive more information about the memory transfer,
+you can enable info printing by adding `LIBOMPTARGET_INFO=-1` ahead of your binary call.
 
 [^list]: https://rocm.docs.amd.com/en/latest/reference/gpu-arch-specs.html or https://developer.nvidia.com/cuda/gpus. Alternatively, check `rustc --print target-cpus`.

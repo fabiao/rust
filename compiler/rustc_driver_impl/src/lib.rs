@@ -59,7 +59,7 @@ use rustc_session::output::invalid_output_for_target;
 use rustc_session::{EarlyDiagCtxt, Session, config};
 use rustc_span::def_id::LOCAL_CRATE;
 use rustc_span::{DUMMY_SP, FileName};
-use rustc_structures::CrateType;
+use rustc_structures::{CrateType, LintName};
 use rustc_target::json::ToJson;
 use rustc_target::spec::{Target, TargetTuple};
 use tracing::trace;
@@ -203,6 +203,7 @@ pub fn compiler_entrypoint(at_args: &[String], callbacks: &mut (dyn Callbacks + 
     let sopts =
         config::build_session_options(&mut default_early_dcx, &matches, warn_unspecified_edition);
     let ice_file = ice_path_with_config(Some(&sopts.unstable_opts)).clone();
+    let _ = ICE_COLOR.set(sopts.color);
 
     if let Some(ref code) = matches.opt_str("explain") {
         handle_explain(&default_early_dcx, code, sopts.color);
@@ -334,7 +335,16 @@ pub fn compiler_entrypoint(at_args: &[String], callbacks: &mut (dyn Callbacks + 
                 }
             }
 
-            let linker = Linker::codegen_and_build_linker(tcx, codegen_backend);
+            let metadata = passes::finish_and_emit_metadata(tcx);
+
+            // Don't do code generation if there were any errors. Likewise if
+            // there were any delayed bugs, because codegen will likely cause
+            // more ICEs, obscuring the original problem.
+            if let Some(guar) = tcx.sess.dcx().has_errors_or_delayed_bugs() {
+                guar.raise_fatal();
+            }
+
+            let linker = Linker::codegen_and_build_linker(tcx, codegen_backend, metadata);
 
             if let Some(metrics_dir) = &sess.opts.unstable_opts.metrics_dir {
                 dump_feature_usage_metrics(tcx, metrics_dir);
@@ -391,7 +401,7 @@ fn make_input(early_dcx: &EarlyDiagCtxt, free_matches: &[String]) -> Option<Inpu
                     .early_fatal("couldn't read from stdin, as it did not contain valid UTF-8");
             }
 
-            let name = match env::var("UNSTABLE_RUSTDOC_TEST_PATH") {
+            match env::var("UNSTABLE_RUSTDOC_TEST_PATH") {
                 Ok(path) => {
                     let line = env::var("UNSTABLE_RUSTDOC_TEST_LINE").expect(
                         "when UNSTABLE_RUSTDOC_TEST_PATH is set \
@@ -400,12 +410,13 @@ fn make_input(early_dcx: &EarlyDiagCtxt, free_matches: &[String]) -> Option<Inpu
                     let line = line
                         .parse::<isize>()
                         .expect("UNSTABLE_RUSTDOC_TEST_LINE needs to be a number");
-                    FileName::doc_test_source_code(PathBuf::from(path), line)
+                    Some(Input::DocTestStr { file: PathBuf::from(path), line, input })
                 }
-                Err(_) => FileName::anon_source_code(&input),
-            };
-
-            Some(Input::Str { name, input })
+                Err(_) => {
+                    let name = FileName::anon_source_code(&input);
+                    Some(Input::Str { name, input })
+                }
+            }
         }
         [ifile] => Some(Input::File(PathBuf::from(ifile))),
         [ifile1, ifile2, ..] => early_dcx.early_fatal(format!(
@@ -516,9 +527,11 @@ fn show_md_content_with_pager(content: &str, color: ColorConfig) {
     }
 
     // The pager failed. Try to print pretty output to stdout.
-    if let Some((bufwtr, mdbuf)) = &mut pretty_data
+    if matches!(color, ColorConfig::Auto | ColorConfig::Always)
+        && let Some((bufwtr, mdbuf)) = &mut pretty_data
         && bufwtr.write_all(&mdbuf).is_ok()
     {
+        // Colored output was successfully printed to stdout.
         return;
     }
 
@@ -619,7 +632,7 @@ fn list_metadata(sess: &Session, metadata_loader: &dyn MetadataLoader) {
             }
             safe_println!("{}", String::from_utf8(v).unwrap());
         }
-        Input::Str { .. } => {
+        Input::Str { .. } | Input::DocTestStr { .. } => {
             sess.dcx().fatal("cannot list metadata for stdin");
         }
     }
@@ -988,11 +1001,9 @@ Available lint options:
         lints
     }
 
-    fn sort_lint_groups(
-        lints: Vec<(&'static str, Vec<LintId>, bool)>,
-    ) -> Vec<(&'static str, Vec<LintId>)> {
+    fn sort_lint_groups(lints: Vec<(LintName, Vec<LintId>, bool)>) -> Vec<(LintName, Vec<LintId>)> {
         let mut lints: Vec<_> = lints.into_iter().map(|(x, y, _)| (x, y)).collect();
-        lints.sort_by_key(|l| l.0);
+        lints.sort_by(|left, right| Ord::cmp(&left.0, &right.0));
         lints
     }
 
@@ -1039,7 +1050,7 @@ Available lint options:
         loaded_groups
             .iter()
             .chain(&builtin_groups)
-            .map(|&(s, _)| s.chars().count())
+            .map(|(s, _)| s.name.as_str().chars().count())
             .max()
             .unwrap_or(0),
     );
@@ -1052,7 +1063,7 @@ Available lint options:
 
     safe_println!("Lint groups provided by rustc:\n");
 
-    let print_lint_groups = |lints: Vec<(&'static str, Vec<LintId>)>, all_warnings| {
+    let print_lint_groups = |lints: Vec<(LintName, Vec<LintId>)>, all_warnings| {
         safe_println!("    {}  sub-lints", padded("name"));
         safe_println!("    {}  ---------", padded("----"));
 
@@ -1061,7 +1072,7 @@ Available lint options:
         }
 
         for (name, to) in lints {
-            let name = name.to_lowercase().replace('_', "-");
+            let name = name.to_string().to_lowercase().replace('_', "-");
             let desc = to
                 .into_iter()
                 .map(|x| x.to_string().replace('_', "-"))
@@ -1303,7 +1314,7 @@ pub fn handle_help(matches: &getopts::Matches, args: &[String]) -> bool {
     let chelp_pos = opt_help_pos("C");
     let print_help = || {
         // Only show unstable options in --help if we accept unstable options.
-        let unstable_enabled = nightly_options::is_unstable_enabled(&matches);
+        let unstable_enabled = nightly_options::unstable_options_enabled(&matches);
         let nightly_build = nightly_options::match_is_nightly_build(&matches);
         usage(matches.opt_present("verbose"), unstable_enabled, nightly_build);
     };
@@ -1373,12 +1384,14 @@ fn parse_crate_attrs<'a>(sess: &'a Session) -> PResult<'a, ast::AttrVec> {
         Input::File(file) => {
             new_parser_from_file(&sess.psess, file, StripTokens::ShebangAndFrontmatter, None)
         }
-        Input::Str { name, input } => new_parser_from_source_str(
-            &sess.psess,
-            name.clone(),
-            input.clone(),
-            StripTokens::ShebangAndFrontmatter,
-        ),
+        instr @ (Input::Str { input, .. } | Input::DocTestStr { input, .. }) => {
+            new_parser_from_source_str(
+                &sess.psess,
+                instr.file_name(sess),
+                input.clone(),
+                StripTokens::ShebangAndFrontmatter,
+            )
+        }
     });
     parser.parse_inner_attributes()
 }
@@ -1392,6 +1405,7 @@ pub fn catch_with_exit_code<T: Termination>(f: impl FnOnce() -> T) -> ExitCode {
     }
 }
 
+static ICE_COLOR: OnceLock<ColorConfig> = OnceLock::new();
 static ICE_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 // This function should only be called from the ICE hook.
@@ -1462,7 +1476,7 @@ pub fn install_ice_hook(bug_report_url: &'static str, extra_info: fn(DiagCtxtHan
     // (e.g. `RUST_BACKTRACE=1`)
     if env::var_os("RUST_BACKTRACE").is_none() {
         // HACK: this check is extremely dumb, but we don't really need it to be smarter since this should only happen in the test suite anyway.
-        let ui_testing = std::env::args().any(|arg| arg == "-Zui-testing");
+        let ui_testing = env::args_os().any(|arg| arg == "-Zui-testing");
         if env!("CFG_RELEASE_CHANNEL") == "dev" && !ui_testing {
             panic::set_backtrace_style(panic::BacktraceStyle::Short);
         } else {
@@ -1538,9 +1552,10 @@ fn report_ice(
     extra_info: fn(DiagCtxtHandle<'_>),
     using_internal_features: &AtomicBool,
 ) {
+    let color = ICE_COLOR.get().copied().unwrap_or(ColorConfig::Auto);
     let emitter =
         Box::new(rustc_errors::annotate_snippet_emitter_writer::AnnotateSnippetEmitter::new(
-            stderr_destination(rustc_errors::ColorConfig::Auto),
+            stderr_destination(color),
         ));
     let dcx = DiagCtxt::new(emitter);
     let dcx = dcx.handle();

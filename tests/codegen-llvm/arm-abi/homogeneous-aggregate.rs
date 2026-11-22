@@ -1,17 +1,20 @@
 //@ add-minicore
 //@ compile-flags: -Cno-prepopulate-passes -Copt-level=0
 //
-//@ revisions: linux eabi watchos
+//@ revisions: linux eabi watchos msvc
 //@[linux] compile-flags: --target armv7-unknown-linux-gnueabihf
+//@[linux] filecheck-flags: --check-prefixes vfp
 //@[eabi] compile-flags: --target armv7r-none-eabi
 //@[watchos] compile-flags: --target armv7k-apple-watchos
+//@[msvc] compile-flags: --target thumbv7a-pc-windows-msvc
+//@[msvc] filecheck-flags: --check-prefixes vfp
 //
 //@ needs-llvm-components: arm
 
 // Test that homogeneous aggregates are passed and returned with the correct ABI on 32-bit arm.
 
 #![feature(no_core, lang_items)]
-#![feature(arm_target_feature)]
+#![feature(arm_target_feature, f16, f128)]
 #![crate_type = "lib"]
 #![no_core]
 
@@ -19,37 +22,69 @@ extern crate minicore;
 use minicore::simd::*;
 use minicore::*;
 
-// A homogeneous float aggregate, which a hard-float ABI passes in VFP registers.
+// A singleton homogeneous float aggregate.
 #[repr(C)]
-pub struct Hfa {
+pub struct Hfa1 {
     pub a: f32,
-    pub b: f32,
 }
-impl Copy for Hfa {}
 
-// linux:   define void @test_hfa([2 x float] %0)
-// eabi:    define dso_local void @test_hfa([2 x i32] %0)
-// watchos: define void @test_hfa([2 x float] %0)
+// vfp:     define void @test_hfa1([1 x float] %0)
+// eabi:    define dso_local void @test_hfa1([1 x i32] %0)
+// watchos: define void @test_hfa1([1 x float] %0)
 #[unsafe(no_mangle)]
-pub extern "C" fn test_hfa(a: Hfa) {
+pub extern "C" fn test_hfa1(a: Hfa1) {
     hint::black_box(a);
 }
 
-// linux:   define [2 x float] @ret_hfa([2 x float] %0)
-// eabi:    define dso_local void @ret_hfa(ptr sret([8 x i8]) align 4 %_0, [2 x i32] %0)
-// watchos: define [2 x float] @ret_hfa([2 x float] %0)
+// vfp:     define [1 x float] @ret_hfa1([1 x float] %0)
+// eabi:    define dso_local i32 @ret_hfa1([1 x i32] %0)
+// watchos: define [1 x float] @ret_hfa1([1 x float] %0)
 #[unsafe(no_mangle)]
-pub extern "C" fn ret_hfa(a: Hfa) -> Hfa {
+pub extern "C" fn ret_hfa1(a: Hfa1) -> Hfa1 {
     a
 }
 
 // When we ask for `extern "aapcs"` specifically, GPRs are used, except on watchOS.
 //
-// linux:   define arm_aapcscc void @test_hfa_aapcs([2 x i32] %0)
-// eabi:    define dso_local arm_aapcscc void @test_hfa_aapcs([2 x i32] %0)
-// watchos: define arm_aapcscc void @test_hfa_aapcs([2 x float] %0)
+// vfp:     define arm_aapcscc void @test_hfa1_aapcs([1 x i32] %0)
+// eabi:    define dso_local arm_aapcscc void @test_hfa1_aapcs([1 x i32] %0)
+// watchos: define arm_aapcscc void @test_hfa1_aapcs([1 x float] %0)
 #[unsafe(no_mangle)]
-pub extern "aapcs" fn test_hfa_aapcs(a: Hfa) {
+pub extern "aapcs" fn test_hfa1_aapcs(a: Hfa1) {
+    hint::black_box(a);
+}
+
+// A homogeneous float aggregate, which a hard-float ABI passes in VFP registers.
+#[repr(C)]
+pub struct Hfa2 {
+    pub a: f32,
+    pub b: f32,
+}
+impl Copy for Hfa2 {}
+
+// vfp:     define void @test_hfa2([2 x float] %0)
+// eabi:    define dso_local void @test_hfa2([2 x i32] %0)
+// watchos: define void @test_hfa2([2 x float] %0)
+#[unsafe(no_mangle)]
+pub extern "C" fn test_hfa2(a: Hfa2) {
+    hint::black_box(a);
+}
+
+// vfp:     define [2 x float] @ret_hfa2([2 x float] %0)
+// eabi:    define dso_local void @ret_hfa2(ptr sret([8 x i8]) align 4 %_0, [2 x i32] %0)
+// watchos: define [2 x float] @ret_hfa2([2 x float] %0)
+#[unsafe(no_mangle)]
+pub extern "C" fn ret_hfa2(a: Hfa2) -> Hfa2 {
+    a
+}
+
+// When we ask for `extern "aapcs"` specifically, GPRs are used, except on watchOS.
+//
+// vfp:     define arm_aapcscc void @test_hfa2_aapcs([2 x i32] %0)
+// eabi:    define dso_local arm_aapcscc void @test_hfa2_aapcs([2 x i32] %0)
+// watchos: define arm_aapcscc void @test_hfa2_aapcs([2 x float] %0)
+#[unsafe(no_mangle)]
+pub extern "aapcs" fn test_hfa2_aapcs(a: Hfa2) {
     hint::black_box(a);
 }
 
@@ -62,7 +97,7 @@ pub struct Hfa4F64 {
     pub d: f64,
 }
 
-// linux:   define void @test_hfa_4_f64([4 x double] %0)
+// vfp:     define void @test_hfa_4_f64([4 x double] %0)
 // eabi:    define dso_local void @test_hfa_4_f64([4 x i64] %0)
 // watchos: define void @test_hfa_4_f64([4 x double] %0)
 #[unsafe(no_mangle)]
@@ -77,7 +112,7 @@ pub struct Hfa2V2F64 {
     pub b: f64x2,
 }
 
-// linux: define void @test_hfa_2_f64x2([2 x <2 x double>] %0)
+// vfp:   define void @test_hfa_2_f64x2([2 x <2 x double>] %0)
 // eabi: define dso_local void @test_hfa_2_f64x2([4 x i64] %0)
 // watchos: define void @test_hfa_2_f64x2([2 x <2 x double>] %0)
 #[unsafe(no_mangle)]
@@ -92,7 +127,7 @@ pub struct Hfa2V2U64 {
     pub b: u64x2,
 }
 
-// linux: define void @test_hfa_2_u64x2([2 x <16 x i8>] %0)
+// vfp:   define void @test_hfa_2_u64x2([2 x <16 x i8>] %0)
 // eabi: define dso_local void @test_hfa_2_u64x2([4 x i64] %0)
 // watchos: define void @test_hfa_2_u64x2([2 x <16 x i8>] %0)
 #[unsafe(no_mangle)]
@@ -107,7 +142,7 @@ pub struct Hfa2V2F32 {
     pub b: f32x2,
 }
 
-// linux: define void @test_hfa_2_f32x2([2 x <2 x float>] %0)
+// vfp:   define void @test_hfa_2_f32x2([2 x <2 x float>] %0)
 // eabi: define dso_local void @test_hfa_2_f32x2([2 x i64] %0)
 // watchos: define void @test_hfa_2_f32x2([2 x <2 x float>] %0)
 #[unsafe(no_mangle)]
@@ -124,7 +159,7 @@ pub struct Hfa4V2F64 {
     pub d: f64x2,
 }
 
-// linux: define void @test_hfa_4_f64x2([4 x <2 x double>] %0)
+// vfp:   define void @test_hfa_4_f64x2([4 x <2 x double>] %0)
 // eabi: define dso_local void @test_hfa_4_f64x2([8 x i64] %0)
 // watchos: define void @test_hfa_4_f64x2([4 x <2 x double>] %0)
 #[unsafe(no_mangle)]
@@ -143,11 +178,25 @@ pub struct Floats5 {
     pub e: f32,
 }
 
-// linux:   define void @test_floats_5([5 x i32] %0)
+// vfp:     define void @test_floats_5([5 x i32] %0)
 // eabi:    define dso_local void @test_floats_5([5 x i32] %0)
 // watchos: define void @test_floats_5(ptr align 4 %a)
 #[unsafe(no_mangle)]
 pub extern "C" fn test_floats_5(a: Floats5) {
+    hint::black_box(a);
+}
+
+// Only f32 and f64 qualify as an HFA base.
+
+// linux:   define void @test_f16([2 x i32] %0)
+#[unsafe(no_mangle)]
+pub extern "C" fn test_f16(a: [f16; 3]) {
+    hint::black_box(a);
+}
+
+// linux:   define void @test_f128([2 x i64] %0)
+#[unsafe(no_mangle)]
+pub extern "C" fn test_f128(a: [f128; 1]) {
     hint::black_box(a);
 }
 
@@ -163,7 +212,7 @@ pub struct Ints6 {
 }
 impl Copy for Ints6 {}
 
-// linux:   define void @test_ints_6([6 x i32] %0)
+// vfp:     define void @test_ints_6([6 x i32] %0)
 // eabi:    define dso_local void @test_ints_6([6 x i32] %0)
 // watchos: define void @test_ints_6(ptr align 4 %a)
 #[unsafe(no_mangle)]
@@ -179,7 +228,7 @@ pub struct Natural {
 
 // Returns are indirect once they exceed 32 bits, except on watchOS.
 //
-// linux:   define void @ret_natural(ptr sret([8 x i8]) align 4 %_0, [2 x i32] %0)
+// vfp:     define void @ret_natural(ptr sret([8 x i8]) align 4 %_0, [2 x i32] %0)
 // eabi:    define dso_local void @ret_natural(ptr sret([8 x i8]) align 4 %_0, [2 x i32] %0)
 // watchos: define [2 x i32] @ret_natural([2 x i32] %0)
 #[unsafe(no_mangle)]
@@ -194,7 +243,7 @@ pub struct Align16 {
     pub b: u32,
 }
 
-// linux:   define void @ret_align16(ptr sret([16 x i8]) align 16 %_0, [4 x i32] %0)
+// vfp:     define void @ret_align16(ptr sret([16 x i8]) align 16 %_0, [4 x i32] %0)
 // eabi:    define dso_local void @ret_align16(ptr sret([16 x i8]) align 16 %_0, [4 x i32] %0)
 // watchos: define [4 x i32] @ret_align16([2 x i64] %0)
 #[unsafe(no_mangle)]
@@ -204,7 +253,7 @@ pub extern "C" fn ret_align16(a: Align16) -> Align16 {
 
 // Larger than 128 bits, so the return is indirect everywhere.
 //
-// linux:   define void @ret_ints_6(ptr sret([24 x i8]) align 4 %_0, [6 x i32] %0)
+// vfp:     define void @ret_ints_6(ptr sret([24 x i8]) align 4 %_0, [6 x i32] %0)
 // eabi:    define dso_local void @ret_ints_6(ptr sret([24 x i8]) align 4 %_0, [6 x i32] %0)
 // watchos: define void @ret_ints_6(ptr sret([24 x i8]) align 4 %_0, ptr align 4 %a)
 #[unsafe(no_mangle)]
@@ -213,30 +262,30 @@ pub extern "C" fn ret_ints_6(a: Ints6) -> Ints6 {
 }
 
 extern "C" {
-    // linux:   declare void @test_hfa_variadic_c([2 x i32], ...)
+    // vfp:     declare void @test_hfa_variadic_c([2 x i32], ...)
     // eabi:    declare dso_local void @test_hfa_variadic_c([2 x i32], ...)
     // watchos: declare void @test_hfa_variadic_c([2 x float], ...)
-    fn test_hfa_variadic_c(_: Hfa, ...);
+    fn test_hfa_variadic_c(_: Hfa2, ...);
 
-    // linux:   declare void @test_ints_6_variadic_c([6 x i32], ...)
+    // vfp:     declare void @test_ints_6_variadic_c([6 x i32], ...)
     // eabi:    declare dso_local void @test_ints_6_variadic_c([6 x i32], ...)
     // watchos: declare void @test_ints_6_variadic_c(ptr align 4, ...)
     fn test_ints_6_variadic_c(_: Ints6, ...);
 }
 
 extern "aapcs" {
-    // linux:   declare arm_aapcscc void @test_hfa_variadic_aapcs([2 x i32], ...)
+    // vfp:     declare arm_aapcscc void @test_hfa_variadic_aapcs([2 x i32], ...)
     // eabi:    declare dso_local arm_aapcscc void @test_hfa_variadic_aapcs([2 x i32], ...)
     // watchos: declare arm_aapcscc void @test_hfa_variadic_aapcs([2 x float], ...)
-    fn test_hfa_variadic_aapcs(_: Hfa, ...);
+    fn test_hfa_variadic_aapcs(_: Hfa2, ...);
 
-    // linux:   declare arm_aapcscc void @test_ints_6_variadic_aapcs([6 x i32], ...)
+    // vfp:     declare arm_aapcscc void @test_ints_6_variadic_aapcs([6 x i32], ...)
     // eabi:    declare dso_local arm_aapcscc void @test_ints_6_variadic_aapcs([6 x i32], ...)
     // watchos: declare arm_aapcscc void @test_ints_6_variadic_aapcs(ptr align 4, ...)
     fn test_ints_6_variadic_aapcs(_: Ints6, ...);
 }
 
-pub unsafe fn call_variadics(a: Hfa, b: Ints6) {
+pub unsafe fn call_variadics(a: Hfa2, b: Ints6) {
     test_hfa_variadic_c(a);
     test_ints_6_variadic_c(b);
 
