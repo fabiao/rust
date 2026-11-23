@@ -2,14 +2,6 @@
 
 use crate::alloc::Layout;
 
-pub fn reclaim(retain_bytes: usize) -> core::alloc::ReclaimResult {
-    if askrust::alloc::reclaim(retain_bytes) {
-        core::alloc::ReclaimResult::Released
-    } else {
-        core::alloc::ReclaimResult::Unchanged
-    }
-}
-
 #[inline]
 pub unsafe fn alloc(layout: Layout) -> *mut u8 {
     // SAFETY: the preconditions match `GlobalAlloc::alloc`.

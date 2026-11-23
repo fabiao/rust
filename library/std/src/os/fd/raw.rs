@@ -2,12 +2,7 @@
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
-#[cfg(target_os = "hermit")]
-use hermit_abi as libc;
-#[cfg(target_os = "motor")]
-use moto_rt::libc;
-
-#[cfg(target_os = "motor")]
+#[cfg(any(target_os = "motor", target_os = "ask"))]
 use super::owned::OwnedFd;
 use crate::alloc::Allocator;
 #[cfg(not(target_os = "trusty"))]
@@ -16,7 +11,7 @@ use crate::io;
 use crate::macros::rustdoc_skip_body;
 #[cfg(target_os = "hermit")]
 use crate::os::hermit::io::OwnedFd;
-#[cfg(all(not(target_os = "hermit"), not(target_os = "motor")))]
+#[cfg(not(any(target_os = "hermit", target_os = "motor", target_os = "ask")))]
 use crate::os::raw;
 #[cfg(all(doc, not(any(target_family = "wasm", target_env = "sgx", target_os = "l4re"))))]
 use crate::os::unix::io::AsFd;
@@ -29,10 +24,10 @@ use crate::sys::{AsInner, FromInner, IntoInner};
 
 /// Raw file descriptors.
 #[stable(feature = "rust1", since = "1.0.0")]
-#[cfg(all(not(target_os = "hermit"), not(target_os = "motor")))]
+#[cfg(not(any(target_os = "hermit", target_os = "motor", target_os = "ask")))]
 pub type RawFd = raw::c_int;
 #[stable(feature = "rust1", since = "1.0.0")]
-#[cfg(any(target_os = "hermit", target_os = "motor"))]
+#[cfg(any(target_os = "hermit", target_os = "motor", target_os = "ask"))]
 pub type RawFd = i32;
 
 /// A trait to extract the raw file descriptor from an underlying object.
@@ -194,56 +189,6 @@ impl IntoRawFd for fs::File {
     #[rustdoc_skip_body]
     fn into_raw_fd(self) -> RawFd {
         self.into_inner().into_inner().into_raw_fd()
-    }
-}
-
-#[stable(feature = "asraw_stdio", since = "1.21.0")]
-#[cfg(not(target_os = "trusty"))]
-impl AsRawFd for io::Stdin {
-    #[inline]
-    fn as_raw_fd(&self) -> RawFd {
-        libc::STDIN_FILENO
-    }
-}
-
-#[stable(feature = "asraw_stdio", since = "1.21.0")]
-impl AsRawFd for io::Stdout {
-    #[inline]
-    fn as_raw_fd(&self) -> RawFd {
-        libc::STDOUT_FILENO
-    }
-}
-
-#[stable(feature = "asraw_stdio", since = "1.21.0")]
-impl AsRawFd for io::Stderr {
-    #[inline]
-    fn as_raw_fd(&self) -> RawFd {
-        libc::STDERR_FILENO
-    }
-}
-
-#[stable(feature = "asraw_stdio_locks", since = "1.35.0")]
-#[cfg(not(target_os = "trusty"))]
-impl<'a> AsRawFd for io::StdinLock<'a> {
-    #[inline]
-    fn as_raw_fd(&self) -> RawFd {
-        libc::STDIN_FILENO
-    }
-}
-
-#[stable(feature = "asraw_stdio_locks", since = "1.35.0")]
-impl<'a> AsRawFd for io::StdoutLock<'a> {
-    #[inline]
-    fn as_raw_fd(&self) -> RawFd {
-        libc::STDOUT_FILENO
-    }
-}
-
-#[stable(feature = "asraw_stdio_locks", since = "1.35.0")]
-impl<'a> AsRawFd for io::StderrLock<'a> {
-    #[inline]
-    fn as_raw_fd(&self) -> RawFd {
-        libc::STDERR_FILENO
     }
 }
 

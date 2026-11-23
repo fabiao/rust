@@ -4,10 +4,6 @@
 
 mod global;
 mod layout;
-mod reclaim;
-
-#[unstable(feature = "allocator_reclaim", issue = "none")]
-pub use self::reclaim::{AllocatorReclaim, ReclaimResult};
 
 #[stable(feature = "global_alloc", since = "1.28.0")]
 pub use self::global::GlobalAlloc;

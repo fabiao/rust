@@ -71,9 +71,8 @@ pub struct LineWriter<W: ?Sized + Write> {
 
 impl<W: Write> LineWriter<W> {
     /// Return the writer and buffered bytes without writing or flushing.
-    #[cfg(target_os = "ask")]
     #[doc(hidden)]
-    #[unstable(feature = "ask_runtime", issue = "none")]
+    #[unstable(feature = "std_internals", issue = "none")]
     pub fn into_parts(self) -> (W, Result<crate::vec::Vec<u8>, super::WriterPanicked>) {
         self.inner.into_parts()
     }

@@ -18,13 +18,17 @@ pub struct Thread {
 unsafe impl Send for Thread {}
 unsafe impl Sync for Thread {}
 
+extern "C" fn cleanup_thread() {
+    crate::rt::thread_cleanup();
+}
+
 unsafe extern "C" fn thread_start(init: *mut c_void) {
-    crate::sys::thread_local::key::init_this_thread();
+    unsafe { askrust::thread::tls::initialize() };
     // SAFETY: `Thread::new` leaked this box for exactly this thread.
     let init = unsafe { Box::from_raw(init.cast::<ThreadInit>()) };
     let rust_start = init.init();
     rust_start();
-    unsafe { crate::sys::thread_local::key::destroy_tls() };
+    unsafe { askrust::thread::tls::finish(cleanup_thread) };
 }
 
 impl Thread {

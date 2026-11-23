@@ -338,7 +338,7 @@ pub use self::stdio::{
 };
 pub(crate) use self::stdio::{attempt_print_to_stderr, cleanup};
 #[cfg(target_os = "ask")]
-pub(crate) use self::stdio::drain_ask;
+pub(crate) use self::stdio::take_stdout_buffer;
 #[unstable(feature = "internal_output_capture", issue = "none")]
 #[doc(no_inline, hidden)]
 pub use self::stdio::{set_output_capture, try_set_output_capture};

@@ -140,12 +140,10 @@ pub(crate) fn cleanup() {
     static CLEANUP: Once = Once::new();
     CLEANUP.call_once(|| unsafe {
         // Flush stdout and disable buffering.
-        #[cfg(not(target_os = "ask"))]
-        crate::io::cleanup();
-        #[cfg(target_os = "ask")]
-        if !askrust::rt::cooperative() {
-            crate::io::cleanup();
-        }
+        cfg_select! {
+            target_os = "ask" => sys::stdio::cleanup(),
+            _ => crate::io::cleanup(),
+        };
         // SAFETY: Only called once during runtime cleanup.
         sys::cleanup();
     });
@@ -160,54 +158,30 @@ fn lang_start_internal(
     argv: *const *const u8,
     sigpipe: u8,
 ) -> isize {
-    #[cfg(target_os = "ask")]
-    return ask_entry::run(main, argc, argv, sigpipe);
-
-    #[cfg(not(target_os = "ask"))]
-    {
-    // Guard against the code called by this function from unwinding outside of the Rust-controlled
-    // code, which is UB. This is a requirement imposed by a combination of how the
-    // `#[lang="start"]` attribute is implemented as well as by the implementation of the panicking
-    // mechanism itself.
-    //
-    // There are a couple of instances where unwinding can begin. First is inside of the
-    // `rt::init`, `rt::cleanup` and similar functions controlled by std. In those instances a
-    // panic is a std implementation bug. A quite likely one too, as there isn't any way to
-    // prevent std from accidentally introducing a panic to these functions. Another is from
-    // user code from `main` or, more nefariously, as described in e.g. issue #86030.
-    //
-    // We use `catch_unwind` with `handle_rt_panic` instead of `abort_on_unwind` to make the error
-    // in case of a panic a bit nicer.
-    panic::catch_unwind(move || {
-        // SAFETY: Only called once during runtime initialization.
-        unsafe { init(argc, argv, sigpipe) };
-
-        let ret_code = panic::catch_unwind(main).unwrap_or_else(move |payload| {
-            // Carefully dispose of the panic payload.
+    let initialize = || {
+        panic::catch_unwind(|| unsafe { init(argc, argv, sigpipe) })
+            .unwrap_or_else(handle_rt_panic);
+    };
+    let application = || {
+        panic::catch_unwind(main).unwrap_or_else(move |payload| {
             let payload = panic::AssertUnwindSafe(payload);
-            panic::catch_unwind(move || drop({ payload }.0)).unwrap_or_else(move |e| {
-                mem::forget(e); // do *not* drop the 2nd payload
+            panic::catch_unwind(move || drop({ payload }.0)).unwrap_or_else(move |error| {
+                mem::forget(error);
                 rtabort!("drop of the panic payload panicked");
             });
-            // Return error code for panicking programs.
             101
-        });
-        let ret_code = ret_code as isize;
-
-        cleanup();
-        // Guard against multiple threads calling `libc::exit` concurrently.
-        // See the documentation for `unique_thread_exit` for more information.
-        crate::sys::exit::unique_thread_exit();
-
-        ret_code
-    })
-    .unwrap_or_else(handle_rt_panic)
-    }
+        })
+    };
+    let finish = || {
+        panic::catch_unwind(|| {
+            cleanup();
+            crate::sys::exit::unique_thread_exit();
+        })
+        .unwrap_or_else(handle_rt_panic);
+    };
+    // SAFETY: The language entry runs once and the callbacks contain panics.
+    unsafe { sys::start(&initialize, &application, &finish) as isize }
 }
-
-#[cfg(all(target_os = "ask", not(test)))]
-#[path = "rt/ask_entry.rs"]
-pub(crate) mod ask_entry;
 
 #[cfg(not(any(test, doctest)))]
 #[lang = "start"]

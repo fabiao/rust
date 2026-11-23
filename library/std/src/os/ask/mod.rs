@@ -9,7 +9,7 @@ pub mod fs;
 #[doc(hidden)]
 #[unstable(feature = "ask_runtime", issue = "none")]
 pub async fn drain_stdio() -> crate::io::Result<()> {
-    crate::io::drain_ask().await
+    crate::sys::stdio::drain().await
 }
 
 /// A prelude for conveniently writing platform-specific code.

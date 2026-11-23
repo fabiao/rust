@@ -733,36 +733,13 @@ pub(crate) fn cleanup() {
 }
 
 #[cfg(target_os = "ask")]
-pub(crate) async fn drain_ask() -> io::Result<()> {
-    let bytes = if let Some(stdout) = STDOUT.get() {
-        let lock = stdout.try_lock().ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
-        let mut writer = lock.try_borrow_mut().map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
-        let old = crate::mem::replace(&mut *writer, LineWriter::with_capacity(0, stdout_raw()));
-        let (_, bytes) = old.into_parts();
-        bytes.map_err(|_| io::Error::from(io::ErrorKind::Other))?
-    } else { Vec::new() };
-    let mut bytes = bytes.as_slice();
-    while !bytes.is_empty() {
-        let count = {
-            // SAFETY: `bytes` outlives the operation, which drops at the end of this block.
-            let mut op = unsafe { askrust::fd::write_start(askrust::fd::number::STDOUT, bytes) }
-                .map_err(crate::sys::ask_error)?;
-            crate::future::poll_fn(|cx| match op.poll() {
-                askrust::op::Poll::Pending => crate::task::Poll::Pending,
-                askrust::op::Poll::Retry => {
-                    cx.waker().wake_by_ref();
-                    crate::task::Poll::Pending
-                }
-                askrust::op::Poll::Ready(result) => crate::task::Poll::Ready(result),
-            })
-            .await
-            .map_err(crate::sys::ask_error)?
-        };
-        let count = usize::try_from(count).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
-        if count == 0 { return Err(io::Error::from(io::ErrorKind::WriteZero)); }
-        bytes = bytes.get(count..).ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
-    }
-    Ok(())
+pub(crate) fn take_stdout_buffer() -> io::Result<Vec<u8>> {
+    let Some(stdout) = STDOUT.get() else { return Ok(Vec::new()) };
+    let lock = stdout.try_lock().ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
+    let mut writer = lock.try_borrow_mut().map_err(|_| io::ErrorKind::WouldBlock)?;
+    let old = crate::mem::replace(&mut *writer, LineWriter::with_capacity(0, stdout_raw()));
+    let (_, bytes) = old.into_parts();
+    bytes.map_err(|_| io::ErrorKind::Other.into())
 }
 
 impl Stdout {

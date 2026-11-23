@@ -1,4 +1,10 @@
-use super::BorrowedFd;
+#[cfg(target_os = "hermit")]
+use hermit_abi as libc;
+#[cfg(target_os = "motor")]
+use moto_rt::libc;
+
+use super::{AsFd, AsRawFd, BorrowedFd, RawFd};
+use crate::io;
 
 /// The file descriptor for the standard input stream of the current process.
 ///
@@ -51,3 +57,104 @@ pub const STDOUT: BorrowedFd<'static> = unsafe { BorrowedFd::borrow_raw(1) };
 /// [global-alloc-reentrancy]: ../../../std/alloc/trait.GlobalAlloc.html#re-entrance
 #[unstable(feature = "stdio_fd_consts", issue = "150836")]
 pub const STDERR: BorrowedFd<'static> = unsafe { BorrowedFd::borrow_raw(2) };
+
+#[stable(feature = "io_safety", since = "1.63.0")]
+impl AsFd for io::Stdin {
+    #[inline]
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        unsafe { BorrowedFd::borrow_raw(0) }
+    }
+}
+
+#[stable(feature = "io_safety", since = "1.63.0")]
+impl<'a> AsFd for io::StdinLock<'a> {
+    #[inline]
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        // SAFETY: user code should not close stdin out from under the standard library
+        unsafe { BorrowedFd::borrow_raw(0) }
+    }
+}
+
+#[stable(feature = "io_safety", since = "1.63.0")]
+impl AsFd for io::Stdout {
+    #[inline]
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        unsafe { BorrowedFd::borrow_raw(1) }
+    }
+}
+
+#[stable(feature = "io_safety", since = "1.63.0")]
+impl<'a> AsFd for io::StdoutLock<'a> {
+    #[inline]
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        // SAFETY: user code should not close stdout out from under the standard library
+        unsafe { BorrowedFd::borrow_raw(1) }
+    }
+}
+
+#[stable(feature = "io_safety", since = "1.63.0")]
+impl AsFd for io::Stderr {
+    #[inline]
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        unsafe { BorrowedFd::borrow_raw(2) }
+    }
+}
+
+#[stable(feature = "io_safety", since = "1.63.0")]
+impl<'a> AsFd for io::StderrLock<'a> {
+    #[inline]
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        // SAFETY: user code should not close stderr out from under the standard library
+        unsafe { BorrowedFd::borrow_raw(2) }
+    }
+}
+
+#[stable(feature = "asraw_stdio", since = "1.21.0")]
+#[cfg(not(target_os = "trusty"))]
+impl AsRawFd for io::Stdin {
+    #[inline]
+    fn as_raw_fd(&self) -> RawFd {
+        libc::STDIN_FILENO
+    }
+}
+
+#[stable(feature = "asraw_stdio", since = "1.21.0")]
+impl AsRawFd for io::Stdout {
+    #[inline]
+    fn as_raw_fd(&self) -> RawFd {
+        libc::STDOUT_FILENO
+    }
+}
+
+#[stable(feature = "asraw_stdio", since = "1.21.0")]
+impl AsRawFd for io::Stderr {
+    #[inline]
+    fn as_raw_fd(&self) -> RawFd {
+        libc::STDERR_FILENO
+    }
+}
+
+#[stable(feature = "asraw_stdio_locks", since = "1.35.0")]
+#[cfg(not(target_os = "trusty"))]
+impl<'a> AsRawFd for io::StdinLock<'a> {
+    #[inline]
+    fn as_raw_fd(&self) -> RawFd {
+        libc::STDIN_FILENO
+    }
+}
+
+#[stable(feature = "asraw_stdio_locks", since = "1.35.0")]
+impl<'a> AsRawFd for io::StdoutLock<'a> {
+    #[inline]
+    fn as_raw_fd(&self) -> RawFd {
+        libc::STDOUT_FILENO
+    }
+}
+
+#[stable(feature = "asraw_stdio_locks", since = "1.35.0")]
+impl<'a> AsRawFd for io::StderrLock<'a> {
+    #[inline]
+    fn as_raw_fd(&self) -> RawFd {
+        libc::STDERR_FILENO
+    }
+}

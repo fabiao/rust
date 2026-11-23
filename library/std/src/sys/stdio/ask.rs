@@ -25,6 +25,17 @@ impl Stderr {
 
 use askrust::fd::number::{STDERR, STDIN, STDOUT};
 
+pub(crate) fn cleanup() {
+    if !askrust::rt::cooperative() {
+        crate::io::cleanup();
+    }
+}
+
+pub(crate) async fn drain() -> io::Result<()> {
+    let buffer = io::take_stdout_buffer()?;
+    askrust::fd::write_all(STDOUT, &buffer).await.map_err(ask_error)
+}
+
 impl io::Read for Stdin {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         askrust::fd::read(STDIN, bytes).map_err(ask_error)

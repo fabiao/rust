@@ -5,9 +5,17 @@
 #![stable(feature = "rust1", since = "1.0.0")]
 
 use crate::ffi::OsString;
+use crate::os::fd::{AsFd, BorrowedFd};
 use crate::path::Path;
 use crate::sys::{AsInner, AsInnerMut, FromInner};
 use crate::{fs, io, sys};
+
+#[unstable(feature = "dirfd", issue = "120426")]
+impl AsFd for fs::Dir {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.as_inner().as_fd()
+    }
+}
 
 /// ASK-specific extensions to [`fs::Metadata`].
 ///

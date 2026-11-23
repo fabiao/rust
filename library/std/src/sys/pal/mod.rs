@@ -3,6 +3,14 @@
 
 #![allow(missing_debug_implementations)]
 
+#[cfg(all(not(test), not(target_os = "ask")))]
+pub(crate) unsafe fn start(initialize: &dyn Fn(), main: &dyn Fn() -> i32, cleanup: &dyn Fn()) -> i32 {
+    initialize();
+    let code = main();
+    cleanup();
+    code
+}
+
 cfg_select! {
     unix => {
         mod unix;

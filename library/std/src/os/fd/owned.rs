@@ -18,7 +18,8 @@ use crate::mem::ManuallyDrop;
     target_env = "sgx",
     target_os = "hermit",
     target_os = "trusty",
-    target_os = "motor"
+    target_os = "motor",
+    target_os = "ask"
 )))]
 use crate::sys::cvt;
 #[cfg(not(target_os = "trusty"))]
@@ -130,7 +131,8 @@ impl BorrowedFd<'_> {
         all(target_family = "wasm", not(target_os = "emscripten")),
         target_os = "hermit",
         target_os = "trusty",
-        target_os = "motor"
+        target_os = "motor",
+        target_os = "ask"
     )))]
     #[stable(feature = "io_safety", since = "1.63.0")]
     #[rustdoc_skip_body]
@@ -172,6 +174,13 @@ impl BorrowedFd<'_> {
     pub fn try_clone_to_owned(&self) -> io::Result<OwnedFd> {
         let fd = moto_rt::fs::duplicate(self.as_raw_fd()).map_err(crate::sys::map_motor_error)?;
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    /// Creates an owned duplicate of this descriptor.
+    #[cfg(target_os = "ask")]
+    #[stable(feature = "io_safety", since = "1.63.0")]
+    pub fn try_clone_to_owned(&self) -> io::Result<OwnedFd> {
+        crate::sys::fd::duplicate(self.as_raw_fd())
     }
 }
 
@@ -225,6 +234,9 @@ impl Drop for OwnedFd {
     #[inline]
     #[rustdoc_skip_body]
     fn drop(&mut self) {
+        #[cfg(target_os = "ask")]
+        crate::sys::fd::close(self.fd.as_inner());
+        #[cfg(not(target_os = "ask"))]
         unsafe {
             // Note that errors are ignored when closing a file descriptor. According to POSIX 2024,
             // we can and indeed should retry `close` on `EINTR`
@@ -372,105 +384,6 @@ impl From<OwnedFd> for fs::File {
     }
 }
 
-#[stable(feature = "io_safety", since = "1.63.0")]
-#[cfg(not(target_os = "trusty"))]
-impl AsFd for crate::net::TcpStream {
-    #[inline]
-    #[rustdoc_skip_body]
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        self.as_inner().socket().as_fd()
-    }
-}
-
-#[stable(feature = "io_safety", since = "1.63.0")]
-#[cfg(not(target_os = "trusty"))]
-impl From<crate::net::TcpStream> for OwnedFd {
-    /// Takes ownership of a [`TcpStream`](crate::net::TcpStream)'s socket file descriptor.
-    #[inline]
-    #[rustdoc_skip_body]
-    fn from(tcp_stream: crate::net::TcpStream) -> OwnedFd {
-        tcp_stream.into_inner().into_socket().into_inner().into_inner()
-    }
-}
-
-#[stable(feature = "io_safety", since = "1.63.0")]
-#[cfg(not(target_os = "trusty"))]
-impl From<OwnedFd> for crate::net::TcpStream {
-    #[inline]
-    #[rustdoc_skip_body]
-    fn from(owned_fd: OwnedFd) -> Self {
-        Self::from_inner(FromInner::from_inner(FromInner::from_inner(FromInner::from_inner(
-            owned_fd,
-        ))))
-    }
-}
-
-#[stable(feature = "io_safety", since = "1.63.0")]
-#[cfg(not(target_os = "trusty"))]
-impl AsFd for crate::net::TcpListener {
-    #[inline]
-    #[rustdoc_skip_body]
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        self.as_inner().socket().as_fd()
-    }
-}
-
-#[stable(feature = "io_safety", since = "1.63.0")]
-#[cfg(not(target_os = "trusty"))]
-impl From<crate::net::TcpListener> for OwnedFd {
-    /// Takes ownership of a [`TcpListener`](crate::net::TcpListener)'s socket file descriptor.
-    #[inline]
-    #[rustdoc_skip_body]
-    fn from(tcp_listener: crate::net::TcpListener) -> OwnedFd {
-        tcp_listener.into_inner().into_socket().into_inner().into_inner()
-    }
-}
-
-#[stable(feature = "io_safety", since = "1.63.0")]
-#[cfg(not(target_os = "trusty"))]
-impl From<OwnedFd> for crate::net::TcpListener {
-    #[inline]
-    #[rustdoc_skip_body]
-    fn from(owned_fd: OwnedFd) -> Self {
-        Self::from_inner(FromInner::from_inner(FromInner::from_inner(FromInner::from_inner(
-            owned_fd,
-        ))))
-    }
-}
-
-#[stable(feature = "io_safety", since = "1.63.0")]
-#[cfg(not(target_os = "trusty"))]
-impl AsFd for crate::net::UdpSocket {
-    #[inline]
-    #[rustdoc_skip_body]
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        self.as_inner().socket().as_fd()
-    }
-}
-
-#[stable(feature = "io_safety", since = "1.63.0")]
-#[cfg(not(target_os = "trusty"))]
-impl From<crate::net::UdpSocket> for OwnedFd {
-    /// Takes ownership of a [`UdpSocket`](crate::net::UdpSocket)'s file descriptor.
-    #[inline]
-    #[rustdoc_skip_body]
-    fn from(udp_socket: crate::net::UdpSocket) -> OwnedFd {
-        udp_socket.into_inner().into_socket().into_inner().into_inner()
-    }
-}
-
-#[stable(feature = "io_safety", since = "1.63.0")]
-#[cfg(not(target_os = "trusty"))]
-impl From<OwnedFd> for crate::net::UdpSocket {
-    #[inline]
-    #[rustdoc_skip_body]
-    fn from(owned_fd: OwnedFd) -> Self {
-        Self::from_inner(FromInner::from_inner(FromInner::from_inner(FromInner::from_inner(
-            owned_fd,
-        ))))
-    }
-}
-
 /// Implements `AsRef<$t>` conversions from `BorrowedFd` to the specified types.
 ///
 /// # Safety
@@ -486,6 +399,7 @@ impl From<OwnedFd> for crate::net::UdpSocket {
 /// - `&$t` impls must tolerate instances being created from any kind of file-descriptor without
 ///   going through some dedicated constructor function, akin to `From<OwnedFd>` being a noop
 ///   conversion.
+#[cfg(not(target_os = "ask"))]
 pub(crate) macro unsafe_impl_fd_asrefs {
     ($($t:ty),*$(,)?) => {$(
         #[unstable(feature = "fd_view", issue = "160402")]
@@ -512,13 +426,8 @@ pub(crate) macro unsafe_impl_fd_asrefs {
     )*}
 }
 
-#[cfg(not(target_os = "trusty"))]
-unsafe_impl_fd_asrefs!(
-    crate::fs::File,
-    crate::net::TcpStream,
-    crate::net::TcpListener,
-    crate::net::UdpSocket,
-);
+#[cfg(not(any(target_os = "trusty", target_os = "ask")))]
+unsafe_impl_fd_asrefs!(crate::fs::File);
 
 #[cfg(unix)]
 unsafe_impl_fd_asrefs!(io::PipeWriter, io::PipeReader);
@@ -567,57 +476,6 @@ impl<T: AsFd + ?Sized, A: Allocator> AsFd for Box<T, A> {
     #[inline]
     fn as_fd(&self) -> BorrowedFd<'_> {
         (**self).as_fd()
-    }
-}
-
-#[stable(feature = "io_safety", since = "1.63.0")]
-impl AsFd for io::Stdin {
-    #[inline]
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        unsafe { BorrowedFd::borrow_raw(0) }
-    }
-}
-
-#[stable(feature = "io_safety", since = "1.63.0")]
-impl<'a> AsFd for io::StdinLock<'a> {
-    #[inline]
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        // SAFETY: user code should not close stdin out from under the standard library
-        unsafe { BorrowedFd::borrow_raw(0) }
-    }
-}
-
-#[stable(feature = "io_safety", since = "1.63.0")]
-impl AsFd for io::Stdout {
-    #[inline]
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        unsafe { BorrowedFd::borrow_raw(1) }
-    }
-}
-
-#[stable(feature = "io_safety", since = "1.63.0")]
-impl<'a> AsFd for io::StdoutLock<'a> {
-    #[inline]
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        // SAFETY: user code should not close stdout out from under the standard library
-        unsafe { BorrowedFd::borrow_raw(1) }
-    }
-}
-
-#[stable(feature = "io_safety", since = "1.63.0")]
-impl AsFd for io::Stderr {
-    #[inline]
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        unsafe { BorrowedFd::borrow_raw(2) }
-    }
-}
-
-#[stable(feature = "io_safety", since = "1.63.0")]
-impl<'a> AsFd for io::StderrLock<'a> {
-    #[inline]
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        // SAFETY: user code should not close stderr out from under the standard library
-        unsafe { BorrowedFd::borrow_raw(2) }
     }
 }
 

@@ -214,14 +214,12 @@ pub(crate) mod key {
             pub(super) use racy::LazyKey;
         }
         target_os = "ask" => {
-            mod ask;
             mod racy;
             #[cfg(test)]
             mod tests;
+            pub(super) use askrust::thread::tls::{Key, get, set};
+            use askrust::thread::tls::{create, destroy};
             pub(super) use racy::LazyKey;
-            pub(crate) use ask::{destroy_tls, init_this_thread};
-            pub(super) use ask::{Key, get, set};
-            use ask::{create, destroy};
         }
         _ => {}
     }

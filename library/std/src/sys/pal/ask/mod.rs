@@ -10,6 +10,9 @@ pub mod futex;
 
 use crate::io;
 
+#[cfg(not(test))]
+pub(crate) use askrust::rt::start;
+
 pub fn unsupported<T>() -> io::Result<T> {
     Err(unsupported_err())
 }
@@ -43,7 +46,7 @@ pub extern "C" fn __ask_std_start() -> ! {
     // Compiler main reaches rt before language initialization; its entry hook
     // stages descriptors and awaits GO before invoking rt's initialize callback.
     // Thread-local access requires primitive TLS even before that hook.
-    crate::sys::thread_local::key::init_this_thread();
+    unsafe { askrust::thread::tls::initialize() };
     // `sys::args` and `sys::env` read argv and the environment from the
     // runtime; the CRT argc/argv pair stays empty, matching Motor OS's `motor_start`.
     let result = unsafe { main(0, core::ptr::null(), 0) };

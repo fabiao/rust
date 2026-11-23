@@ -10,7 +10,7 @@ use crate::ffi::{OsStr, OsString};
 use crate::num::NonZeroI32;
 use crate::path::Path;
 use crate::process::StdioPipes;
-use crate::os::fd::FromRawFd;
+use crate::os::fd::{FromRawFd, OwnedFd};
 use crate::sys::FromInner;
 use crate::sys::fd::FileDesc;
 use crate::sys::fs::File;
@@ -250,6 +250,13 @@ fn plan_stdio(spec: Stdio, target: i32) -> io::Result<StdioPlan> {
 impl From<Pipe> for Stdio {
     fn from(pipe: Pipe) -> Stdio {
         Stdio::Pipe(pipe)
+    }
+}
+
+#[stable(feature = "io_safety", since = "1.63.0")]
+impl From<OwnedFd> for crate::process::Stdio {
+    fn from(fd: OwnedFd) -> Self {
+        Self::from_inner(Stdio::Fd(FileDesc::from_inner(fd)))
     }
 }
 

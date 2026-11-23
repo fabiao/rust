@@ -7,11 +7,9 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 // `RawFd`, `AsRawFd`, etc.
-#[cfg_attr(target_os = "ask", path = "raw_ask.rs")]
 mod raw;
 
 // `OwnedFd`, `AsFd`, etc.
-#[cfg_attr(target_os = "ask", path = "owned_ask.rs")]
 mod owned;
 
 // Implementations for `AsRawFd` etc. for network types.
